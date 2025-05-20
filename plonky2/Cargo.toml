@@ -29,6 +29,7 @@ num = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { version = "0.3.1", optional = true, default-features = false }
 serde = { workspace = true, features = ["rc"] }
+ts-rs = {workspace = true}
 static_assertions = { workspace = true }
 unroll = { workspace = true }
 web-time = { version = "1.0.0", optional = true }
