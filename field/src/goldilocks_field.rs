@@ -29,14 +29,14 @@ impl TS for GoldilocksField {
     type WithoutGenerics = GoldilocksField;
     
     fn ident() -> String {
-        "number".to_string()
+        "bigint".to_string()
     }
 
     fn name() -> String {
-        "number".to_string()
+        "bigint".to_string()
     }
     fn inline() -> String {
-        "number".to_string()
+        "bigint".to_string()
     }
     fn inline_flattened() -> String {
         panic!("{} cannot be flattened", Self::name())
