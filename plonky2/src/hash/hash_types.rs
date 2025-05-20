@@ -30,9 +30,9 @@ impl<F: Field> TS for HashOut<F> {
     type WithoutGenerics = HashOut<GoldilocksField>;
 
     fn name() -> String { "HashOut".to_string() }
-    fn inline() -> String { "{ elements: [number, number, number, number] }".to_string() }
-    fn inline_flattened() -> String { "elements: [number, number, number, number]".to_string() }
-    fn decl() -> String { "export type HashOut = { elements: [number, number, number, number] };".to_string() }
+    fn inline() -> String { "{ elements: [bigint, bigint, bigint, bigint] }".to_string() }
+    fn inline_flattened() -> String { "elements: [bigint, bigint, bigint, bigint]".to_string() }
+    fn decl() -> String { "export type HashOut = { elements: [bigint, bigint, bigint, bigint] };".to_string() }
     fn decl_concrete() -> String { Self::decl() }
 }
 
