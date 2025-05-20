@@ -5,7 +5,7 @@ use core::fmt;
 use anyhow::ensure;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
+use ts_rs::TS;
 use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::types::{Field, PrimeField64, Sample};
 use crate::hash::poseidon::Poseidon;
@@ -24,6 +24,16 @@ pub const NUM_HASH_OUT_ELTS: usize = 4;
 #[serde(bound = "")]
 pub struct HashOut<F: Field> {
     pub elements: [F; NUM_HASH_OUT_ELTS],
+}
+
+impl<F: Field> TS for HashOut<F> {
+    type WithoutGenerics = HashOut<GoldilocksField>;
+
+    fn name() -> String { "HashOut".to_string() }
+    fn inline() -> String { "{ elements: [number, number, number, number] }".to_string() }
+    fn inline_flattened() -> String { "elements: [number, number, number, number]".to_string() }
+    fn decl() -> String { "export type HashOut = { elements: [number, number, number, number] };".to_string() }
+    fn decl_concrete() -> String { Self::decl() }
 }
 
 impl<F: Field> HashOut<F> {
