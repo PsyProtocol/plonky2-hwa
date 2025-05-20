@@ -18,6 +18,7 @@ rand = { workspace = true, features = ["getrandom"] }
 serde = { workspace = true, features = ["alloc"] }
 static_assertions = { workspace = true }
 unroll = { workspace = true }
+ts-rs = {workspace = true}
 
 # Local dependencies
 plonky2_util = { version = "1.0.0", path = "../util", default-features = false }

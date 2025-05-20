@@ -1,3 +1,4 @@
+use alloc::string::{String, ToString};
 use core::fmt::{self, Debug, Display, Formatter};
 use core::hash::{Hash, Hasher};
 use core::iter::{Product, Sum};
@@ -6,7 +7,7 @@ use core::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAss
 use num::{BigUint, Integer, ToPrimitive};
 use plonky2_util::{assume, branch_hint};
 use serde::{Deserialize, Serialize};
-
+use ts_rs::TS;
 use crate::ops::Square;
 use crate::types::{Field, Field64, PrimeField, PrimeField64, Sample};
 
@@ -23,6 +24,30 @@ const EPSILON: u64 = (1 << 32) - 1;
 #[derive(Copy, Clone, Serialize, Deserialize)]
 #[repr(transparent)]
 pub struct GoldilocksField(pub u64);
+
+impl TS for GoldilocksField {
+    type WithoutGenerics = GoldilocksField;
+    
+    fn ident() -> String {
+        "number".to_string()
+    }
+
+    fn name() -> String {
+        "number".to_string()
+    }
+    fn inline() -> String {
+        "number".to_string()
+    }
+    fn inline_flattened() -> String {
+        panic!("{} cannot be flattened", Self::name())
+    }
+    fn decl() -> String {
+        panic!("{} cannot be declared", Self::name())
+    }
+    fn decl_concrete() -> String {
+        panic!("{} cannot be declared", Self::name())
+    }
+}
 
 impl Default for GoldilocksField {
     fn default() -> Self {
