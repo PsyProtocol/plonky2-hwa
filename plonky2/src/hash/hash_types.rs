@@ -1,5 +1,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
+#[cfg(not(feature = "std"))]
+use alloc::string::{String,ToString};
 use core::fmt;
 
 use anyhow::ensure;
