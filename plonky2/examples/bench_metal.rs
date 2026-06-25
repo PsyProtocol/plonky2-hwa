@@ -176,11 +176,16 @@ fn main() -> Result<()> {
 
     let cpu_avg = cpu_total / rounds as f64;
     let metal_avg = metal_total / rounds as f64;
+    let speedup_factor = cpu_avg / metal_avg;
+    let faster_percent = (speedup_factor - 1.0) * 100.0;
+    let time_reduction_percent = (1.0 - metal_avg / cpu_avg) * 100.0;
     println!("cpu avg prove: {:.6}s", cpu_avg);
     println!("metal avg prove: {:.6}s", metal_avg);
+    println!("metal avg speedup factor vs cpu: {:.2}x", speedup_factor);
+    println!("metal avg faster than cpu: {:.2}%", faster_percent);
     println!(
-        "metal avg speedup vs cpu: {:.2}%",
-        (cpu_avg / metal_avg - 1.0) * 100.0
+        "metal avg time reduction vs cpu: {:.2}%",
+        time_reduction_percent
     );
 
     Ok(())
