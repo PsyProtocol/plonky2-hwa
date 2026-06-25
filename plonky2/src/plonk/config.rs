@@ -39,6 +39,14 @@ use crate::util::timing::TimingTree;
 use crate::util::{reverse_index_bits_in_place, transpose};
 
 #[cfg(feature = "metal")]
+fn fill_goldilocks_rand(dst: &mut [GoldilocksField]) {
+    let mut rng = rand::rngs::OsRng;
+    for value in dst {
+        *value = GoldilocksField::sample(&mut rng);
+    }
+}
+
+#[cfg(feature = "metal")]
 fn goldilocks_vec_for_overwrite(len: usize) -> Vec<GoldilocksField> {
     let mut values = Vec::with_capacity(len);
     // SAFETY: Each caller immediately overwrites the whole slice before it is read. This helper is
@@ -468,8 +476,8 @@ impl<C: GenericConfig<2, F = GoldilocksField, Hasher = PoseidonHash>>
                             .for_each(|(dst, polynomial)| {
                                 dst.copy_from_slice(&polynomial.coeffs);
                             });
-                        let metal_values =
-                            plonky2_metal::MetalRuntime::get().coset_lde_values_poly_major(
+                        let metal_values = plonky2_metal::MetalRuntime::get()
+                            .coset_lde_values_poly_major(
                                 &coeffs,
                                 polynomials.len(),
                                 degree,
@@ -487,14 +495,10 @@ impl<C: GenericConfig<2, F = GoldilocksField, Hasher = PoseidonHash>>
                         lde_values
                             .par_chunks_mut(leaf_count)
                             .skip(polynomials.len())
-                            .for_each(|dst| {
-                                let salt = GoldilocksField::rand_vec(leaf_count);
-                                dst.copy_from_slice(&salt);
-                            });
+                            .for_each(fill_goldilocks_rand);
                         lde_values
                     } else {
-                        let mut lde_values =
-                            vec![GoldilocksField::ZERO; leaf_count * leaf_length];
+                        let mut lde_values = goldilocks_vec_for_overwrite(leaf_count * leaf_length);
                         lde_values
                             .par_chunks_mut(leaf_count)
                             .enumerate()
@@ -510,8 +514,7 @@ impl<C: GenericConfig<2, F = GoldilocksField, Hasher = PoseidonHash>>
                                         .values;
                                     dst.copy_from_slice(&values);
                                 } else {
-                                    let salt = GoldilocksField::rand_vec(leaf_count);
-                                    dst.copy_from_slice(&salt);
+                                    fill_goldilocks_rand(dst);
                                 }
                             });
                         lde_values
