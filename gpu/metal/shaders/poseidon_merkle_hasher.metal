@@ -37,6 +37,377 @@ inline uint reverse_bits(uint value, uint num_bits) {
     return value >> (32 - num_bits);
 }
 
+inline Fp fp_sub(Fp lhs, Fp rhs) {
+    ulong a = static_cast<ulong>(lhs);
+    ulong b = static_cast<ulong>(rhs);
+    if (a >= b) {
+        return Fp(a - b);
+    }
+    return Fp(a - b - 0xfffffffful);
+}
+
+struct FftUniforms {
+    uint poly_count;
+    uint fft_len;
+    uint log_fft_len;
+    uint zero_factor;
+    uint half_m;
+};
+
+struct FftPairUniforms {
+    uint poly_count;
+    uint fft_len;
+    uint half_m;
+};
+
+struct FftTripleUniforms {
+    uint poly_count;
+    uint fft_len;
+    uint half_m;
+};
+
+struct CosetLdeUniforms {
+    uint poly_count;
+    uint coeff_len;
+    uint fft_len;
+    uint log_fft_len;
+    uint zero_factor;
+};
+
+struct LocalCosetLdeUniforms {
+    uint poly_count;
+    uint coeff_len;
+    uint fft_len;
+    uint log_fft_len;
+    uint zero_factor;
+    uint tile_log;
+};
+
+struct SingleCosetLdeUniforms {
+    uint poly_count;
+    uint coeff_len;
+    uint fft_len;
+    uint log_fft_len;
+    uint zero_factor;
+    uint thread_count;
+};
+
+kernel void fft_init_reverse_zero(
+    constant Fp * input[[buffer(0)]],
+    device Fp * values[[buffer(1)]],
+    constant FftUniforms & uniforms[[buffer(2)]],
+    uint2 gid[[thread_position_in_grid]]
+) {
+    uint index = gid[1] * 32768 + gid[0];
+    uint total = uniforms.poly_count * uniforms.fft_len;
+    if (index >= total) {
+        return;
+    }
+
+    uint point = index % uniforms.fft_len;
+    uint poly = index / uniforms.fft_len;
+    uint mask = uniforms.zero_factor >= 32 ? 0u : (0xffffffffu << uniforms.zero_factor);
+    uint input_point = reverse_bits(point & mask, uniforms.log_fft_len);
+
+    values[index] = input[poly * uniforms.fft_len + input_point];
+}
+
+kernel void fft_init_coset_lde(
+    constant Fp * coeffs[[buffer(0)]],
+    constant Fp * shift_powers[[buffer(1)]],
+    device Fp * values[[buffer(2)]],
+    constant CosetLdeUniforms & uniforms[[buffer(3)]],
+    uint2 gid[[thread_position_in_grid]]
+) {
+    uint index = gid[1] * 32768 + gid[0];
+    uint total = uniforms.poly_count * uniforms.fft_len;
+    if (index >= total) {
+        return;
+    }
+
+    uint point = index % uniforms.fft_len;
+    uint poly = index / uniforms.fft_len;
+    uint mask = uniforms.zero_factor >= 32 ? 0u : (0xffffffffu << uniforms.zero_factor);
+    uint input_point = reverse_bits(point & mask, uniforms.log_fft_len);
+
+    Fp coeff = coeffs[poly * uniforms.coeff_len + input_point];
+    Fp shift = shift_powers[input_point];
+    values[index] = coeff * shift;
+}
+
+kernel void fft_coset_lde_single(
+    constant Fp * coeffs[[buffer(0)]],
+    constant Fp * shift_powers[[buffer(1)]],
+    device Fp * values[[buffer(2)]],
+    constant Fp * flat_roots[[buffer(3)]],
+    constant SingleCosetLdeUniforms & uniforms[[buffer(4)]],
+    uint tid[[thread_index_in_threadgroup]],
+    uint2 tgid[[threadgroup_position_in_grid]]
+) {
+    uint poly = tgid[1] * 32768 + tgid[0];
+    if (poly >= uniforms.poly_count) {
+        return;
+    }
+
+    uint mask = uniforms.zero_factor >= 32 ? 0u : (0xffffffffu << uniforms.zero_factor);
+    uint poly_offset = poly * uniforms.fft_len;
+    uint coeff_offset = poly * uniforms.coeff_len;
+    for (uint point = tid; point < uniforms.fft_len; point += uniforms.thread_count) {
+        uint input_point = reverse_bits(point & mask, uniforms.log_fft_len);
+        Fp coeff = coeffs[coeff_offset + input_point];
+        Fp shift = shift_powers[input_point];
+        values[poly_offset + point] = coeff * shift;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    for (uint stage = uniforms.zero_factor; stage < uniforms.log_fft_len; stage++) {
+        uint half_m = 1u << stage;
+        uint m = half_m << 1;
+        uint root_offset = stage == 0 ? 0 : (1u << stage);
+
+        for (uint k = tid; k < (uniforms.fft_len >> 1); k += uniforms.thread_count) {
+            uint block = k / half_m;
+            uint j = k - block * half_m;
+            uint left = poly_offset + block * m + j;
+            uint right = left + half_m;
+
+            Fp u = values[left];
+            Fp omega = flat_roots[root_offset + j];
+            Fp right_value = values[right];
+            Fp t = omega * right_value;
+            values[left] = u + t;
+            values[right] = fp_sub(u, t);
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+}
+
+kernel void fft_init_coset_lde_local(
+    constant Fp * coeffs[[buffer(0)]],
+    constant Fp * shift_powers[[buffer(1)]],
+    device Fp * values[[buffer(2)]],
+    constant Fp * flat_roots[[buffer(3)]],
+    constant LocalCosetLdeUniforms & uniforms[[buffer(4)]],
+    threadgroup Fp * scratch[[threadgroup(0)]],
+    uint tid[[thread_index_in_threadgroup]],
+    uint2 tgid[[threadgroup_position_in_grid]]
+) {
+    uint group_index = tgid[1] * 32768 + tgid[0];
+    uint tile_len = 1u << uniforms.tile_log;
+    uint half_tile_len = tile_len >> 1;
+    uint tiles_per_poly = uniforms.fft_len >> uniforms.tile_log;
+    uint total_groups = uniforms.poly_count * tiles_per_poly;
+    if (group_index >= total_groups) {
+        return;
+    }
+
+    uint poly = group_index / tiles_per_poly;
+    uint tile = group_index - poly * tiles_per_poly;
+    uint tile_base = tile * tile_len;
+    uint mask = uniforms.zero_factor >= 32 ? 0u : (0xffffffffu << uniforms.zero_factor);
+
+    for (uint lane = tid; lane < tile_len; lane += half_tile_len) {
+        uint point = tile_base + lane;
+        uint input_point = reverse_bits(point & mask, uniforms.log_fft_len);
+        Fp coeff = coeffs[poly * uniforms.coeff_len + input_point];
+        Fp shift = shift_powers[input_point];
+        scratch[lane] = coeff * shift;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stage = uniforms.zero_factor; stage < uniforms.tile_log; stage++) {
+        uint half_m = 1u << stage;
+        uint m = half_m << 1;
+        uint block = tid / half_m;
+        uint j = tid - block * half_m;
+        uint left = block * m + j;
+        uint right = left + half_m;
+        uint root_offset = stage == 0 ? 0 : (1u << stage);
+
+        Fp u = scratch[left];
+        Fp omega = flat_roots[root_offset + j];
+        Fp right_value = scratch[right];
+        Fp t = omega * right_value;
+        scratch[left] = u + t;
+        scratch[right] = fp_sub(u, t);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint output_offset = poly * uniforms.fft_len + tile_base;
+    for (uint lane = tid; lane < tile_len; lane += half_tile_len) {
+        values[output_offset + lane] = scratch[lane];
+    }
+}
+
+kernel void fft_stage(
+    device Fp * values[[buffer(0)]],
+    constant Fp * roots[[buffer(1)]],
+    constant FftUniforms & uniforms[[buffer(2)]],
+    uint2 gid[[thread_position_in_grid]]
+) {
+    uint index = gid[1] * 32768 + gid[0];
+    uint butterflies_per_poly = uniforms.fft_len >> 1;
+    uint total = uniforms.poly_count * butterflies_per_poly;
+    if (index >= total) {
+        return;
+    }
+
+    uint poly = index / butterflies_per_poly;
+    uint k = index - poly * butterflies_per_poly;
+    uint half_m = uniforms.half_m;
+    uint m = half_m << 1;
+    uint block = k / half_m;
+    uint j = k - block * half_m;
+    uint left = poly * uniforms.fft_len + block * m + j;
+    uint right = left + half_m;
+
+    Fp u = values[left];
+    Fp omega = roots[j];
+    Fp right_value = values[right];
+    Fp t = omega * right_value;
+    values[left] = u + t;
+    values[right] = fp_sub(u, t);
+}
+
+kernel void fft_stage_pair(
+    device Fp * values[[buffer(0)]],
+    constant Fp * roots0[[buffer(1)]],
+    constant Fp * roots1[[buffer(2)]],
+    constant FftPairUniforms & uniforms[[buffer(3)]],
+    uint2 gid[[thread_position_in_grid]]
+) {
+    uint index = gid[1] * 32768 + gid[0];
+    uint groups_per_poly = uniforms.fft_len >> 2;
+    uint total = uniforms.poly_count * groups_per_poly;
+    if (index >= total) {
+        return;
+    }
+
+    uint poly = index / groups_per_poly;
+    uint k = index - poly * groups_per_poly;
+    uint half_m = uniforms.half_m;
+    uint m = half_m << 1;
+    uint block = k / half_m;
+    uint j = k - block * half_m;
+    uint base = poly * uniforms.fft_len + block * (m << 1) + j;
+    uint i0 = base;
+    uint i1 = base + half_m;
+    uint i2 = base + m;
+    uint i3 = base + m + half_m;
+
+    Fp a0 = values[i0];
+    Fp a1 = values[i1];
+    Fp a2 = values[i2];
+    Fp a3 = values[i3];
+
+    Fp omega0 = roots0[j];
+    Fp t0 = omega0 * a1;
+    Fp t1 = omega0 * a3;
+    Fp b0 = a0 + t0;
+    Fp b1 = fp_sub(a0, t0);
+    Fp b2 = a2 + t1;
+    Fp b3 = fp_sub(a2, t1);
+
+    Fp omega1_lo = roots1[j];
+    Fp omega1_hi = roots1[j + half_m];
+    Fp u0 = omega1_lo * b2;
+    Fp u1 = omega1_hi * b3;
+
+    values[i0] = b0 + u0;
+    values[i2] = fp_sub(b0, u0);
+    values[i1] = b1 + u1;
+    values[i3] = fp_sub(b1, u1);
+}
+
+kernel void fft_stage_triple(
+    device Fp * values[[buffer(0)]],
+    constant Fp * roots0[[buffer(1)]],
+    constant Fp * roots1[[buffer(2)]],
+    constant Fp * roots2[[buffer(3)]],
+    constant FftTripleUniforms & uniforms[[buffer(4)]],
+    uint2 gid[[thread_position_in_grid]]
+) {
+    uint index = gid[1] * 32768 + gid[0];
+    uint groups_per_poly = uniforms.fft_len >> 3;
+    uint total = uniforms.poly_count * groups_per_poly;
+    if (index >= total) {
+        return;
+    }
+
+    uint poly = index / groups_per_poly;
+    uint k = index - poly * groups_per_poly;
+    uint half_m = uniforms.half_m;
+    uint m = half_m << 1;
+    uint block = k / half_m;
+    uint j = k - block * half_m;
+    uint base = poly * uniforms.fft_len + block * (m << 2) + j;
+
+    uint i0 = base;
+    uint i1 = base + half_m;
+    uint i2 = base + m;
+    uint i3 = base + m + half_m;
+    uint i4 = base + (m << 1);
+    uint i5 = i4 + half_m;
+    uint i6 = i4 + m;
+    uint i7 = i6 + half_m;
+
+    Fp a0 = values[i0];
+    Fp a1 = values[i1];
+    Fp a2 = values[i2];
+    Fp a3 = values[i3];
+    Fp a4 = values[i4];
+    Fp a5 = values[i5];
+    Fp a6 = values[i6];
+    Fp a7 = values[i7];
+
+    Fp omega0 = roots0[j];
+    Fp t0 = omega0 * a1;
+    Fp t1 = omega0 * a3;
+    Fp t2 = omega0 * a5;
+    Fp t3 = omega0 * a7;
+    Fp b0 = a0 + t0;
+    Fp b1 = fp_sub(a0, t0);
+    Fp b2 = a2 + t1;
+    Fp b3 = fp_sub(a2, t1);
+    Fp b4 = a4 + t2;
+    Fp b5 = fp_sub(a4, t2);
+    Fp b6 = a6 + t3;
+    Fp b7 = fp_sub(a6, t3);
+
+    Fp omega1_lo = roots1[j];
+    Fp omega1_hi = roots1[j + half_m];
+    Fp u0 = omega1_lo * b2;
+    Fp u1 = omega1_hi * b3;
+    Fp u2 = omega1_lo * b6;
+    Fp u3 = omega1_hi * b7;
+    Fp c0 = b0 + u0;
+    Fp c2 = fp_sub(b0, u0);
+    Fp c1 = b1 + u1;
+    Fp c3 = fp_sub(b1, u1);
+    Fp c4 = b4 + u2;
+    Fp c6 = fp_sub(b4, u2);
+    Fp c5 = b5 + u3;
+    Fp c7 = fp_sub(b5, u3);
+
+    Fp omega2_0 = roots2[j];
+    Fp omega2_1 = roots2[j + half_m];
+    Fp omega2_2 = roots2[j + (half_m << 1)];
+    Fp omega2_3 = roots2[j + (half_m << 1) + half_m];
+    Fp v0 = omega2_0 * c4;
+    Fp v1 = omega2_1 * c5;
+    Fp v2 = omega2_2 * c6;
+    Fp v3 = omega2_3 * c7;
+
+    values[i0] = c0 + v0;
+    values[i4] = fp_sub(c0, v0);
+    values[i1] = c1 + v1;
+    values[i5] = fp_sub(c1, v1);
+    values[i2] = c2 + v2;
+    values[i6] = fp_sub(c2, v2);
+    values[i3] = c3 + v3;
+    values[i7] = fp_sub(c3, v3);
+}
+
 kernel void poseidon_hash_leaves(
     constant Fp * leaf_inputs[[buffer(0)]],
     device ulong * output[[buffer(1)]],

@@ -1,16 +1,20 @@
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use lazy_static::lazy_static;
 use metal::objc::rc::autoreleasepool;
 use metal::*;
+use plonky2_field::fft::fft_root_table;
 use plonky2_field::goldilocks_field::GoldilocksField;
+use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
 pub type GoldilocksDigest = [GoldilocksField; 4];
 
 static METAL_PROFILE_LEVEL: AtomicU8 = AtomicU8::new(0);
+static METAL_LDE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Default)]
 struct MetalHashProfile {
@@ -39,6 +43,14 @@ pub fn set_profile_detail_enabled(enabled: bool) {
     METAL_PROFILE_LEVEL.store(if enabled { 2 } else { 0 }, Ordering::Relaxed);
 }
 
+pub fn set_lde_enabled(enabled: bool) {
+    METAL_LDE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn lde_enabled() -> bool {
+    METAL_LDE_ENABLED.load(Ordering::Relaxed)
+}
+
 fn flatten_leaves_parallel(
     leaves: &[Vec<GoldilocksField>],
     leaf_length: usize,
@@ -60,6 +72,10 @@ fn flatten_leaves_parallel(
 
 fn get_size_for_count(count: usize) -> MTLSize {
     const MAX_DIM: usize = 32768;
+    assert!(
+        count <= u32::MAX as usize,
+        "Metal shader thread index uses u32; count must fit in u32"
+    );
     if count <= MAX_DIM {
         MTLSize {
             width: count as u64,
@@ -123,6 +139,16 @@ pub struct MetalRuntime {
     pipeline_poseidon_hash_leaves: ComputePipelineState,
     pipeline_poseidon_hash_leaves_poly_major: ComputePipelineState,
     pipeline_poseidon_hash_tree_level: ComputePipelineState,
+    pipeline_fft_init_reverse_zero: ComputePipelineState,
+    pipeline_fft_init_coset_lde: ComputePipelineState,
+    pipeline_fft_coset_lde_single: ComputePipelineState,
+    pipeline_fft_init_coset_lde_local: ComputePipelineState,
+    pipeline_fft_stage: ComputePipelineState,
+    pipeline_fft_stage_pair: ComputePipelineState,
+    pipeline_fft_stage_triple: ComputePipelineState,
+    fft_root_buffers: Mutex<HashMap<usize, Vec<Buffer>>>,
+    fft_flat_root_buffers: Mutex<HashMap<usize, Buffer>>,
+    coset_shift_buffers: Mutex<HashMap<usize, Buffer>>,
     command_queue: CommandQueue,
     init_time: u128,
 }
@@ -150,6 +176,14 @@ lazy_static! {
             .unwrap();
         let f_poseidon_hash_tree_level =
             lib.get_function("poseidon_hash_tree_level", None).unwrap();
+        let f_fft_init_reverse_zero = lib.get_function("fft_init_reverse_zero", None).unwrap();
+        let f_fft_init_coset_lde = lib.get_function("fft_init_coset_lde", None).unwrap();
+        let f_fft_coset_lde_single = lib.get_function("fft_coset_lde_single", None).unwrap();
+        let f_fft_init_coset_lde_local =
+            lib.get_function("fft_init_coset_lde_local", None).unwrap();
+        let f_fft_stage = lib.get_function("fft_stage", None).unwrap();
+        let f_fft_stage_pair = lib.get_function("fft_stage_pair", None).unwrap();
+        let f_fft_stage_triple = lib.get_function("fft_stage_triple", None).unwrap();
         let pipeline_poseidon_hash_leaves = device
             .new_compute_pipeline_state_with_function(&f_poseidon_hash_leaves)
             .unwrap();
@@ -159,6 +193,27 @@ lazy_static! {
         let pipeline_poseidon_hash_tree_level = device
             .new_compute_pipeline_state_with_function(&f_poseidon_hash_tree_level)
             .unwrap();
+        let pipeline_fft_init_reverse_zero = device
+            .new_compute_pipeline_state_with_function(&f_fft_init_reverse_zero)
+            .unwrap();
+        let pipeline_fft_init_coset_lde = device
+            .new_compute_pipeline_state_with_function(&f_fft_init_coset_lde)
+            .unwrap();
+        let pipeline_fft_coset_lde_single = device
+            .new_compute_pipeline_state_with_function(&f_fft_coset_lde_single)
+            .unwrap();
+        let pipeline_fft_init_coset_lde_local = device
+            .new_compute_pipeline_state_with_function(&f_fft_init_coset_lde_local)
+            .unwrap();
+        let pipeline_fft_stage = device
+            .new_compute_pipeline_state_with_function(&f_fft_stage)
+            .unwrap();
+        let pipeline_fft_stage_pair = device
+            .new_compute_pipeline_state_with_function(&f_fft_stage_pair)
+            .unwrap();
+        let pipeline_fft_stage_triple = device
+            .new_compute_pipeline_state_with_function(&f_fft_stage_triple)
+            .unwrap();
 
         MetalRuntime {
             device: Mutex::new(device),
@@ -166,6 +221,16 @@ lazy_static! {
             pipeline_poseidon_hash_leaves,
             pipeline_poseidon_hash_leaves_poly_major,
             pipeline_poseidon_hash_tree_level,
+            pipeline_fft_init_reverse_zero,
+            pipeline_fft_init_coset_lde,
+            pipeline_fft_coset_lde_single,
+            pipeline_fft_init_coset_lde_local,
+            pipeline_fft_stage,
+            pipeline_fft_stage_pair,
+            pipeline_fft_stage_triple,
+            fft_root_buffers: Mutex::new(HashMap::new()),
+            fft_flat_root_buffers: Mutex::new(HashMap::new()),
+            coset_shift_buffers: Mutex::new(HashMap::new()),
             init_time: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -183,6 +248,432 @@ impl MetalRuntime {
         self.init_time
     }
 
+    fn root_buffers_for_len(&self, fft_len: usize) -> Vec<Buffer> {
+        let mut cache = self.fft_root_buffers.lock().unwrap();
+        if let Some(root_buffers) = cache.get(&fft_len) {
+            return root_buffers.to_vec();
+        }
+
+        let root_table = fft_root_table::<GoldilocksField>(fft_len);
+        let device = self.device.lock().unwrap();
+        let root_buffers = root_table
+            .iter()
+            .map(|row| {
+                device.new_buffer_with_data(
+                    row.as_ptr() as *const core::ffi::c_void,
+                    (row.len() * std::mem::size_of::<u64>()) as u64,
+                    MTLResourceOptions::CPUCacheModeWriteCombined,
+                )
+            })
+            .collect::<Vec<_>>();
+        cache.insert(fft_len, root_buffers.clone());
+        root_buffers
+    }
+
+    fn flat_root_buffer_for_len(&self, fft_len: usize) -> Buffer {
+        let mut cache = self.fft_flat_root_buffers.lock().unwrap();
+        if let Some(buffer) = cache.get(&fft_len) {
+            return buffer.clone();
+        }
+
+        let root_table = fft_root_table::<GoldilocksField>(fft_len);
+        let mut roots = Vec::with_capacity(fft_len);
+        for row in root_table {
+            roots.extend(row);
+        }
+        debug_assert_eq!(roots.len(), fft_len);
+
+        let buffer = self.device.lock().unwrap().new_buffer_with_data(
+            roots.as_ptr() as *const core::ffi::c_void,
+            (roots.len() * std::mem::size_of::<u64>()) as u64,
+            MTLResourceOptions::CPUCacheModeWriteCombined,
+        );
+        cache.insert(fft_len, buffer.clone());
+        buffer
+    }
+
+    fn coset_shift_buffer_for_len(&self, coeff_len: usize) -> Buffer {
+        let mut cache = self.coset_shift_buffers.lock().unwrap();
+        if let Some(buffer) = cache.get(&coeff_len) {
+            return buffer.clone();
+        }
+
+        let mut shift_powers = vec![GoldilocksField::ZERO; coeff_len];
+        let coset_shift = GoldilocksField::coset_shift();
+        let mut shift_power = GoldilocksField::ONE;
+        for power in &mut shift_powers {
+            *power = shift_power;
+            shift_power *= coset_shift;
+        }
+
+        let buffer = self.device.lock().unwrap().new_buffer_with_data(
+            shift_powers.as_ptr() as *const core::ffi::c_void,
+            (shift_powers.len() * std::mem::size_of::<u64>()) as u64,
+            MTLResourceOptions::CPUCacheModeWriteCombined,
+        );
+        cache.insert(coeff_len, buffer.clone());
+        buffer
+    }
+
+    pub fn coset_lde_values_poly_major(
+        &self,
+        coeffs: &[GoldilocksField],
+        poly_count: usize,
+        coeff_len: usize,
+        rate_bits: usize,
+    ) -> Vec<GoldilocksField> {
+        let coeff_count = poly_count
+            .checked_mul(coeff_len)
+            .expect("Metal LDE coefficient count overflow");
+        assert_eq!(coeffs.len(), coeff_count);
+        assert!(coeff_len.is_power_of_two());
+
+        let fft_len = coeff_len << rate_bits;
+        let log_fft_len = fft_len.ilog2() as usize;
+        assert!(log_fft_len <= 32);
+        assert!(rate_bits <= log_fft_len);
+        let value_count = poly_count
+            .checked_mul(fft_len)
+            .expect("Metal LDE value count overflow");
+        assert!(
+            value_count <= u32::MAX as usize,
+            "Metal LDE value count must fit in u32 shader indices"
+        );
+
+        let root_buffers = self.root_buffers_for_len(fft_len);
+        let flat_roots_buffer = self.flat_root_buffer_for_len(fft_len);
+        let shift_powers_buffer = self.coset_shift_buffer_for_len(coeff_len);
+        let mut output = vec![GoldilocksField::ZERO; value_count];
+        let local_tile_log = log_fft_len.min(11);
+        let use_local_init = rate_bits < local_tile_log;
+
+        autoreleasepool::<(), _>(|| {
+            let device = self.device.lock().unwrap();
+            let coeffs_buffer = device.new_buffer_with_bytes_no_copy(
+                coeffs.as_ptr() as *const core::ffi::c_void,
+                (coeffs.len() * std::mem::size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            );
+            let output_buffer = device.new_buffer_with_bytes_no_copy(
+                output.as_mut_ptr() as *const core::ffi::c_void,
+                (output.len() * std::mem::size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            );
+            drop(device);
+
+            let command_buffer = self.command_queue.new_command_buffer();
+            let compute_pass_descriptor = ComputePassDescriptor::new();
+            let encoder =
+                command_buffer.compute_command_encoder_with_descriptor(compute_pass_descriptor);
+
+            // This CUDA-style path is correct but under-utilizes Apple GPUs for large FFTs:
+            // one threadgroup owns an entire polynomial, so dispatch overhead drops but occupancy
+            // is too low for the large global-memory stage loops.
+            let use_single_kernel = false;
+            if use_single_kernel {
+                let thread_count = self
+                    .pipeline_fft_coset_lde_single
+                    .max_total_threads_per_threadgroup()
+                    .min(1024);
+                let uniforms = [
+                    poly_count as u32,
+                    coeff_len as u32,
+                    fft_len as u32,
+                    log_fft_len as u32,
+                    rate_bits as u32,
+                    thread_count as u32,
+                ];
+
+                encoder.set_compute_pipeline_state(&self.pipeline_fft_coset_lde_single);
+                encoder.set_buffer(0, Some(&coeffs_buffer), 0);
+                encoder.set_buffer(1, Some(&shift_powers_buffer), 0);
+                encoder.set_buffer(2, Some(&output_buffer), 0);
+                encoder.set_buffer(3, Some(&flat_roots_buffer), 0);
+                encoder.set_bytes(
+                    4,
+                    (uniforms.len() * std::mem::size_of::<u32>()) as u64,
+                    uniforms.as_ptr() as *mut core::ffi::c_void,
+                );
+                let threadgroups_per_grid = get_size_for_count(poly_count);
+                let thread_group_size = MTLSize {
+                    width: thread_count,
+                    height: 1,
+                    depth: 1,
+                };
+                encoder.dispatch_thread_groups(threadgroups_per_grid, thread_group_size);
+            } else {
+                let first_global_stage = if use_local_init {
+                    let uniforms = [
+                        poly_count as u32,
+                        coeff_len as u32,
+                        fft_len as u32,
+                        log_fft_len as u32,
+                        rate_bits as u32,
+                        local_tile_log as u32,
+                    ];
+                    let tile_len = 1usize << local_tile_log;
+                    let tile_count = fft_len >> local_tile_log;
+
+                    encoder.set_compute_pipeline_state(&self.pipeline_fft_init_coset_lde_local);
+                    encoder.set_buffer(0, Some(&coeffs_buffer), 0);
+                    encoder.set_buffer(1, Some(&shift_powers_buffer), 0);
+                    encoder.set_buffer(2, Some(&output_buffer), 0);
+                    encoder.set_buffer(3, Some(&flat_roots_buffer), 0);
+                    encoder.set_bytes(
+                        4,
+                        (uniforms.len() * std::mem::size_of::<u32>()) as u64,
+                        uniforms.as_ptr() as *mut core::ffi::c_void,
+                    );
+                    encoder.set_threadgroup_memory_length(
+                        0,
+                        (tile_len * std::mem::size_of::<u64>()) as u64,
+                    );
+                    let threadgroups_per_grid = get_size_for_count(poly_count * tile_count);
+                    let thread_group_size = MTLSize {
+                        width: (tile_len >> 1) as u64,
+                        height: 1,
+                        depth: 1,
+                    };
+                    encoder.dispatch_thread_groups(threadgroups_per_grid, thread_group_size);
+                    local_tile_log
+                } else {
+                    let uniforms = [
+                        poly_count as u32,
+                        coeff_len as u32,
+                        fft_len as u32,
+                        log_fft_len as u32,
+                        rate_bits as u32,
+                    ];
+                    encoder.set_compute_pipeline_state(&self.pipeline_fft_init_coset_lde);
+                    encoder.set_buffer(0, Some(&coeffs_buffer), 0);
+                    encoder.set_buffer(1, Some(&shift_powers_buffer), 0);
+                    encoder.set_buffer(2, Some(&output_buffer), 0);
+                    encoder.set_bytes(
+                        3,
+                        (uniforms.len() * std::mem::size_of::<u32>()) as u64,
+                        uniforms.as_ptr() as *mut core::ffi::c_void,
+                    );
+                    let threads_per_grid = get_size_for_count(output.len());
+                    let thread_group_size = MTLSize {
+                        width: self.pipeline_fft_init_coset_lde.thread_execution_width(),
+                        height: 1,
+                        depth: 1,
+                    };
+                    encoder.dispatch_threads(threads_per_grid, thread_group_size);
+                    rate_bits
+                };
+
+                if first_global_stage < log_fft_len {
+                    encoder.memory_barrier_with_resources(&[output_buffer.as_ref()]);
+                }
+
+                let mut stage = first_global_stage;
+                while stage < log_fft_len {
+                    // Three-stage fusion is correct but was slightly slower in the prover
+                    // benchmark, likely due to higher register pressure. Keep the kernel around
+                    // for experiments, but use two-stage fusion in the default Metal LDE path.
+                    let use_triple_fusion = false;
+                    if use_triple_fusion && stage + 2 < log_fft_len {
+                        let half_m = 1usize << stage;
+                        let uniforms = [poly_count as u32, fft_len as u32, half_m as u32];
+
+                        encoder.set_compute_pipeline_state(&self.pipeline_fft_stage_triple);
+                        encoder.set_buffer(0, Some(&output_buffer), 0);
+                        encoder.set_buffer(1, Some(&root_buffers[stage]), 0);
+                        encoder.set_buffer(2, Some(&root_buffers[stage + 1]), 0);
+                        encoder.set_buffer(3, Some(&root_buffers[stage + 2]), 0);
+                        encoder.set_bytes(
+                            4,
+                            (uniforms.len() * std::mem::size_of::<u32>()) as u64,
+                            uniforms.as_ptr() as *mut core::ffi::c_void,
+                        );
+                        let threads_per_grid = get_size_for_count(poly_count * (fft_len >> 3));
+                        let thread_group_size = MTLSize {
+                            width: self.pipeline_fft_stage_triple.thread_execution_width(),
+                            height: 1,
+                            depth: 1,
+                        };
+                        encoder.dispatch_threads(threads_per_grid, thread_group_size);
+                        stage += 3;
+                    } else if stage + 1 < log_fft_len {
+                        let half_m = 1usize << stage;
+                        let uniforms = [poly_count as u32, fft_len as u32, half_m as u32];
+
+                        encoder.set_compute_pipeline_state(&self.pipeline_fft_stage_pair);
+                        encoder.set_buffer(0, Some(&output_buffer), 0);
+                        encoder.set_buffer(1, Some(&root_buffers[stage]), 0);
+                        encoder.set_buffer(2, Some(&root_buffers[stage + 1]), 0);
+                        encoder.set_bytes(
+                            3,
+                            (uniforms.len() * std::mem::size_of::<u32>()) as u64,
+                            uniforms.as_ptr() as *mut core::ffi::c_void,
+                        );
+                        let threads_per_grid = get_size_for_count(poly_count * (fft_len >> 2));
+                        let thread_group_size = MTLSize {
+                            width: self.pipeline_fft_stage_pair.thread_execution_width(),
+                            height: 1,
+                            depth: 1,
+                        };
+                        encoder.dispatch_threads(threads_per_grid, thread_group_size);
+                        stage += 2;
+                    } else {
+                        let half_m = 1usize << stage;
+                        let uniforms = [
+                            poly_count as u32,
+                            fft_len as u32,
+                            log_fft_len as u32,
+                            rate_bits as u32,
+                            half_m as u32,
+                        ];
+
+                        encoder.set_compute_pipeline_state(&self.pipeline_fft_stage);
+                        encoder.set_buffer(0, Some(&output_buffer), 0);
+                        encoder.set_buffer(1, Some(&root_buffers[stage]), 0);
+                        encoder.set_bytes(
+                            2,
+                            (uniforms.len() * std::mem::size_of::<u32>()) as u64,
+                            uniforms.as_ptr() as *mut core::ffi::c_void,
+                        );
+                        let threads_per_grid = get_size_for_count(poly_count * (fft_len >> 1));
+                        let thread_group_size = MTLSize {
+                            width: self.pipeline_fft_stage.thread_execution_width(),
+                            height: 1,
+                            depth: 1,
+                        };
+                        encoder.dispatch_threads(threads_per_grid, thread_group_size);
+                        stage += 1;
+                    }
+
+                    if stage < log_fft_len {
+                        encoder.memory_barrier_with_resources(&[output_buffer.as_ref()]);
+                    }
+                }
+            }
+
+            encoder.end_encoding();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+        });
+
+        output
+    }
+
+    pub fn fft_values_poly_major(
+        &self,
+        values: &[GoldilocksField],
+        poly_count: usize,
+        fft_len: usize,
+        zero_factor: usize,
+    ) -> Vec<GoldilocksField> {
+        let value_count = poly_count
+            .checked_mul(fft_len)
+            .expect("Metal FFT value count overflow");
+        assert_eq!(values.len(), value_count);
+        assert!(fft_len.is_power_of_two());
+        let log_fft_len = fft_len.ilog2() as usize;
+        assert!(log_fft_len <= 32);
+        assert!(zero_factor <= log_fft_len);
+        assert!(
+            value_count <= u32::MAX as usize,
+            "Metal FFT value count must fit in u32 shader indices"
+        );
+
+        let root_buffers = self.root_buffers_for_len(fft_len);
+        let mut output = vec![GoldilocksField::ZERO; values.len()];
+
+        autoreleasepool::<(), _>(|| {
+            let device = self.device.lock().unwrap();
+            let input_buffer = device.new_buffer_with_bytes_no_copy(
+                values.as_ptr() as *const core::ffi::c_void,
+                (values.len() * std::mem::size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            );
+            let output_buffer = device.new_buffer_with_bytes_no_copy(
+                output.as_mut_ptr() as *const core::ffi::c_void,
+                (output.len() * std::mem::size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            );
+            drop(device);
+
+            let command_buffer = self.command_queue.new_command_buffer();
+            let compute_pass_descriptor = ComputePassDescriptor::new();
+            let encoder =
+                command_buffer.compute_command_encoder_with_descriptor(compute_pass_descriptor);
+
+            let uniforms = [
+                poly_count as u32,
+                fft_len as u32,
+                log_fft_len as u32,
+                zero_factor as u32,
+                0u32,
+            ];
+            encoder.set_compute_pipeline_state(&self.pipeline_fft_init_reverse_zero);
+            encoder.set_buffer(0, Some(&input_buffer), 0);
+            encoder.set_buffer(1, Some(&output_buffer), 0);
+            encoder.set_bytes(
+                2,
+                (uniforms.len() * std::mem::size_of::<u32>()) as u64,
+                uniforms.as_ptr() as *mut core::ffi::c_void,
+            );
+            let threads_per_grid = get_size_for_count(values.len());
+            let thread_group_size = MTLSize {
+                width: self.pipeline_fft_init_reverse_zero.thread_execution_width(),
+                height: 1,
+                depth: 1,
+            };
+            encoder.dispatch_threads(threads_per_grid, thread_group_size);
+
+            if zero_factor < log_fft_len {
+                encoder.memory_barrier_with_resources(&[output_buffer.as_ref()]);
+            }
+
+            for (stage, roots_buffer) in root_buffers
+                .iter()
+                .enumerate()
+                .take(log_fft_len)
+                .skip(zero_factor)
+            {
+                let half_m = 1usize << stage;
+                let uniforms = [
+                    poly_count as u32,
+                    fft_len as u32,
+                    log_fft_len as u32,
+                    zero_factor as u32,
+                    half_m as u32,
+                ];
+
+                encoder.set_compute_pipeline_state(&self.pipeline_fft_stage);
+                encoder.set_buffer(0, Some(&output_buffer), 0);
+                encoder.set_buffer(1, Some(roots_buffer), 0);
+                encoder.set_bytes(
+                    2,
+                    (uniforms.len() * std::mem::size_of::<u32>()) as u64,
+                    uniforms.as_ptr() as *mut core::ffi::c_void,
+                );
+                let threads_per_grid = get_size_for_count(poly_count * (fft_len >> 1));
+                let thread_group_size = MTLSize {
+                    width: self.pipeline_fft_stage.thread_execution_width(),
+                    height: 1,
+                    depth: 1,
+                };
+                encoder.dispatch_threads(threads_per_grid, thread_group_size);
+                if stage + 1 < log_fft_len {
+                    encoder.memory_barrier_with_resources(&[output_buffer.as_ref()]);
+                }
+            }
+
+            encoder.end_encoding();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+        });
+
+        output
+    }
+
     pub fn hash_merkle_tree_digests(
         leaves: &[Vec<GoldilocksField>],
         cap_height: usize,
@@ -192,10 +683,24 @@ impl MetalRuntime {
         let leaf_length = leaves[0].len();
         let leaf_count = leaves.len();
         let tree_height = leaf_count.ilog2() as usize;
+        let input_len = leaf_count
+            .checked_mul(leaf_length)
+            .expect("Metal Merkle input length overflow");
+        assert!(
+            input_len <= u32::MAX as usize,
+            "Metal Merkle input length must fit in u32 shader indices"
+        );
 
         let num_caps = 1usize << cap_height;
         let total_tree_hashes = leaf_count * 2 - 1;
         let total_digests = total_tree_hashes - (num_caps * 2 - 1);
+        assert!(
+            total_digests
+                .checked_mul(4)
+                .expect("Metal Merkle digest length overflow")
+                <= u32::MAX as usize,
+            "Metal Merkle digest length must fit in u32 shader indices"
+        );
 
         let flatten_start = Instant::now();
         let leaf_u64s = flatten_leaves_parallel(leaves, leaf_length);
@@ -264,12 +769,26 @@ impl MetalRuntime {
     ) -> Vec<GoldilocksDigest> {
         let profile = metal_profile_enabled();
         let total_start = Instant::now();
-        assert_eq!(poly_values.len(), leaf_count * leaf_length);
+        let input_len = leaf_count
+            .checked_mul(leaf_length)
+            .expect("Metal poly-major Merkle input length overflow");
+        assert_eq!(poly_values.len(), input_len);
+        assert!(
+            input_len <= u32::MAX as usize,
+            "Metal poly-major Merkle input length must fit in u32 shader indices"
+        );
         let tree_height = leaf_count.ilog2() as usize;
 
         let num_caps = 1usize << cap_height;
         let total_tree_hashes = leaf_count * 2 - 1;
         let total_digests = total_tree_hashes - (num_caps * 2 - 1);
+        assert!(
+            total_digests
+                .checked_mul(4)
+                .expect("Metal poly-major Merkle digest length overflow")
+                <= u32::MAX as usize,
+            "Metal poly-major Merkle digest length must fit in u32 shader indices"
+        );
 
         let mut input_buffer_time = Duration::ZERO;
         let mut hash_profile = MetalHashProfile::default();
@@ -562,6 +1081,8 @@ impl MetalRuntime {
 
 #[cfg(test)]
 mod tests {
+    use plonky2_field::polynomial::PolynomialCoeffs;
+
     use super::*;
 
     fn reverse_bits(value: usize, num_bits: usize) -> usize {
@@ -628,5 +1149,67 @@ mod tests {
         );
 
         assert_eq!(poly_major, row_major);
+    }
+
+    #[test]
+    fn fft_poly_major_matches_cpu_when_available() {
+        if !is_available() {
+            eprintln!("skipping Metal FFT test: no Metal device available");
+            return;
+        }
+
+        let poly_count = 3;
+        let fft_len = 64;
+        let zero_factor = 2;
+        let live_coeff_len = fft_len >> zero_factor;
+        let mut values = vec![GoldilocksField::ZERO; poly_count * fft_len];
+        for poly in 0..poly_count {
+            for i in 0..live_coeff_len {
+                values[poly * fft_len + i] =
+                    GoldilocksField::from_canonical_u64((poly * 97 + i * 13 + 5) as u64);
+            }
+        }
+
+        let metal =
+            MetalRuntime::get().fft_values_poly_major(&values, poly_count, fft_len, zero_factor);
+        for poly in 0..poly_count {
+            let start = poly * fft_len;
+            let cpu = PolynomialCoeffs::new(values[start..start + fft_len].to_vec())
+                .fft_with_options(Some(zero_factor), None)
+                .values;
+            assert_eq!(&metal[start..start + fft_len], cpu.as_slice());
+        }
+    }
+
+    #[test]
+    fn coset_lde_poly_major_matches_cpu_when_available() {
+        if !is_available() {
+            eprintln!("skipping Metal coset LDE test: no Metal device available");
+            return;
+        }
+
+        let poly_count = 2;
+        let coeff_len = 32;
+        let rate_bits = 3;
+        let fft_len = coeff_len << rate_bits;
+        let coeffs = (0..poly_count)
+            .flat_map(|poly| {
+                (0..coeff_len).map(move |i| {
+                    GoldilocksField::from_canonical_u64((poly * 131 + i * 17 + 11) as u64)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let metal = MetalRuntime::get()
+            .coset_lde_values_poly_major(&coeffs, poly_count, coeff_len, rate_bits);
+        for poly in 0..poly_count {
+            let coeff_start = poly * coeff_len;
+            let eval_start = poly * fft_len;
+            let cpu = PolynomialCoeffs::new(coeffs[coeff_start..coeff_start + coeff_len].to_vec())
+                .lde(rate_bits)
+                .coset_fft_with_options(GoldilocksField::coset_shift(), Some(rate_bits), None)
+                .values;
+            assert_eq!(&metal[eval_start..eval_start + fft_len], cpu.as_slice());
+        }
     }
 }

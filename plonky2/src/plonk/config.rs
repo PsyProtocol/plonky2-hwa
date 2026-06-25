@@ -450,25 +450,50 @@ impl<C: GenericConfig<2, F = GoldilocksField, Hasher = PoseidonHash>>
             if cap_height < tree_height && tree_height >= 13 && plonky2_metal::is_available() {
                 let mut lde_values = vec![GoldilocksField::ZERO; leaf_count * leaf_length];
                 timed!(timing, "generate LDE values", {
-                    lde_values
-                        .par_chunks_mut(leaf_count)
-                        .enumerate()
-                        .for_each(|(i, dst)| {
-                            if i < polynomials.len() {
-                                let values = polynomials[i]
-                                    .lde(rate_bits)
-                                    .coset_fft_with_options(
-                                        GoldilocksField::coset_shift(),
-                                        Some(rate_bits),
-                                        fft_root_table,
-                                    )
-                                    .values;
-                                dst.copy_from_slice(&values);
-                            } else {
+                    if plonky2_metal::lde_enabled() {
+                        let mut coeffs = vec![GoldilocksField::ZERO; polynomials.len() * degree];
+                        coeffs
+                            .par_chunks_mut(degree)
+                            .zip(polynomials.par_iter())
+                            .for_each(|(dst, polynomial)| {
+                                dst.copy_from_slice(&polynomial.coeffs);
+                            });
+                        let metal_values =
+                            plonky2_metal::MetalRuntime::get().coset_lde_values_poly_major(
+                                &coeffs,
+                                polynomials.len(),
+                                degree,
+                                rate_bits,
+                            );
+                        lde_values[..metal_values.len()].copy_from_slice(&metal_values);
+                        lde_values
+                            .par_chunks_mut(leaf_count)
+                            .skip(polynomials.len())
+                            .for_each(|dst| {
                                 let salt = GoldilocksField::rand_vec(leaf_count);
                                 dst.copy_from_slice(&salt);
-                            }
-                        });
+                            });
+                    } else {
+                        lde_values
+                            .par_chunks_mut(leaf_count)
+                            .enumerate()
+                            .for_each(|(i, dst)| {
+                                if i < polynomials.len() {
+                                    let values = polynomials[i]
+                                        .lde(rate_bits)
+                                        .coset_fft_with_options(
+                                            GoldilocksField::coset_shift(),
+                                            Some(rate_bits),
+                                            fft_root_table,
+                                        )
+                                        .values;
+                                    dst.copy_from_slice(&values);
+                                } else {
+                                    let salt = GoldilocksField::rand_vec(leaf_count);
+                                    dst.copy_from_slice(&salt);
+                                }
+                            });
+                    }
                 });
 
                 let digests = timed!(
@@ -846,6 +871,56 @@ mod tests {
                 None,
             )
             .unwrap();
+
+        assert!(metal.merkle_tree.leaves.is_empty());
+        assert_eq!(metal.merkle_tree.digests, cpu.merkle_tree.digests);
+        assert_eq!(metal.merkle_tree.cap, cpu.merkle_tree.cap);
+        for &index in &[0, 1, 17, 4096, 8191] {
+            assert_eq!(metal.get_leaf_values(index), cpu.get_leaf_values(index));
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_lde_compute_from_coeffs_matches_cpu_for_large_tree() {
+        if !plonky2_metal::is_available() {
+            eprintln!("skipping Metal LDE compute_from_coeffs test: no Metal device available");
+            return;
+        }
+
+        let polynomials = (0..6)
+            .map(|poly| {
+                PolynomialCoeffs::new(
+                    (0..1024)
+                        .map(|i| GoldilocksField::from_canonical_usize(poly * 31 + i * 17 + 5))
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut cpu_timing = TimingTree::new("cpu", Level::Debug);
+        let mut metal_timing = TimingTree::new("metal lde", Level::Debug);
+        let cpu = PolynomialBatch::<GoldilocksField, PoseidonGoldilocksConfig, 2>::from_coeffs(
+            polynomials.clone(),
+            3,
+            false,
+            4,
+            &mut cpu_timing,
+            None,
+        )
+        .unwrap();
+
+        plonky2_metal::set_lde_enabled(true);
+        let metal =
+            PolynomialBatch::<GoldilocksField, PoseidonGoldilocksMetalConfig, 2>::from_coeffs(
+                polynomials,
+                3,
+                false,
+                4,
+                &mut metal_timing,
+                None,
+            )
+            .unwrap();
+        plonky2_metal::set_lde_enabled(false);
 
         assert!(metal.merkle_tree.leaves.is_empty());
         assert_eq!(metal.merkle_tree.digests, cpu.merkle_tree.digests);

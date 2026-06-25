@@ -132,18 +132,27 @@ fn main() -> Result<()> {
         .nth(2)
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(1);
-    let profile_mode = std::env::args().nth(3);
-    let profile_prover = matches!(profile_mode.as_deref(), Some("profile-detail") | Some("detail"));
+    let flags = std::env::args().skip(3).collect::<Vec<_>>();
+    let profile_mode = flags
+        .iter()
+        .find(|flag| matches!(flag.as_str(), "profile" | "profile-detail" | "detail"))
+        .map(String::as_str);
+    let metal_lde = flags
+        .iter()
+        .any(|flag| matches!(flag.as_str(), "metal-lde" | "lde"));
+    let profile_prover = matches!(profile_mode, Some("profile-detail") | Some("detail"));
     if profile_prover {
         init_profile_logger();
     }
-    configure_metal_profile(profile_mode.as_deref());
+    configure_metal_profile(profile_mode);
+    configure_metal_lde(metal_lde);
     let metal_available = metal_available();
     println!("BENCH_ITERS={num_iters}");
     println!("BENCH_ROUNDS={rounds}");
     if let Some(profile_mode) = profile_mode {
         println!("BENCH_PROFILE={profile_mode}");
     }
+    println!("BENCH_METAL_LDE={metal_lde}");
     println!("metal device available: {metal_available}");
     if !metal_available {
         println!("metal config will use CPU fallback in this environment");
@@ -209,6 +218,11 @@ fn configure_metal_profile(profile_mode: Option<&str>) {
     }
 }
 
+#[cfg(feature = "metal")]
+fn configure_metal_lde(enabled: bool) {
+    plonky2_metal::set_lde_enabled(enabled);
+}
+
 #[cfg(not(feature = "metal"))]
 fn metal_available() -> bool {
     false
@@ -219,3 +233,6 @@ fn warm_up_metal() {}
 
 #[cfg(not(feature = "metal"))]
 fn configure_metal_profile(_profile_mode: Option<&str>) {}
+
+#[cfg(not(feature = "metal"))]
+fn configure_metal_lde(_enabled: bool) {}
