@@ -235,8 +235,13 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
     /// Create a Merkle proof from a leaf index.
     pub fn prove(&self, leaf_index: usize) -> MerkleProof<F, H> {
         let cap_height = log2_strict(self.cap.len());
+        let leaves_len = if self.leaves.is_empty() {
+            self.digests.len() / 2 + self.cap.len()
+        } else {
+            self.leaves.len()
+        };
         let siblings =
-            merkle_tree_prove::<F, H>(leaf_index, self.leaves.len(), cap_height, &self.digests);
+            merkle_tree_prove::<F, H>(leaf_index, leaves_len, cap_height, &self.digests);
 
         MerkleProof { siblings }
     }

@@ -12,17 +12,23 @@ use crate::fri::proof::{FriInitialTreeProof, FriProof, FriQueryRound, FriQuerySt
 use crate::fri::{FriConfig, FriParams};
 use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
+use crate::hash::merkle_proofs::MerkleProof;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::GenericConfig;
+use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
 use crate::util::reverse_index_bits_in_place;
 use crate::util::timing::TimingTree;
 
 /// Builds a FRI proof.
+pub trait FriInitialTree<F: RichField, H: Hasher<F>>: Sync {
+    fn leaf(&self, index: usize) -> Vec<F>;
+    fn prove(&self, index: usize) -> MerkleProof<F, H>;
+}
+
 pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
-    initial_merkle_trees: &[&MerkleTree<F, C::Hasher>],
+    initial_merkle_trees: &[&dyn FriInitialTree<F, C::Hasher>],
     // Coefficients of the polynomial on which the LDT is performed. Only the first `1/rate` coefficients are non-zero.
     lde_polynomial_coeffs: PolynomialCoeffs<F::Extension>,
     // Evaluation of the polynomial on the large domain.
@@ -206,7 +212,7 @@ fn fri_prover_query_rounds<
     C: GenericConfig<D, F = F>,
     const D: usize,
 >(
-    initial_merkle_trees: &[&MerkleTree<F, C::Hasher>],
+    initial_merkle_trees: &[&dyn FriInitialTree<F, C::Hasher>],
     trees: &[MerkleTree<F, C::Hasher>],
     challenger: &mut Challenger<F, C::Hasher>,
     n: usize,
@@ -227,7 +233,7 @@ fn fri_prover_query_round<
     C: GenericConfig<D, F = F>,
     const D: usize,
 >(
-    initial_merkle_trees: &[&MerkleTree<F, C::Hasher>],
+    initial_merkle_trees: &[&dyn FriInitialTree<F, C::Hasher>],
     trees: &[MerkleTree<F, C::Hasher>],
     mut x_index: usize,
     fri_params: &FriParams,
@@ -235,7 +241,7 @@ fn fri_prover_query_round<
     let mut query_steps = Vec::new();
     let initial_proof = initial_merkle_trees
         .iter()
-        .map(|t| (t.get(x_index).to_vec(), t.prove(x_index)))
+        .map(|t| (t.leaf(x_index), t.prove(x_index)))
         .collect::<Vec<_>>();
     for (i, tree) in trees.iter().enumerate() {
         let arity_bits = fri_params.reduction_arity_bits[i];

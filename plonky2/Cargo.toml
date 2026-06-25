@@ -13,6 +13,8 @@ categories.workspace = true
 
 [features]
 default = ["gate_testing", "parallel", "rand_chacha", "std", "timing", "ts-rs", "serialize_speedy"]
+cuda = ["std", "dep:plonky2_cuda"]
+metal = ["std", "dep:plonky2_metal"]
 gate_testing = []
 parallel = ["hashbrown/rayon", "plonky2_maybe_rayon/parallel"]
 std = ["anyhow/std", "rand/std", "itertools/use_std"]
@@ -47,6 +49,8 @@ ts-rs = { workspace = true, optional = true }
 plonky2_field = { version = "1.0.0", path = "../field" }
 plonky2_maybe_rayon = { version = "1.0.0", path = "../maybe_rayon" }
 plonky2_util = { version = "1.0.0", path = "../util", default-features = false }
+plonky2_cuda = { version = "0.1.0", path = "../gpu/cuda", optional = true }
+plonky2_metal = { version = "0.1.0", path = "../gpu/metal", optional = true }
 
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]

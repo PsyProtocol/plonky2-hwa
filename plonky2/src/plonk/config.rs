@@ -9,6 +9,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
 use core::fmt::Debug;
+use core::marker::PhantomData;
 
 use plonky2_field::polynomial::PolynomialValues;
 use plonky2_maybe_rayon::*;
@@ -21,10 +22,14 @@ use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::fft::FftRootTable;
 use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::polynomial::PolynomialCoeffs;
+#[cfg(feature = "metal")]
+use crate::field::types::{Field, Sample};
 use crate::fri::oracle::PolynomialBatch;
 use crate::hash::hash_types::{HashOut, RichField};
 use crate::hash::hashing::PlonkyPermutation;
 use crate::hash::keccak::KeccakHash;
+#[cfg(feature = "metal")]
+use crate::hash::merkle_tree::MerkleCap;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::hash::poseidon::PoseidonHash;
 use crate::iop::target::{BoolTarget, Target};
@@ -147,6 +152,144 @@ pub trait ProverCompute<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>
     ) -> anyhow::Result<MerkleTree<F, C::Hasher>>;
 }
 
+fn compute_from_coeffs_with_prover_compute<
+    PC: ProverCompute<F, C, D>,
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    timing: &mut TimingTree,
+    polynomials: Vec<PolynomialCoeffs<F>>,
+    cap_height: usize,
+    rate_bits: usize,
+    blinding: bool,
+    fft_root_table: Option<&FftRootTable<F>>,
+) -> anyhow::Result<PolynomialBatch<F, C, D>> {
+    const SALT_SIZE: usize = 4;
+    let salt_size = if blinding { SALT_SIZE } else { 0 };
+
+    let degree = polynomials[0].len();
+    let degree_log = log2_strict(degree);
+
+    let lde_values: Vec<Vec<F>> = timed!(
+        timing,
+        "generate LDE values",
+        polynomials
+            .par_iter()
+            .map(|p| {
+                p.lde(rate_bits)
+                    .coset_fft_with_options(F::coset_shift(), Some(rate_bits), fft_root_table)
+                    .values
+            })
+            .chain(
+                (0..salt_size)
+                    .into_par_iter()
+                    .map(|_| F::rand_vec(degree << rate_bits)),
+            )
+            .collect()
+    );
+
+    let mut leaves = transpose(&lde_values);
+    reverse_index_bits_in_place(&mut leaves);
+
+    let merkle_tree = timed!(
+        timing,
+        "Merkle tree",
+        PC::build_merkle_tree(timing, leaves, cap_height)?
+    );
+    Ok(PolynomialBatch {
+        polynomials,
+        merkle_tree,
+        lde_values: None,
+        degree_log,
+        rate_bits,
+        blinding,
+    })
+}
+
+fn compute_from_values_with_prover_compute<
+    PC: ProverCompute<F, C, D>,
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    timing: &mut TimingTree,
+    values: Vec<PolynomialValues<F>>,
+    rate_bits: usize,
+    blinding: bool,
+    cap_height: usize,
+    fft_root_table: Option<&FftRootTable<F>>,
+) -> anyhow::Result<PolynomialBatch<F, C, D>> {
+    let coeffs = timed!(
+        timing,
+        "IFFT",
+        values.into_par_iter().map(|v| v.ifft()).collect::<Vec<_>>()
+    );
+    PC::compute_from_coeffs(
+        timing,
+        coeffs,
+        cap_height,
+        rate_bits,
+        blinding,
+        fft_root_table,
+    )
+}
+
+fn transpose_and_compute_from_coeffs_with_prover_compute<
+    PC: ProverCompute<F, C, D>,
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    timing: &mut TimingTree,
+    pre_transposed_quotient_polys: Vec<Vec<F>>,
+    quotient_degree: usize,
+    degree: usize,
+    rate_bits: usize,
+    blinding: bool,
+    cap_height: usize,
+    fft_root_table: Option<&FftRootTable<F>>,
+) -> anyhow::Result<PolynomialBatch<F, C, D>> {
+    let quotient_polys: Vec<PolynomialCoeffs<F>> = timed!(
+        timing,
+        "coset IFFT quotient polys",
+        transpose(&pre_transposed_quotient_polys)
+            .into_par_iter()
+            .map(PolynomialValues::new)
+            .map(|values| values.coset_ifft(F::coset_shift()))
+            .collect::<Vec<_>>()
+    );
+
+    let all_quotient_poly_chunks: Vec<PolynomialCoeffs<F>> = timed!(
+        timing,
+        "split up quotient polys",
+        quotient_polys
+            .into_par_iter()
+            .flat_map(|mut quotient_poly| {
+                quotient_poly.trim_to_len(quotient_degree).expect(
+                    "Quotient has failed, the vanishing polynomial is not divisible by Z_H",
+                );
+                // Split quotient into degree-n chunks.
+                quotient_poly.chunks(degree)
+            })
+            .collect()
+    );
+
+    let quotient_polys_commitment = timed!(
+        timing,
+        "commit to quotient polys",
+        PC::compute_from_coeffs(
+            timing,
+            all_quotient_poly_chunks,
+            cap_height,
+            rate_bits,
+            blinding,
+            fft_root_table,
+        )?
+    );
+    Ok(quotient_polys_commitment)
+}
+
 /// Default CPU implementation of `ProverCompute`.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct CpuProverCompute;
@@ -161,46 +304,14 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         blinding: bool,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> anyhow::Result<PolynomialBatch<F, C, D>> {
-        //println!("CPU ProverCompute::compute_from_coeffs called");
-        const SALT_SIZE: usize = 4;
-        let salt_size = if blinding { SALT_SIZE } else { 0 };
-
-        let degree = polynomials[0].len();
-        let degree_log = log2_strict(degree);
-
-        let lde_values: Vec<Vec<F>> = timed!(
+        compute_from_coeffs_with_prover_compute::<Self, F, C, D>(
             timing,
-            "generate LDE values",
-            polynomials
-                .par_iter()
-                .map(|p| {
-                    p.lde(rate_bits)
-                        .coset_fft_with_options(F::coset_shift(), Some(rate_bits), fft_root_table)
-                        .values
-                })
-                .chain(
-                    (0..salt_size)
-                        .into_par_iter()
-                        .map(|_| F::rand_vec(degree << rate_bits)),
-                )
-                .collect()
-        );
-
-        let mut leaves = transpose(&lde_values);
-        reverse_index_bits_in_place(&mut leaves);
-
-        let merkle_tree = timed!(
-            timing,
-            "Merkle tree",
-            <Self as ProverCompute<F, C, D>>::build_merkle_tree(timing, leaves, cap_height)?
-        );
-        Ok(PolynomialBatch {
             polynomials,
-            merkle_tree,
-            degree_log,
+            cap_height,
             rate_bits,
             blinding,
-        })
+            fft_root_table,
+        )
     }
 
     fn compute_from_values(
@@ -211,18 +322,12 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         cap_height: usize,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> anyhow::Result<PolynomialBatch<F, C, D>> {
-        //println!("CPU ProverCompute::compute_from_values called");
-        let coeffs = timed!(
+        compute_from_values_with_prover_compute::<Self, F, C, D>(
             timing,
-            "IFFT",
-            values.into_par_iter().map(|v| v.ifft()).collect::<Vec<_>>()
-        );
-        Self::compute_from_coeffs(
-            timing,
-            coeffs,
-            cap_height,
+            values,
             rate_bits,
             blinding,
+            cap_height,
             fft_root_table,
         )
     }
@@ -237,45 +342,16 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         cap_height: usize,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> anyhow::Result<PolynomialBatch<F, C, D>> {
-        //println!("CPU ProverCompute::transpose_and_compute_from_coeffs called");
-        let quotient_polys: Vec<PolynomialCoeffs<F>> = timed!(
+        transpose_and_compute_from_coeffs_with_prover_compute::<Self, F, C, D>(
             timing,
-            "coset IFFT quotient polys",
-            transpose(&pre_transposed_quotient_polys)
-                .into_par_iter()
-                .map(PolynomialValues::new)
-                .map(|values| values.coset_ifft(F::coset_shift()))
-                .collect::<Vec<_>>()
-        );
-
-        let all_quotient_poly_chunks: Vec<PolynomialCoeffs<F>> = timed!(
-            timing,
-            "split up quotient polys",
-            quotient_polys
-                .into_par_iter()
-                .flat_map(|mut quotient_poly| {
-                    quotient_poly.trim_to_len(quotient_degree).expect(
-                        "Quotient has failed, the vanishing polynomial is not divisible by Z_H",
-                    );
-                    // Split quotient into degree-n chunks.
-                    quotient_poly.chunks(degree)
-                })
-                .collect()
-        );
-
-        let quotient_polys_commitment = timed!(
-            timing,
-            "commit to quotient polys",
-            Self::compute_from_coeffs(
-                timing,
-                all_quotient_poly_chunks,
-                cap_height,
-                rate_bits,
-                blinding,
-                fft_root_table,
-            )?
-        );
-        Ok(quotient_polys_commitment)
+            pre_transposed_quotient_polys,
+            quotient_degree,
+            degree,
+            rate_bits,
+            blinding,
+            cap_height,
+            fft_root_table,
+        )
     }
 
     fn build_merkle_tree(
@@ -286,6 +362,307 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         //println!("CPU ProverCompute::build_merkle_tree called");
         let merkle_tree = timed!(timing, "Merkle tree", MerkleTree::new(leaves, cap_height));
         Ok(merkle_tree)
+    }
+}
+
+/// Marker for the placeholder CUDA backend.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct CudaBackend;
+
+#[cfg(feature = "metal")]
+fn get_node_hash_index_in_digests(
+    num_layers: usize,
+    tree_length: usize,
+    level: usize,
+    index: usize,
+) -> usize {
+    let leaf_index = index << level;
+    let tree_index = index >> (num_layers - level);
+    let pair_index = ((leaf_index) & ((1 << num_layers) - 1)) >> level;
+    let parity = pair_index & 1;
+    let pair_index = pair_index >> 1;
+
+    let siblings_index = (pair_index << (level + 1)) + (1 << level) - 1;
+    let d_index = 2 * siblings_index + parity;
+    d_index + (tree_index * tree_length)
+}
+
+#[cfg(feature = "metal")]
+fn metal_merkle_tree_from_digests(
+    leaves: Vec<Vec<GoldilocksField>>,
+    leaf_count: usize,
+    digests: Vec<HashOut<GoldilocksField>>,
+    cap_height: usize,
+) -> MerkleTree<GoldilocksField, PoseidonHash> {
+    let tree_height = log2_strict(leaf_count);
+    let num_caps = 1usize << cap_height;
+    let total_tree_hashes = leaf_count * 2 - 1;
+    let total_digests = total_tree_hashes - (num_caps * 2 - 1);
+    let num_layers = tree_height - cap_height;
+    let tree_length = total_digests >> cap_height;
+
+    let mut caps = Vec::with_capacity(num_caps);
+    let cap_child_level = tree_height - cap_height - 1;
+    for i in 0..num_caps {
+        let left_index =
+            get_node_hash_index_in_digests(num_layers, tree_length, cap_child_level, i * 2);
+        caps.push(<PoseidonHash as Hasher<GoldilocksField>>::two_to_one(
+            digests[left_index],
+            digests[left_index + 1],
+        ));
+    }
+
+    MerkleTree {
+        leaves,
+        digests,
+        cap: MerkleCap(caps),
+    }
+}
+
+/// Metal-backed prover compute implementation.
+///
+/// Currently this accelerates Poseidon Goldilocks Merkle tree construction for large trees and
+/// delegates FFTs and small trees to the CPU path.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct MetalProverCompute;
+
+impl<C: GenericConfig<2, F = GoldilocksField, Hasher = PoseidonHash>>
+    ProverCompute<GoldilocksField, C, 2> for MetalProverCompute
+{
+    fn compute_from_coeffs(
+        timing: &mut TimingTree,
+        polynomials: Vec<PolynomialCoeffs<GoldilocksField>>,
+        cap_height: usize,
+        rate_bits: usize,
+        blinding: bool,
+        fft_root_table: Option<&FftRootTable<GoldilocksField>>,
+    ) -> anyhow::Result<PolynomialBatch<GoldilocksField, C, 2>> {
+        #[cfg(feature = "metal")]
+        {
+            const SALT_SIZE: usize = 4;
+            let salt_size = if blinding { SALT_SIZE } else { 0 };
+            let degree = polynomials[0].len();
+            let degree_log = log2_strict(degree);
+            let leaf_count = degree << rate_bits;
+            let leaf_length = polynomials.len() + salt_size;
+            let tree_height = log2_strict(leaf_count);
+
+            if cap_height < tree_height && tree_height >= 13 && plonky2_metal::is_available() {
+                let mut lde_values = vec![GoldilocksField::ZERO; leaf_count * leaf_length];
+                timed!(timing, "generate LDE values", {
+                    lde_values
+                        .par_chunks_mut(leaf_count)
+                        .enumerate()
+                        .for_each(|(i, dst)| {
+                            if i < polynomials.len() {
+                                let values = polynomials[i]
+                                    .lde(rate_bits)
+                                    .coset_fft_with_options(
+                                        GoldilocksField::coset_shift(),
+                                        Some(rate_bits),
+                                        fft_root_table,
+                                    )
+                                    .values;
+                                dst.copy_from_slice(&values);
+                            } else {
+                                let salt = GoldilocksField::rand_vec(leaf_count);
+                                dst.copy_from_slice(&salt);
+                            }
+                        });
+                });
+
+                let digests = timed!(
+                    timing,
+                    "Merkle tree",
+                    plonky2_metal::MetalRuntime::hash_merkle_tree_poly_major_digests(
+                        &lde_values,
+                        leaf_count,
+                        leaf_length,
+                        cap_height,
+                    )
+                    .into_iter()
+                    .map(HashOut::from)
+                    .collect::<Vec<_>>()
+                );
+                let merkle_tree =
+                    metal_merkle_tree_from_digests(Vec::new(), leaf_count, digests, cap_height);
+
+                return Ok(PolynomialBatch {
+                    polynomials,
+                    merkle_tree,
+                    lde_values: Some(lde_values),
+                    degree_log,
+                    rate_bits,
+                    blinding,
+                });
+            }
+        }
+
+        compute_from_coeffs_with_prover_compute::<Self, GoldilocksField, C, 2>(
+            timing,
+            polynomials,
+            cap_height,
+            rate_bits,
+            blinding,
+            fft_root_table,
+        )
+    }
+
+    fn compute_from_values(
+        timing: &mut TimingTree,
+        values: Vec<PolynomialValues<GoldilocksField>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        fft_root_table: Option<&FftRootTable<GoldilocksField>>,
+    ) -> anyhow::Result<PolynomialBatch<GoldilocksField, C, 2>> {
+        compute_from_values_with_prover_compute::<Self, GoldilocksField, C, 2>(
+            timing,
+            values,
+            rate_bits,
+            blinding,
+            cap_height,
+            fft_root_table,
+        )
+    }
+
+    fn transpose_and_compute_from_coeffs(
+        timing: &mut TimingTree,
+        pre_transposed_quotient_polys: Vec<Vec<GoldilocksField>>,
+        quotient_degree: usize,
+        degree: usize,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        fft_root_table: Option<&FftRootTable<GoldilocksField>>,
+    ) -> anyhow::Result<PolynomialBatch<GoldilocksField, C, 2>> {
+        transpose_and_compute_from_coeffs_with_prover_compute::<Self, GoldilocksField, C, 2>(
+            timing,
+            pre_transposed_quotient_polys,
+            quotient_degree,
+            degree,
+            rate_bits,
+            blinding,
+            cap_height,
+            fft_root_table,
+        )
+    }
+
+    fn build_merkle_tree(
+        timing: &mut TimingTree,
+        leaves: Vec<Vec<GoldilocksField>>,
+        cap_height: usize,
+    ) -> anyhow::Result<MerkleTree<GoldilocksField, C::Hasher>> {
+        let tree_height = log2_strict(leaves.len());
+        if cap_height == tree_height || tree_height < 13 {
+            return <CpuProverCompute as ProverCompute<GoldilocksField, C, 2>>::build_merkle_tree(
+                timing, leaves, cap_height,
+            );
+        }
+
+        #[cfg(feature = "metal")]
+        {
+            if plonky2_metal::is_available() {
+                let digests =
+                    plonky2_metal::MetalRuntime::hash_merkle_tree_digests(&leaves, cap_height)
+                        .into_iter()
+                        .map(HashOut::from)
+                        .collect::<Vec<_>>();
+
+                let leaf_count = leaves.len();
+                return Ok(metal_merkle_tree_from_digests(
+                    leaves, leaf_count, digests, cap_height,
+                ));
+            }
+        }
+
+        <CpuProverCompute as ProverCompute<GoldilocksField, C, 2>>::build_merkle_tree(
+            timing, leaves, cap_height,
+        )
+    }
+}
+
+/// Placeholder for a GPU-backed prover compute implementation.
+///
+/// This currently delegates to the CPU implementation. The backend marker keeps future CUDA kernel
+/// wiring isolated behind this `ProverCompute` implementation.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct PlaceholderGpuProverCompute<B>(PhantomData<B>);
+
+/// Placeholder for a CUDA-backed prover compute implementation.
+pub type CudaProverCompute = PlaceholderGpuProverCompute<CudaBackend>;
+
+impl<
+        B: 'static + Debug + Clone + Send + Sync,
+        C: GenericConfig<2, F = GoldilocksField, Hasher = PoseidonHash>,
+    > ProverCompute<GoldilocksField, C, 2> for PlaceholderGpuProverCompute<B>
+{
+    fn compute_from_coeffs(
+        timing: &mut TimingTree,
+        polynomials: Vec<PolynomialCoeffs<GoldilocksField>>,
+        cap_height: usize,
+        rate_bits: usize,
+        blinding: bool,
+        fft_root_table: Option<&FftRootTable<GoldilocksField>>,
+    ) -> anyhow::Result<PolynomialBatch<GoldilocksField, C, 2>> {
+        compute_from_coeffs_with_prover_compute::<Self, GoldilocksField, C, 2>(
+            timing,
+            polynomials,
+            cap_height,
+            rate_bits,
+            blinding,
+            fft_root_table,
+        )
+    }
+
+    fn compute_from_values(
+        timing: &mut TimingTree,
+        values: Vec<PolynomialValues<GoldilocksField>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        fft_root_table: Option<&FftRootTable<GoldilocksField>>,
+    ) -> anyhow::Result<PolynomialBatch<GoldilocksField, C, 2>> {
+        compute_from_values_with_prover_compute::<Self, GoldilocksField, C, 2>(
+            timing,
+            values,
+            rate_bits,
+            blinding,
+            cap_height,
+            fft_root_table,
+        )
+    }
+
+    fn transpose_and_compute_from_coeffs(
+        timing: &mut TimingTree,
+        pre_transposed_quotient_polys: Vec<Vec<GoldilocksField>>,
+        quotient_degree: usize,
+        degree: usize,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        fft_root_table: Option<&FftRootTable<GoldilocksField>>,
+    ) -> anyhow::Result<PolynomialBatch<GoldilocksField, C, 2>> {
+        transpose_and_compute_from_coeffs_with_prover_compute::<Self, GoldilocksField, C, 2>(
+            timing,
+            pre_transposed_quotient_polys,
+            quotient_degree,
+            degree,
+            rate_bits,
+            blinding,
+            cap_height,
+            fft_root_table,
+        )
+    }
+
+    fn build_merkle_tree(
+        timing: &mut TimingTree,
+        leaves: Vec<Vec<GoldilocksField>>,
+        cap_height: usize,
+    ) -> anyhow::Result<MerkleTree<GoldilocksField, C::Hasher>> {
+        <CpuProverCompute as ProverCompute<GoldilocksField, C, 2>>::build_merkle_tree(
+            timing, leaves, cap_height,
+        )
     }
 }
 
@@ -316,6 +693,32 @@ impl GenericConfig<2> for PoseidonGoldilocksConfig {
     type Compute = CpuProverCompute;
 }
 
+/// Configuration using Poseidon over the Goldilocks field with a Metal compute backend.
+///
+/// The backend is a CPU fallback placeholder until Metal kernels are wired in.
+#[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Serialize)]
+pub struct PoseidonGoldilocksMetalConfig;
+impl GenericConfig<2> for PoseidonGoldilocksMetalConfig {
+    type F = GoldilocksField;
+    type FE = QuadraticExtension<Self::F>;
+    type Hasher = PoseidonHash;
+    type InnerHasher = PoseidonHash;
+    type Compute = MetalProverCompute;
+}
+
+/// Configuration using Poseidon over the Goldilocks field with a CUDA compute backend.
+///
+/// The backend is a CPU fallback placeholder until CUDA kernels are wired in.
+#[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Serialize)]
+pub struct PoseidonGoldilocksCudaConfig;
+impl GenericConfig<2> for PoseidonGoldilocksCudaConfig {
+    type F = GoldilocksField;
+    type FE = QuadraticExtension<Self::F>;
+    type Hasher = PoseidonHash;
+    type InnerHasher = PoseidonHash;
+    type Compute = CudaProverCompute;
+}
+
 /// Configuration using truncated Keccak over the Goldilocks field.
 #[derive(Debug, Copy, Clone, Default, Eq, PartialEq)]
 pub struct KeccakGoldilocksConfig;
@@ -325,4 +728,135 @@ impl GenericConfig<2> for KeccakGoldilocksConfig {
     type Hasher = KeccakHash<25>;
     type InnerHasher = PoseidonHash;
     type Compute = CpuProverCompute;
+}
+
+#[cfg(test)]
+mod tests {
+    use log::Level;
+
+    use super::*;
+    use crate::field::types::Field;
+    use crate::iop::witness::{PartialWitness, WitnessWrite};
+    use crate::plonk::circuit_builder::CircuitBuilder;
+    use crate::plonk::circuit_data::CircuitConfig;
+
+    fn test_leaves() -> Vec<Vec<GoldilocksField>> {
+        (0..8)
+            .map(|row| {
+                (0..6)
+                    .map(|col| GoldilocksField::from_canonical_usize(row * 17 + col * 3))
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn assert_backend_merkle_matches_cpu<C>()
+    where
+        C: GenericConfig<2, F = GoldilocksField, Hasher = PoseidonHash>,
+    {
+        let leaves = test_leaves();
+        let expected = MerkleTree::<GoldilocksField, PoseidonHash>::new(leaves.clone(), 2);
+        let mut timing = TimingTree::new("test backend merkle", Level::Debug);
+        let actual = <C::Compute as ProverCompute<GoldilocksField, C, 2>>::build_merkle_tree(
+            &mut timing,
+            leaves,
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    fn prove_small_addition<C>()
+    where
+        C: GenericConfig<2, F = GoldilocksField, Hasher = PoseidonHash, InnerHasher = PoseidonHash>,
+    {
+        let mut builder =
+            CircuitBuilder::<GoldilocksField, 2>::new(CircuitConfig::standard_recursion_config());
+        let a = builder.add_virtual_target();
+        let b = builder.add_virtual_target();
+        let sum = builder.add(a, b);
+        builder.register_public_input(sum);
+
+        let mut pw = PartialWitness::new();
+        pw.set_target(a, GoldilocksField::from_canonical_u64(3))
+            .unwrap();
+        pw.set_target(b, GoldilocksField::from_canonical_u64(4))
+            .unwrap();
+
+        let data = builder.build::<C>();
+        let proof = data.prove(pw).unwrap();
+        assert_eq!(
+            proof.public_inputs,
+            vec![GoldilocksField::from_canonical_u64(7)]
+        );
+        data.verify(proof).unwrap();
+    }
+
+    #[test]
+    fn metal_merkle_backend_matches_cpu_for_small_tree() {
+        assert_backend_merkle_matches_cpu::<PoseidonGoldilocksMetalConfig>();
+    }
+
+    #[test]
+    fn cuda_merkle_backend_matches_cpu_for_small_tree() {
+        assert_backend_merkle_matches_cpu::<PoseidonGoldilocksCudaConfig>();
+    }
+
+    #[test]
+    fn metal_config_proves_and_verifies_small_circuit() {
+        prove_small_addition::<PoseidonGoldilocksMetalConfig>();
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_compute_from_coeffs_matches_cpu_for_large_tree() {
+        if !plonky2_metal::is_available() {
+            eprintln!("skipping Metal compute_from_coeffs test: no Metal device available");
+            return;
+        }
+
+        let polynomials = (0..6)
+            .map(|poly| {
+                PolynomialCoeffs::new(
+                    (0..1024)
+                        .map(|i| GoldilocksField::from_canonical_usize(poly * 31 + i * 17 + 5))
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut cpu_timing = TimingTree::new("cpu", Level::Debug);
+        let mut metal_timing = TimingTree::new("metal", Level::Debug);
+        let cpu = PolynomialBatch::<GoldilocksField, PoseidonGoldilocksConfig, 2>::from_coeffs(
+            polynomials.clone(),
+            3,
+            false,
+            4,
+            &mut cpu_timing,
+            None,
+        )
+        .unwrap();
+        let metal =
+            PolynomialBatch::<GoldilocksField, PoseidonGoldilocksMetalConfig, 2>::from_coeffs(
+                polynomials,
+                3,
+                false,
+                4,
+                &mut metal_timing,
+                None,
+            )
+            .unwrap();
+
+        assert!(metal.merkle_tree.leaves.is_empty());
+        assert_eq!(metal.merkle_tree.digests, cpu.merkle_tree.digests);
+        assert_eq!(metal.merkle_tree.cap, cpu.merkle_tree.cap);
+        for &index in &[0, 1, 17, 4096, 8191] {
+            assert_eq!(metal.get_leaf_values(index), cpu.get_leaf_values(index));
+        }
+    }
+
+    #[test]
+    fn cuda_config_proves_and_verifies_small_circuit() {
+        prove_small_addition::<PoseidonGoldilocksCudaConfig>();
+    }
 }

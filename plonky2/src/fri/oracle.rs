@@ -3,14 +3,13 @@ use alloc::{format, vec::Vec};
 
 use itertools::Itertools;
 use plonky2_field::types::Field;
-use plonky2_maybe_rayon::*;
 
 use crate::field::extension::Extendable;
 use crate::field::fft::FftRootTable;
 use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::proof::FriProof;
-use crate::fri::prover::fri_proof;
+use crate::fri::prover::{fri_proof, FriInitialTree};
 use crate::fri::structure::{FriBatchInfo, FriInstanceInfo};
 use crate::fri::FriParams;
 use crate::hash::hash_types::RichField;
@@ -25,12 +24,30 @@ use crate::plonk::config::ProverCompute;
 /// Four (~64 bit) field elements gives ~128 bit security.
 pub const SALT_SIZE: usize = 4;
 
+#[derive(Debug)]
+pub enum LdeValues<'a, F> {
+    Borrowed(&'a [F]),
+    Owned(Vec<F>),
+}
+
+impl<'a, F> core::ops::Deref for LdeValues<'a, F> {
+    type Target = [F];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(values) => values,
+            Self::Owned(values) => values,
+        }
+    }
+}
+
 /// Represents a FRI oracle, i.e. a batch of polynomials which have been Merklized.
 #[derive(Eq, PartialEq, Debug)]
 pub struct PolynomialBatch<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
 {
     pub polynomials: Vec<PolynomialCoeffs<F>>,
     pub merkle_tree: MerkleTree<F, C::Hasher>,
+    pub lde_values: Option<Vec<F>>,
     pub degree_log: usize,
     pub rate_bits: usize,
     pub blinding: bool,
@@ -43,6 +60,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> D
         PolynomialBatch {
             polynomials: Vec::new(),
             merkle_tree: MerkleTree::default(),
+            lde_values: None,
             degree_log: 0,
             rate_bits: 0,
             blinding: false,
@@ -107,11 +125,116 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     }
 
     /// Fetches LDE values at the `index * step`th point.
-    pub fn get_lde_values(&self, index: usize, step: usize) -> &[F] {
+    pub fn get_lde_values(&self, index: usize, step: usize) -> LdeValues<'_, F> {
         let index = index * step;
-        let index = reverse_bits(index, self.degree_log + self.rate_bits);
-        let slice = &self.merkle_tree.leaves[index];
-        &slice[..slice.len() - if self.blinding { SALT_SIZE } else { 0 }]
+        if let Some(lde_values) = &self.lde_values {
+            let leaf_count = 1 << (self.degree_log + self.rate_bits);
+            let leaf_length = lde_values.len() / leaf_count;
+            let value_length = leaf_length - if self.blinding { SALT_SIZE } else { 0 };
+            LdeValues::Owned(
+                (0..value_length)
+                    .map(|poly_index| lde_values[poly_index * leaf_count + index])
+                    .collect(),
+            )
+        } else {
+            let index = reverse_bits(index, self.degree_log + self.rate_bits);
+            let slice = &self.merkle_tree.leaves[index];
+            LdeValues::Borrowed(&slice[..slice.len() - if self.blinding { SALT_SIZE } else { 0 }])
+        }
+    }
+
+    pub fn has_poly_major_lde_values(&self) -> bool {
+        self.lde_values.is_some()
+    }
+
+    pub fn get_lde_values_range(
+        &self,
+        index: usize,
+        step: usize,
+        range: impl core::ops::RangeBounds<usize>,
+    ) -> LdeValues<'_, F> {
+        let index = index * step;
+        let leaf_length = if let Some(lde_values) = &self.lde_values {
+            let leaf_count = 1 << (self.degree_log + self.rate_bits);
+            lde_values.len() / leaf_count
+        } else {
+            let leaf_index = reverse_bits(index, self.degree_log + self.rate_bits);
+            self.merkle_tree.leaves[leaf_index].len()
+        };
+        let start = match range.start_bound() {
+            core::ops::Bound::Included(&start) => start,
+            core::ops::Bound::Excluded(&start) => start + 1,
+            core::ops::Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            core::ops::Bound::Included(&end) => end + 1,
+            core::ops::Bound::Excluded(&end) => end,
+            core::ops::Bound::Unbounded => leaf_length - if self.blinding { SALT_SIZE } else { 0 },
+        };
+        if let Some(lde_values) = &self.lde_values {
+            let leaf_count = 1 << (self.degree_log + self.rate_bits);
+            LdeValues::Owned(
+                (start..end)
+                    .map(|poly_index| lde_values[poly_index * leaf_count + index])
+                    .collect(),
+            )
+        } else {
+            let index = reverse_bits(index, self.degree_log + self.rate_bits);
+            let slice = &self.merkle_tree.leaves[index];
+            LdeValues::Borrowed(&slice[start..end])
+        }
+    }
+
+    pub fn for_each_lde_values_range(
+        &self,
+        index: usize,
+        step: usize,
+        range: impl core::ops::RangeBounds<usize>,
+        mut f: impl FnMut(usize, F),
+    ) {
+        let index = index * step;
+        let leaf_length = if let Some(lde_values) = &self.lde_values {
+            let leaf_count = 1 << (self.degree_log + self.rate_bits);
+            lde_values.len() / leaf_count
+        } else {
+            let leaf_index = reverse_bits(index, self.degree_log + self.rate_bits);
+            self.merkle_tree.leaves[leaf_index].len()
+        };
+        let start = match range.start_bound() {
+            core::ops::Bound::Included(&start) => start,
+            core::ops::Bound::Excluded(&start) => start + 1,
+            core::ops::Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            core::ops::Bound::Included(&end) => end + 1,
+            core::ops::Bound::Excluded(&end) => end,
+            core::ops::Bound::Unbounded => leaf_length - if self.blinding { SALT_SIZE } else { 0 },
+        };
+        if let Some(lde_values) = &self.lde_values {
+            let leaf_count = 1 << (self.degree_log + self.rate_bits);
+            for (j, poly_index) in (start..end).enumerate() {
+                f(j, lde_values[poly_index * leaf_count + index]);
+            }
+        } else {
+            let index = reverse_bits(index, self.degree_log + self.rate_bits);
+            let slice = &self.merkle_tree.leaves[index];
+            for (j, &value) in slice[start..end].iter().enumerate() {
+                f(j, value);
+            }
+        }
+    }
+
+    pub fn get_leaf_values(&self, index: usize) -> Vec<F> {
+        if let Some(lde_values) = &self.lde_values {
+            let leaf_count = 1 << (self.degree_log + self.rate_bits);
+            let leaf_length = lde_values.len() / leaf_count;
+            let point_index = reverse_bits(index, self.degree_log + self.rate_bits);
+            (0..leaf_length)
+                .map(|poly_index| lde_values[poly_index * leaf_count + point_index])
+                .collect()
+        } else {
+            self.merkle_tree.get(index).to_vec()
+        }
     }
 
     /// Like `get_lde_values`, but fetches LDE values from a batch of `P::WIDTH` points, and returns
@@ -176,11 +299,13 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             lde_final_poly.coset_fft(F::coset_shift().into())
         );
 
+        let initial_oracles = oracles
+            .iter()
+            .map(|&c| c as &dyn FriInitialTree<F, C::Hasher>)
+            .collect::<Vec<_>>();
+
         let fri_proof = fri_proof::<F, C, D>(
-            &oracles
-                .par_iter()
-                .map(|c| &c.merkle_tree)
-                .collect::<Vec<_>>(),
+            &initial_oracles,
             lde_final_poly,
             lde_final_values,
             challenger,
@@ -191,5 +316,17 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         );
 
         fri_proof
+    }
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
+    FriInitialTree<F, C::Hasher> for PolynomialBatch<F, C, D>
+{
+    fn leaf(&self, index: usize) -> Vec<F> {
+        self.get_leaf_values(index)
+    }
+
+    fn prove(&self, index: usize) -> crate::hash::merkle_proofs::MerkleProof<F, C::Hasher> {
+        self.merkle_tree.prove(index)
     }
 }
