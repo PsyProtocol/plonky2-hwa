@@ -675,51 +675,47 @@ fn compute_quotient_polys_pre_transpose<
                 || wires_commitment.has_poly_major_lde_values()
                 || zs_partial_products_and_lookup_commitment.has_poly_major_lde_values();
 
+            if use_poly_major_lde {
+                let next_indices_batch = indices_batch
+                    .iter()
+                    .map(|&i| (i + next_step) % lde_size)
+                    .collect::<Vec<_>>();
+
+                s_sigmas_batch_vecs = prover_data
+                    .constants_sigmas_commitment
+                    .get_lde_values_batch(&indices_batch, step, common_data.sigmas_range());
+                local_zs_batch_vecs = zs_partial_products_and_lookup_commitment
+                    .get_lde_values_batch(&indices_batch, step, common_data.zs_range());
+                next_zs_batch_vecs = zs_partial_products_and_lookup_commitment
+                    .get_lde_values_batch(&next_indices_batch, step, common_data.zs_range());
+                partial_products_batch_vecs = zs_partial_products_and_lookup_commitment
+                    .get_lde_values_batch(&indices_batch, step, common_data.partial_products_range());
+                if has_lookup {
+                    local_lookup_batch_vecs = zs_partial_products_and_lookup_commitment
+                        .get_lde_values_batch(&indices_batch, step, common_data.lookup_range());
+                    next_lookup_batch_vecs = zs_partial_products_and_lookup_commitment
+                        .get_lde_values_batch(&next_indices_batch, step, common_data.lookup_range());
+                }
+
+                prover_data.constants_sigmas_commitment.fill_lde_values_batch(
+                    &indices_batch,
+                    step,
+                    common_data.constants_range(),
+                    &mut local_constants_batch,
+                );
+                wires_commitment.fill_lde_values_batch(
+                    &indices_batch,
+                    step,
+                    0..common_data.config.num_wires,
+                    &mut local_wires_batch,
+                );
+            }
+
             for (k, (&i, &x)) in indices_batch.iter().zip(xs_batch).enumerate() {
                 shifted_xs_batch.push(F::coset_shift() * x);
 
                 let i_next = (i + next_step) % lde_size;
-                if use_poly_major_lde {
-                    let local_sigmas = prover_data
-                        .constants_sigmas_commitment
-                        .get_lde_values_range(i, step, common_data.sigmas_range());
-                    let local_zs = zs_partial_products_and_lookup_commitment
-                        .get_lde_values_range(i, step, common_data.zs_range());
-                    let next_zs = zs_partial_products_and_lookup_commitment
-                        .get_lde_values_range(i_next, step, common_data.zs_range());
-                    let partial_products = zs_partial_products_and_lookup_commitment
-                        .get_lde_values_range(i, step, common_data.partial_products_range());
-
-                    s_sigmas_batch_vecs.push(local_sigmas.to_vec());
-                    local_zs_batch_vecs.push(local_zs.to_vec());
-                    next_zs_batch_vecs.push(next_zs.to_vec());
-                    partial_products_batch_vecs.push(partial_products.to_vec());
-                    if has_lookup {
-                        let local_lookup = zs_partial_products_and_lookup_commitment
-                            .get_lde_values_range(i, step, common_data.lookup_range());
-                        let next_lookup = zs_partial_products_and_lookup_commitment
-                            .get_lde_values_range(i_next, step, common_data.lookup_range());
-                        local_lookup_batch_vecs.push(local_lookup.to_vec());
-                        next_lookup_batch_vecs.push(next_lookup.to_vec());
-                    }
-
-                    prover_data.constants_sigmas_commitment.for_each_lde_values_range(
-                        i,
-                        step,
-                        common_data.constants_range(),
-                        |j, c| {
-                            local_constants_batch[j * n + k] = c;
-                        },
-                    );
-                    wires_commitment.for_each_lde_values_range(
-                        i,
-                        step,
-                        0..common_data.config.num_wires,
-                        |j, w| {
-                            local_wires_batch[j * n + k] = w;
-                        },
-                    );
-                } else {
+                if !use_poly_major_lde {
                     let local_constants_sigmas = prover_data.constants_sigmas_commitment.get_lde_values(i, step);
                     let local_wires = wires_commitment.get_lde_values(i, step);
                     let local_zs_partial_and_lookup = zs_partial_products_and_lookup_commitment.get_lde_values(i, step);
