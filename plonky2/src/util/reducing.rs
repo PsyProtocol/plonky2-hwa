@@ -80,18 +80,24 @@ impl<F: Field> ReducingFactor<F> {
         })
     }
 
-    pub fn reduce_polys_base<BF: Extendable<D, Extension = F>, const D: usize>(
+    pub fn reduce_polys_base<BF, const D: usize>(
         &mut self,
         polys: impl IntoIterator<Item = impl Borrow<PolynomialCoeffs<BF>>>,
-    ) -> PolynomialCoeffs<F> {
-        self.base
-            .powers()
-            .zip(polys)
-            .map(|(base_power, poly)| {
-                self.count += 1;
-                poly.borrow().mul_extension(base_power)
-            })
-            .sum()
+    ) -> PolynomialCoeffs<F>
+    where
+        BF: Extendable<D, Extension = F>,
+        F: FieldExtension<D, BaseField = BF>,
+    {
+        let mut acc = PolynomialCoeffs::empty();
+        for (base_power, poly) in self.base.powers().zip(polys) {
+            self.count += 1;
+            let poly = poly.borrow();
+            acc.coeffs.resize(acc.len().max(poly.len()), F::ZERO);
+            for (acc_coeff, &poly_coeff) in acc.coeffs.iter_mut().zip(&poly.coeffs) {
+                *acc_coeff += <F as FieldExtension<D>>::scalar_mul(&base_power, poly_coeff);
+            }
+        }
+        acc
     }
 
     pub fn shift(&mut self, x: F) -> F {
@@ -358,6 +364,35 @@ mod tests {
     #[test]
     fn test_reduce_gadget_base_100() -> Result<()> {
         test_reduce_gadget_base(100)
+    }
+
+    #[test]
+    fn test_reduce_polys_base() {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type FF = <C as GenericConfig<D>>::FE;
+
+        let alpha = FF::rand();
+        let polys = vec![
+            PolynomialCoeffs::new(vec![F::from_canonical_usize(1), F::from_canonical_usize(2)]),
+            PolynomialCoeffs::new(vec![F::from_canonical_usize(3)]),
+            PolynomialCoeffs::new(vec![
+                F::from_canonical_usize(4),
+                F::from_canonical_usize(5),
+                F::from_canonical_usize(6),
+            ]),
+        ];
+        let expected = alpha
+            .powers()
+            .zip(&polys)
+            .map(|(base_power, poly)| poly.mul_extension::<D>(base_power))
+            .sum();
+
+        let mut reducing = ReducingFactor::new(alpha);
+        let reduced = reducing.reduce_polys_base::<F, D>(polys.iter());
+        assert_eq!(reduced, expected);
+        assert_eq!(reducing.shift(FF::ONE), alpha.exp_u64(polys.len() as u64));
     }
 
     #[test]
