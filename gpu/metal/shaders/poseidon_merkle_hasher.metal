@@ -507,6 +507,63 @@ kernel void poseidon_hash_leaves_poly_major(
     output[offset + 3] = static_cast<ulong>(p2_state[3]);
 }
 
+inline void poseidon_absorb8_poly_major(
+    constant Fp *poly_inputs,
+    uint leaf_count,
+    uint point_index,
+    uint poly_index,
+    thread Fp *p2_state
+) {
+    p2_state[0] = poly_inputs[(poly_index + 0) * leaf_count + point_index];
+    p2_state[1] = poly_inputs[(poly_index + 1) * leaf_count + point_index];
+    p2_state[2] = poly_inputs[(poly_index + 2) * leaf_count + point_index];
+    p2_state[3] = poly_inputs[(poly_index + 3) * leaf_count + point_index];
+    p2_state[4] = poly_inputs[(poly_index + 4) * leaf_count + point_index];
+    p2_state[5] = poly_inputs[(poly_index + 5) * leaf_count + point_index];
+    p2_state[6] = poly_inputs[(poly_index + 6) * leaf_count + point_index];
+    p2_state[7] = poly_inputs[(poly_index + 7) * leaf_count + point_index];
+    poseidon_permute(p2_state);
+}
+
+inline void poseidon_hash_poly_major_init(
+    thread Fp *p2_state
+) {
+    p2_state[8] = 0;
+    p2_state[9] = 0;
+    p2_state[10] = 0;
+    p2_state[11] = 0;
+}
+
+inline void poseidon_store_poly_major_digest(
+    device ulong *output,
+    constant Uniforms &uniforms,
+    uint leaf_index,
+    thread Fp *p2_state
+) {
+    uint offset = compute_digest_index(uniforms.tree_length, uniforms.num_layers, 0, leaf_index) * 4;
+    output[offset] = static_cast<ulong>(p2_state[0]);
+    output[offset + 1] = static_cast<ulong>(p2_state[1]);
+    output[offset + 2] = static_cast<ulong>(p2_state[2]);
+    output[offset + 3] = static_cast<ulong>(p2_state[3]);
+}
+
+kernel void poseidon_hash_leaves_poly_major_16(
+    constant Fp * poly_inputs[[buffer(0)]],
+    device ulong * output[[buffer(1)]],
+    constant Uniforms & uniforms[[buffer(2)]],
+    uint2 gid[[thread_position_in_grid]]
+) {
+    uint point_index = gid[1] * 32768 + gid[0];
+    uint leaf_index = reverse_bits(point_index, uniforms.tree_height);
+    uint leaf_count = 1u << uniforms.tree_height;
+
+    Fp p2_state[12];
+    poseidon_hash_poly_major_init(p2_state);
+    poseidon_absorb8_poly_major(poly_inputs, leaf_count, point_index, 0, p2_state);
+    poseidon_absorb8_poly_major(poly_inputs, leaf_count, point_index, 8, p2_state);
+    poseidon_store_poly_major_digest(output, uniforms, leaf_index, p2_state);
+}
+
 kernel void poseidon_hash_tree_level(
     constant Uniforms & uniforms[[buffer(1)]],
     device ulong * output[[buffer(0)]],

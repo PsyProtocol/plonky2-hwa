@@ -138,6 +138,7 @@ pub struct MetalRuntime {
     device: Mutex<Device>,
     pipeline_poseidon_hash_leaves: ComputePipelineState,
     pipeline_poseidon_hash_leaves_poly_major: ComputePipelineState,
+    pipeline_poseidon_hash_leaves_poly_major_16: ComputePipelineState,
     pipeline_poseidon_hash_tree_level: ComputePipelineState,
     pipeline_fft_init_reverse_zero: ComputePipelineState,
     pipeline_fft_init_coset_lde: ComputePipelineState,
@@ -174,6 +175,9 @@ lazy_static! {
         let f_poseidon_hash_leaves_poly_major = lib
             .get_function("poseidon_hash_leaves_poly_major", None)
             .unwrap();
+        let f_poseidon_hash_leaves_poly_major_16 = lib
+            .get_function("poseidon_hash_leaves_poly_major_16", None)
+            .unwrap();
         let f_poseidon_hash_tree_level =
             lib.get_function("poseidon_hash_tree_level", None).unwrap();
         let f_fft_init_reverse_zero = lib.get_function("fft_init_reverse_zero", None).unwrap();
@@ -189,6 +193,9 @@ lazy_static! {
             .unwrap();
         let pipeline_poseidon_hash_leaves_poly_major = device
             .new_compute_pipeline_state_with_function(&f_poseidon_hash_leaves_poly_major)
+            .unwrap();
+        let pipeline_poseidon_hash_leaves_poly_major_16 = device
+            .new_compute_pipeline_state_with_function(&f_poseidon_hash_leaves_poly_major_16)
             .unwrap();
         let pipeline_poseidon_hash_tree_level = device
             .new_compute_pipeline_state_with_function(&f_poseidon_hash_tree_level)
@@ -220,6 +227,7 @@ lazy_static! {
             command_queue,
             pipeline_poseidon_hash_leaves,
             pipeline_poseidon_hash_leaves_poly_major,
+            pipeline_poseidon_hash_leaves_poly_major_16,
             pipeline_poseidon_hash_tree_level,
             pipeline_fft_init_reverse_zero,
             pipeline_fft_init_coset_lde,
@@ -845,6 +853,17 @@ impl MetalRuntime {
         digests
     }
 
+    fn leaf_hash_pipeline(&self, poly_major: bool, leaf_length: usize) -> &ComputePipelineState {
+        if !poly_major {
+            return &self.pipeline_poseidon_hash_leaves;
+        }
+
+        match leaf_length {
+            16 => &self.pipeline_poseidon_hash_leaves_poly_major_16,
+            _ => &self.pipeline_poseidon_hash_leaves_poly_major,
+        }
+    }
+
     fn hash_merkle_tree_buf_profiled(
         &self,
         leaves_buffer: Buffer,
@@ -889,6 +908,7 @@ impl MetalRuntime {
                 digests,
                 digests_buffer,
                 uniforms,
+                leaf_length,
                 leaf_count,
                 num_layers,
                 poly_major,
@@ -901,11 +921,7 @@ impl MetalRuntime {
         let encoder =
             command_buffer.compute_command_encoder_with_descriptor(compute_pass_descriptor);
 
-        let leaf_pipeline = if poly_major {
-            &self.pipeline_poseidon_hash_leaves_poly_major
-        } else {
-            &self.pipeline_poseidon_hash_leaves
-        };
+        let leaf_pipeline = self.leaf_hash_pipeline(poly_major, leaf_length);
         encoder.set_compute_pipeline_state(leaf_pipeline);
         encoder.set_buffer(0, Some(&leaves_buffer), 0);
         encoder.set_buffer(1, Some(&digests_buffer), 0);
@@ -981,6 +997,7 @@ impl MetalRuntime {
         digests: Vec<GoldilocksDigest>,
         digests_buffer: Buffer,
         mut uniforms: [u32; 5],
+        leaf_length: usize,
         leaf_count: usize,
         num_layers: usize,
         poly_major: bool,
@@ -991,11 +1008,7 @@ impl MetalRuntime {
         let leaf_encoder = leaf_command_buffer
             .compute_command_encoder_with_descriptor(leaf_compute_pass_descriptor);
 
-        let leaf_pipeline = if poly_major {
-            &self.pipeline_poseidon_hash_leaves_poly_major
-        } else {
-            &self.pipeline_poseidon_hash_leaves
-        };
+        let leaf_pipeline = self.leaf_hash_pipeline(poly_major, leaf_length);
         leaf_encoder.set_compute_pipeline_state(leaf_pipeline);
         leaf_encoder.set_buffer(0, Some(&leaves_buffer), 0);
         leaf_encoder.set_buffer(1, Some(&digests_buffer), 0);
@@ -1120,35 +1133,36 @@ mod tests {
             return;
         }
 
-        let leaf_count = 1usize << 13;
-        let leaf_length = 20;
-        let tree_height = leaf_count.ilog2() as usize;
-        let cap_height = 4;
-        let poly_values = (0..leaf_length)
-            .flat_map(|poly| {
-                (0..leaf_count).map(move |point| {
-                    GoldilocksField(((poly * 31 + point * 17 + 7) as u64) & 0xffff_ffff)
+        for leaf_length in [16, 20, 33, 84, 135] {
+            let leaf_count = 1usize << 9;
+            let tree_height = leaf_count.ilog2() as usize;
+            let cap_height = 4;
+            let poly_values = (0..leaf_length)
+                .flat_map(|poly| {
+                    (0..leaf_count).map(move |point| {
+                        GoldilocksField(((poly * 31 + point * 17 + 7) as u64) & 0xffff_ffff)
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
-        let leaves = (0..leaf_count)
-            .map(|leaf_index| {
-                let point_index = reverse_bits(leaf_index, tree_height);
-                (0..leaf_length)
-                    .map(|poly_index| poly_values[poly_index * leaf_count + point_index])
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>();
+            let leaves = (0..leaf_count)
+                .map(|leaf_index| {
+                    let point_index = reverse_bits(leaf_index, tree_height);
+                    (0..leaf_length)
+                        .map(|poly_index| poly_values[poly_index * leaf_count + point_index])
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
 
-        let row_major = MetalRuntime::hash_merkle_tree_digests(&leaves, cap_height);
-        let poly_major = MetalRuntime::hash_merkle_tree_poly_major_digests(
-            &poly_values,
-            leaf_count,
-            leaf_length,
-            cap_height,
-        );
+            let row_major = MetalRuntime::hash_merkle_tree_digests(&leaves, cap_height);
+            let poly_major = MetalRuntime::hash_merkle_tree_poly_major_digests(
+                &poly_values,
+                leaf_count,
+                leaf_length,
+                cap_height,
+            );
 
-        assert_eq!(poly_major, row_major);
+            assert_eq!(poly_major, row_major, "leaf_length={leaf_length}");
+        }
     }
 
     #[test]
