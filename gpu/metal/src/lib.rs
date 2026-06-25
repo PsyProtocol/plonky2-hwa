@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -15,6 +15,7 @@ pub type GoldilocksDigest = [GoldilocksField; 4];
 
 static METAL_PROFILE_LEVEL: AtomicU8 = AtomicU8::new(0);
 static METAL_LDE_ENABLED: AtomicBool = AtomicBool::new(false);
+static METAL_LEAF_THREADGROUP_WIDTH: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
 struct MetalHashProfile {
@@ -49,6 +50,30 @@ pub fn set_lde_enabled(enabled: bool) {
 
 pub fn lde_enabled() -> bool {
     METAL_LDE_ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn set_leaf_threadgroup_width(width: u64) {
+    METAL_LEAF_THREADGROUP_WIDTH.store(width, Ordering::Relaxed);
+}
+
+pub fn leaf_threadgroup_width() -> u64 {
+    METAL_LEAF_THREADGROUP_WIDTH.load(Ordering::Relaxed)
+}
+
+fn leaf_threadgroup_size(pipeline: &ComputePipelineState) -> MTLSize {
+    let requested = leaf_threadgroup_width();
+    let max_supported = pipeline.max_total_threads_per_threadgroup();
+    let default_width = pipeline.thread_execution_width();
+    let width = if requested == 0 {
+        default_width
+    } else {
+        requested.min(max_supported).max(default_width)
+    };
+    MTLSize {
+        width,
+        height: 1,
+        depth: 1,
+    }
 }
 
 fn flatten_leaves_parallel(
@@ -928,11 +953,7 @@ impl MetalRuntime {
         encoder.set_buffer(2, Some(&uniforms_buffer), 0);
 
         let threads_per_grid = get_size_for_count(leaf_count);
-        let thread_group_size = MTLSize {
-            width: leaf_pipeline.thread_execution_width(),
-            height: 1,
-            depth: 1,
-        };
+        let thread_group_size = leaf_threadgroup_size(leaf_pipeline);
         encoder.dispatch_threads(threads_per_grid, thread_group_size);
         if num_layers > 1 {
             encoder.memory_barrier_with_resources(&[digests_buffer.as_ref()]);
@@ -1015,11 +1036,7 @@ impl MetalRuntime {
         leaf_encoder.set_buffer(2, Some(&uniforms_buffer), 0);
 
         let threads_per_grid = get_size_for_count(leaf_count);
-        let thread_group_size = MTLSize {
-            width: leaf_pipeline.thread_execution_width(),
-            height: 1,
-            depth: 1,
-        };
+        let thread_group_size = leaf_threadgroup_size(leaf_pipeline);
         leaf_encoder.dispatch_threads(threads_per_grid, thread_group_size);
         leaf_encoder.end_encoding();
         let leaf_encode_time = leaf_encode_start.elapsed();

@@ -140,12 +140,14 @@ fn main() -> Result<()> {
     let metal_lde = flags
         .iter()
         .any(|flag| matches!(flag.as_str(), "metal-lde" | "lde"));
+    let leaf_threads = parse_leaf_threads(&flags)?;
     let profile_prover = matches!(profile_mode, Some("profile-detail") | Some("detail"));
     if profile_prover {
         init_profile_logger();
     }
     configure_metal_profile(profile_mode);
     configure_metal_lde(metal_lde);
+    configure_metal_leaf_threads(leaf_threads);
     let metal_available = metal_available();
     println!("BENCH_ITERS={num_iters}");
     println!("BENCH_ROUNDS={rounds}");
@@ -153,6 +155,13 @@ fn main() -> Result<()> {
         println!("BENCH_PROFILE={profile_mode}");
     }
     println!("BENCH_METAL_LDE={metal_lde}");
+    if let Some(leaf_threads) = effective_metal_leaf_threads() {
+        if leaf_threads == 0 {
+            println!("BENCH_METAL_LEAF_THREADS=auto");
+        } else {
+            println!("BENCH_METAL_LEAF_THREADS={leaf_threads}");
+        }
+    }
     println!("metal device available: {metal_available}");
     if !metal_available {
         println!("metal config will use CPU fallback in this environment");
@@ -228,6 +237,18 @@ fn configure_metal_lde(enabled: bool) {
     plonky2_metal::set_lde_enabled(enabled);
 }
 
+#[cfg(feature = "metal")]
+fn configure_metal_leaf_threads(width: Option<u64>) {
+    if let Some(width) = width {
+        plonky2_metal::set_leaf_threadgroup_width(width);
+    }
+}
+
+#[cfg(feature = "metal")]
+fn effective_metal_leaf_threads() -> Option<u64> {
+    Some(plonky2_metal::leaf_threadgroup_width())
+}
+
 #[cfg(not(feature = "metal"))]
 fn metal_available() -> bool {
     false
@@ -241,3 +262,43 @@ fn configure_metal_profile(_profile_mode: Option<&str>) {}
 
 #[cfg(not(feature = "metal"))]
 fn configure_metal_lde(_enabled: bool) {}
+
+#[cfg(not(feature = "metal"))]
+fn configure_metal_leaf_threads(_width: Option<u64>) {}
+
+#[cfg(not(feature = "metal"))]
+fn effective_metal_leaf_threads() -> Option<u64> {
+    None
+}
+
+fn parse_leaf_threads(flags: &[String]) -> Result<Option<u64>> {
+    for (i, flag) in flags.iter().enumerate() {
+        if let Some(value) = flag
+            .strip_prefix("leaf-threads=")
+            .or_else(|| flag.strip_prefix("metal-leaf-threads="))
+        {
+            return value
+                .parse()
+                .map(Some)
+                .map_err(|_| anyhow::anyhow!("invalid Metal leaf thread count: {flag}"));
+        }
+
+        if matches!(flag.as_str(), "leaf-threads" | "metal-leaf-threads") {
+            let value = flags
+                .get(i + 1)
+                .ok_or_else(|| anyhow::anyhow!("missing value after {flag}"))?;
+            return value.parse().map(Some).map_err(|_| {
+                anyhow::anyhow!("invalid Metal leaf thread count after {flag}: {value}")
+            });
+        }
+    }
+
+    std::env::var("METAL_LEAF_THREADS")
+        .ok()
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid METAL_LEAF_THREADS value: {value}"))
+        })
+        .transpose()
+}
