@@ -38,6 +38,17 @@ use crate::timed;
 use crate::util::timing::TimingTree;
 use crate::util::{reverse_index_bits_in_place, transpose};
 
+#[cfg(feature = "metal")]
+fn goldilocks_vec_for_overwrite(len: usize) -> Vec<GoldilocksField> {
+    let mut values = Vec::with_capacity(len);
+    // SAFETY: Each caller immediately overwrites the whole slice before it is read. This helper is
+    // only sound for full-slice writes.
+    unsafe {
+        values.set_len(len);
+    }
+    values
+}
+
 pub trait GenericHashOut<F: RichField>:
     Copy + Clone + Debug + Eq + PartialEq + Send + Sync + Serialize + DeserializeOwned
 {
@@ -448,10 +459,9 @@ impl<C: GenericConfig<2, F = GoldilocksField, Hasher = PoseidonHash>>
             let tree_height = log2_strict(leaf_count);
 
             if cap_height < tree_height && tree_height >= 13 && plonky2_metal::is_available() {
-                let mut lde_values = vec![GoldilocksField::ZERO; leaf_count * leaf_length];
-                timed!(timing, "generate LDE values", {
+                let lde_values = timed!(timing, "generate LDE values", {
                     if plonky2_metal::lde_enabled() {
-                        let mut coeffs = vec![GoldilocksField::ZERO; polynomials.len() * degree];
+                        let mut coeffs = goldilocks_vec_for_overwrite(polynomials.len() * degree);
                         coeffs
                             .par_chunks_mut(degree)
                             .zip(polynomials.par_iter())
@@ -465,7 +475,15 @@ impl<C: GenericConfig<2, F = GoldilocksField, Hasher = PoseidonHash>>
                                 degree,
                                 rate_bits,
                             );
-                        lde_values[..metal_values.len()].copy_from_slice(&metal_values);
+                        let mut lde_values = metal_values;
+                        let total_len = leaf_count * leaf_length;
+                        if lde_values.len() < total_len {
+                            lde_values.reserve(total_len - lde_values.len());
+                            // SAFETY: The added salt chunks are fully overwritten below.
+                            unsafe {
+                                lde_values.set_len(total_len);
+                            }
+                        }
                         lde_values
                             .par_chunks_mut(leaf_count)
                             .skip(polynomials.len())
@@ -473,7 +491,10 @@ impl<C: GenericConfig<2, F = GoldilocksField, Hasher = PoseidonHash>>
                                 let salt = GoldilocksField::rand_vec(leaf_count);
                                 dst.copy_from_slice(&salt);
                             });
+                        lde_values
                     } else {
+                        let mut lde_values =
+                            vec![GoldilocksField::ZERO; leaf_count * leaf_length];
                         lde_values
                             .par_chunks_mut(leaf_count)
                             .enumerate()
@@ -493,6 +514,7 @@ impl<C: GenericConfig<2, F = GoldilocksField, Hasher = PoseidonHash>>
                                     dst.copy_from_slice(&salt);
                                 }
                             });
+                        lde_values
                     }
                 });
 

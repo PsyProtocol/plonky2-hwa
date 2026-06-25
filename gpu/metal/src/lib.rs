@@ -116,6 +116,17 @@ fn get_size_for_count(count: usize) -> MTLSize {
     }
 }
 
+fn goldilocks_vec_for_gpu_overwrite(len: usize) -> Vec<GoldilocksField> {
+    let mut output = Vec::with_capacity(len);
+    // SAFETY: Callers bind this Vec as a Metal output buffer and wait for the command buffer before
+    // returning it. This helper is only sound for kernels that write every element before any Rust
+    // read; it must not be used with partial-output kernels.
+    unsafe {
+        output.set_len(len);
+    }
+    output
+}
+
 const SHADERLIB: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/shaders/poseidon_merkle_hasher.metallib"
@@ -376,7 +387,7 @@ impl MetalRuntime {
         let root_buffers = self.root_buffers_for_len(fft_len);
         let flat_roots_buffer = self.flat_root_buffer_for_len(fft_len);
         let shift_powers_buffer = self.coset_shift_buffer_for_len(coeff_len);
-        let mut output = vec![GoldilocksField::ZERO; value_count];
+        let mut output = goldilocks_vec_for_gpu_overwrite(value_count);
         let local_tile_log = log_fft_len.min(11);
         let use_local_init = rate_bits < local_tile_log;
 
@@ -614,7 +625,7 @@ impl MetalRuntime {
         );
 
         let root_buffers = self.root_buffers_for_len(fft_len);
-        let mut output = vec![GoldilocksField::ZERO; values.len()];
+        let mut output = goldilocks_vec_for_gpu_overwrite(values.len());
 
         autoreleasepool::<(), _>(|| {
             let device = self.device.lock().unwrap();
