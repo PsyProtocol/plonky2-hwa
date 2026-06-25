@@ -5,6 +5,9 @@ description = "Metal acceleration helpers for plonky2"
 edition.workspace = true
 license = "MIT"
 
+[features]
+lde = []
+
 [dependencies]
 lazy_static = "1.4.0"
 metal = "0.26.0"

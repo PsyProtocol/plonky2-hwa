@@ -14,7 +14,7 @@ use plonky2_maybe_rayon::*;
 pub type GoldilocksDigest = [GoldilocksField; 4];
 
 static METAL_PROFILE_LEVEL: AtomicU8 = AtomicU8::new(0);
-static METAL_LDE_ENABLED: AtomicBool = AtomicBool::new(false);
+static METAL_LDE_ENABLED: AtomicBool = AtomicBool::new(cfg!(feature = "lde"));
 static METAL_LEAF_THREADGROUP_WIDTH: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]

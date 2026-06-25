@@ -137,7 +137,7 @@ fn main() -> Result<()> {
         .iter()
         .find(|flag| matches!(flag.as_str(), "profile" | "profile-detail" | "detail"))
         .map(String::as_str);
-    let metal_lde = flags
+    let metal_lde_requested = flags
         .iter()
         .any(|flag| matches!(flag.as_str(), "metal-lde" | "lde"));
     let leaf_threads = parse_leaf_threads(&flags)?;
@@ -146,9 +146,12 @@ fn main() -> Result<()> {
         init_profile_logger();
     }
     configure_metal_profile(profile_mode);
-    configure_metal_lde(metal_lde);
+    if metal_lde_requested {
+        configure_metal_lde(true);
+    }
     configure_metal_leaf_threads(leaf_threads);
     let metal_available = metal_available();
+    let metal_lde = effective_metal_lde();
     println!("BENCH_ITERS={num_iters}");
     println!("BENCH_ROUNDS={rounds}");
     if let Some(profile_mode) = profile_mode {
@@ -238,6 +241,11 @@ fn configure_metal_lde(enabled: bool) {
 }
 
 #[cfg(feature = "metal")]
+fn effective_metal_lde() -> bool {
+    plonky2_metal::lde_enabled()
+}
+
+#[cfg(feature = "metal")]
 fn configure_metal_leaf_threads(width: Option<u64>) {
     if let Some(width) = width {
         plonky2_metal::set_leaf_threadgroup_width(width);
@@ -262,6 +270,11 @@ fn configure_metal_profile(_profile_mode: Option<&str>) {}
 
 #[cfg(not(feature = "metal"))]
 fn configure_metal_lde(_enabled: bool) {}
+
+#[cfg(not(feature = "metal"))]
+fn effective_metal_lde() -> bool {
+    false
+}
 
 #[cfg(not(feature = "metal"))]
 fn configure_metal_leaf_threads(_width: Option<u64>) {}
