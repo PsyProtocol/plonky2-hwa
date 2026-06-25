@@ -410,7 +410,7 @@ kernel void fft_stage_triple(
 
 kernel void poseidon_hash_leaves(
     constant Fp * leaf_inputs[[buffer(0)]],
-    device ulong * output[[buffer(1)]],
+    device packed_ulong4 * output[[buffer(1)]],
     constant Uniforms & uniforms[[buffer(2)]],
     uint2 gid[[thread_position_in_grid]]
 ) {
@@ -451,16 +451,18 @@ kernel void poseidon_hash_leaves(
         poseidon_permute(p2_state);
     }
 
-    offset = compute_digest_index(uniforms.tree_length, uniforms.num_layers, 0, index) * 4;
-    output[offset] = static_cast<ulong>(p2_state[0]);
-    output[offset + 1] = static_cast<ulong>(p2_state[1]);
-    output[offset + 2] = static_cast<ulong>(p2_state[2]);
-    output[offset + 3] = static_cast<ulong>(p2_state[3]);
+    offset = compute_digest_index(uniforms.tree_length, uniforms.num_layers, 0, index);
+    output[offset] = packed_ulong4(
+        static_cast<ulong>(p2_state[0]),
+        static_cast<ulong>(p2_state[1]),
+        static_cast<ulong>(p2_state[2]),
+        static_cast<ulong>(p2_state[3])
+    );
 }
 
 kernel void poseidon_hash_leaves_poly_major(
     constant Fp * poly_inputs[[buffer(0)]],
-    device ulong * output[[buffer(1)]],
+    device packed_ulong4 * output[[buffer(1)]],
     constant Uniforms & uniforms[[buffer(2)]],
     uint2 gid[[thread_position_in_grid]]
 ) {
@@ -500,11 +502,13 @@ kernel void poseidon_hash_leaves_poly_major(
         poseidon_permute(p2_state);
     }
 
-    uint offset = compute_digest_index(uniforms.tree_length, uniforms.num_layers, 0, leaf_index) * 4;
-    output[offset] = static_cast<ulong>(p2_state[0]);
-    output[offset + 1] = static_cast<ulong>(p2_state[1]);
-    output[offset + 2] = static_cast<ulong>(p2_state[2]);
-    output[offset + 3] = static_cast<ulong>(p2_state[3]);
+    uint offset = compute_digest_index(uniforms.tree_length, uniforms.num_layers, 0, leaf_index);
+    output[offset] = packed_ulong4(
+        static_cast<ulong>(p2_state[0]),
+        static_cast<ulong>(p2_state[1]),
+        static_cast<ulong>(p2_state[2]),
+        static_cast<ulong>(p2_state[3])
+    );
 }
 
 inline void poseidon_absorb8_poly_major(
@@ -535,21 +539,23 @@ inline void poseidon_hash_poly_major_init(
 }
 
 inline void poseidon_store_poly_major_digest(
-    device ulong *output,
+    device packed_ulong4 *output,
     constant Uniforms &uniforms,
     uint leaf_index,
     thread Fp *p2_state
 ) {
-    uint offset = compute_digest_index(uniforms.tree_length, uniforms.num_layers, 0, leaf_index) * 4;
-    output[offset] = static_cast<ulong>(p2_state[0]);
-    output[offset + 1] = static_cast<ulong>(p2_state[1]);
-    output[offset + 2] = static_cast<ulong>(p2_state[2]);
-    output[offset + 3] = static_cast<ulong>(p2_state[3]);
+    uint offset = compute_digest_index(uniforms.tree_length, uniforms.num_layers, 0, leaf_index);
+    output[offset] = packed_ulong4(
+        static_cast<ulong>(p2_state[0]),
+        static_cast<ulong>(p2_state[1]),
+        static_cast<ulong>(p2_state[2]),
+        static_cast<ulong>(p2_state[3])
+    );
 }
 
 kernel void poseidon_hash_leaves_poly_major_16(
     constant Fp * poly_inputs[[buffer(0)]],
-    device ulong * output[[buffer(1)]],
+    device packed_ulong4 * output[[buffer(1)]],
     constant Uniforms & uniforms[[buffer(2)]],
     uint2 gid[[thread_position_in_grid]]
 ) {
@@ -566,33 +572,37 @@ kernel void poseidon_hash_leaves_poly_major_16(
 
 kernel void poseidon_hash_tree_level(
     constant Uniforms & uniforms[[buffer(1)]],
-    device ulong * output[[buffer(0)]],
+    device packed_ulong4 * output[[buffer(0)]],
     uint2 gid[[thread_position_in_grid]]
 ) {
     uint index = gid[1] * 32768 + gid[0];
 
     Fp p2_state[12];
-    uint offset = compute_digest_index(uniforms.tree_length, uniforms.num_layers, uniforms.level - 1, index * 2) * 4;
+    uint offset = compute_digest_index(uniforms.tree_length, uniforms.num_layers, uniforms.level - 1, index * 2);
+    packed_ulong4 left = output[offset];
+    packed_ulong4 right = output[offset + 1];
 
-    p2_state[0] = output[offset];
-    p2_state[1] = output[offset + 1];
-    p2_state[2] = output[offset + 2];
-    p2_state[3] = output[offset + 3];
+    p2_state[0] = left.x;
+    p2_state[1] = left.y;
+    p2_state[2] = left.z;
+    p2_state[3] = left.w;
 
-    p2_state[4] = output[offset + 4];
-    p2_state[5] = output[offset + 5];
-    p2_state[6] = output[offset + 6];
-    p2_state[7] = output[offset + 7];
+    p2_state[4] = right.x;
+    p2_state[5] = right.y;
+    p2_state[6] = right.z;
+    p2_state[7] = right.w;
     p2_state[8] = 0;
     p2_state[9] = 0;
     p2_state[10] = 0;
     p2_state[11] = 0;
     poseidon_permute(p2_state);
     
-    offset = compute_digest_index(uniforms.tree_length, uniforms.num_layers, uniforms.level, index) * 4;
-    
-    output[offset] = static_cast<ulong>(p2_state[0]);
-    output[offset + 1] = static_cast<ulong>(p2_state[1]);
-    output[offset + 2] = static_cast<ulong>(p2_state[2]);
-    output[offset + 3] = static_cast<ulong>(p2_state[3]);
+    offset = compute_digest_index(uniforms.tree_length, uniforms.num_layers, uniforms.level, index);
+
+    output[offset] = packed_ulong4(
+        static_cast<ulong>(p2_state[0]),
+        static_cast<ulong>(p2_state[1]),
+        static_cast<ulong>(p2_state[2]),
+        static_cast<ulong>(p2_state[3])
+    );
 }

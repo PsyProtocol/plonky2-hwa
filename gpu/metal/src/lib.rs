@@ -703,10 +703,7 @@ impl MetalRuntime {
         let total_tree_hashes = leaf_count * 2 - 1;
         let total_digests = total_tree_hashes - (num_caps * 2 - 1);
         assert!(
-            total_digests
-                .checked_mul(4)
-                .expect("Metal Merkle digest length overflow")
-                <= u32::MAX as usize,
+            total_digests <= u32::MAX as usize,
             "Metal Merkle digest length must fit in u32 shader indices"
         );
 
@@ -791,10 +788,7 @@ impl MetalRuntime {
         let total_tree_hashes = leaf_count * 2 - 1;
         let total_digests = total_tree_hashes - (num_caps * 2 - 1);
         assert!(
-            total_digests
-                .checked_mul(4)
-                .expect("Metal poly-major Merkle digest length overflow")
-                <= u32::MAX as usize,
+            total_digests <= u32::MAX as usize,
             "Metal poly-major Merkle digest length must fit in u32 shader indices"
         );
 
