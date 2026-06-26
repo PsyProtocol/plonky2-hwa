@@ -14,7 +14,10 @@ use crate::plonk::config::{GenericHashOut, Hasher};
 use crate::util::log2_strict;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
+#[cfg_attr(
+    feature = "serialize_speedy",
+    derive(speedy::Readable, speedy::Writable)
+)]
 #[repr(C)]
 pub struct BatchMerkleTree<F: RichField, H: Hasher<F>> {
     /// The data stored in the Merkle tree leaves.

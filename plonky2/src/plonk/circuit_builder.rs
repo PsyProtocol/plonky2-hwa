@@ -1178,10 +1178,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
 
         // Precompute FFT roots.
         debug!("rate_bits: {}", rate_bits);
-        debug!(
-            "quotient_degree_factor: {}",
-            quotient_degree_factor
-        );
+        debug!("quotient_degree_factor: {}", quotient_degree_factor);
         let max_fft_points = 1 << (degree_bits + max(rate_bits, log2_ceil(quotient_degree_factor)));
         let fft_root_table = fft_root_table(max_fft_points);
 
@@ -1197,7 +1194,8 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             )
         } else {
             Ok(PolynomialBatch::<F, C, D>::default())
-        }.unwrap(); // todo: handle error
+        }
+        .unwrap(); // todo: handle error
 
         // Map between gates where not all generators are used and the gate's number of used generators.
         let incomplete_gates = self

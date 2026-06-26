@@ -16,12 +16,11 @@ use crate::fri::FriParams;
 use crate::hash::hash_types::RichField;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::GenericConfig;
+use crate::plonk::config::{GenericConfig, ProverCompute};
 use crate::timed;
 use crate::util::reducing::ReducingFactor;
-use crate::util::timing::TimingTree;
 use crate::util::reverse_bits;
-use crate::plonk::config::ProverCompute;
+use crate::util::timing::TimingTree;
 /// Four (~64 bit) field elements gives ~128 bit security.
 pub const SALT_SIZE: usize = 4;
 
@@ -230,7 +229,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         if let Some(lde_values) = &self.lde_values {
             let leaf_count = 1 << (self.degree_log + self.rate_bits);
             for (j, poly_index) in (start..end).enumerate() {
-                let poly_values = &lde_values[poly_index * leaf_count..(poly_index + 1) * leaf_count];
+                let poly_values =
+                    &lde_values[poly_index * leaf_count..(poly_index + 1) * leaf_count];
                 for (k, &index) in indices.iter().enumerate() {
                     values[k][j] = poly_values[index * step];
                 }
@@ -269,7 +269,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         if let Some(lde_values) = &self.lde_values {
             let leaf_count = 1 << (self.degree_log + self.rate_bits);
             for (j, poly_index) in (start..end).enumerate() {
-                let poly_values = &lde_values[poly_index * leaf_count..(poly_index + 1) * leaf_count];
+                let poly_values =
+                    &lde_values[poly_index * leaf_count..(poly_index + 1) * leaf_count];
                 let dst_chunk = &mut dst[j * n..(j + 1) * n];
                 for (k, &index) in indices.iter().enumerate() {
                     dst_chunk[k] = poly_values[index * step];
@@ -381,7 +382,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     }
 }
 
-fn normalize_range(range: impl RangeBounds<usize>, leaf_length: usize, blinding: bool) -> (usize, usize) {
+fn normalize_range(
+    range: impl RangeBounds<usize>,
+    leaf_length: usize,
+    blinding: bool,
+) -> (usize, usize) {
     let start = match range.start_bound() {
         Bound::Included(&start) => start,
         Bound::Excluded(&start) => start + 1,
