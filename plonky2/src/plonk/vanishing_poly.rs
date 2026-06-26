@@ -181,6 +181,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     alphas: &[F],
     z_h_on_coset: &ZeroPolyOnCoset<F>,
     lut_re_poly_evals: &[&[F]],
+    precomputed_perm_batch: Option<&[&[F]]>,
 ) -> Vec<Vec<F>> {
     let has_lookup = common_data.num_lookup_polys != 0;
 
@@ -198,6 +199,12 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     }
     assert_eq!(partial_products_batch.len(), n);
     assert_eq!(s_sigmas_batch.len(), n);
+    if let Some(precomputed_perm_batch) = precomputed_perm_batch {
+        assert_eq!(precomputed_perm_batch.len(), n);
+        for precomputed_perm in precomputed_perm_batch {
+            assert_eq!(precomputed_perm.len(), alphas.len());
+        }
+    }
 
     let max_degree = common_data.quotient_degree_factor;
     let num_prods = common_data.num_partial_products;
@@ -205,11 +212,20 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     let num_gate_constraints = common_data.num_gate_constraints;
 
     let constraint_terms_batch =
-        evaluate_gate_constraints_base_batch::<F, D>(common_data, vars_batch);
+        crate::plonk::prover::qp_profile::timed(&crate::plonk::prover::qp_profile::GATE_NS, || {
+            evaluate_gate_constraints_base_batch::<F, D>(common_data, vars_batch)
+        });
     debug_assert!(constraint_terms_batch.len() == n * num_gate_constraints);
 
     let num_challenges = common_data.config.num_challenges;
     let num_routed_wires = common_data.config.num_routed_wires;
+    let perm_term_count = num_challenges * (num_prods + 2);
+    let perm_alpha_powers = precomputed_perm_batch.map(|_| {
+        alphas
+            .iter()
+            .map(|alpha| alpha.exp_u64(perm_term_count as u64))
+            .collect::<Vec<_>>()
+    });
 
     let mut numerator_values = Vec::with_capacity(num_routed_wires);
     let mut denominator_values = Vec::with_capacity(num_routed_wires);
@@ -255,14 +271,15 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
         let partial_products = partial_products_batch[k];
         let s_sigmas = s_sigmas_batch[k];
-
-        let constraint_terms = PackedStridedView::new(&constraint_terms_batch, n, k);
+        let precomputed_perm = precomputed_perm_batch.map(|batch| batch[k]);
 
         let l_0_x = z_h_on_coset.eval_l_0(index, x);
         for i in 0..num_challenges {
             let z_x = local_zs[i];
             let z_gx = next_zs[i];
-            vanishing_z_1_terms.push(l_0_x * z_x.sub_one());
+            if precomputed_perm.is_none() {
+                vanishing_z_1_terms.push(l_0_x * z_x.sub_one());
+            }
 
             // If there are lookups in the circuit, then we add the lookup constraints.
             if has_lookup {
@@ -285,41 +302,65 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 vanishing_all_lookup_terms.extend(lookup_constraints);
             }
 
-            numerator_values.extend((0..num_routed_wires).map(|j| {
-                let wire_value = vars.local_wires[j];
-                let k_i = common_data.k_is[j];
-                let s_id = k_i * x;
-                wire_value + betas[i] * s_id + gammas[i]
-            }));
-            denominator_values.extend((0..num_routed_wires).map(|j| {
-                let wire_value = vars.local_wires[j];
-                let s_sigma = s_sigmas[j];
-                wire_value + betas[i] * s_sigma + gammas[i]
-            }));
+            if precomputed_perm.is_none() {
+                numerator_values.extend((0..num_routed_wires).map(|j| {
+                    let wire_value = vars.local_wires[j];
+                    let k_i = common_data.k_is[j];
+                    let s_id = k_i * x;
+                    wire_value + betas[i] * s_id + gammas[i]
+                }));
+                denominator_values.extend((0..num_routed_wires).map(|j| {
+                    let wire_value = vars.local_wires[j];
+                    let s_sigma = s_sigmas[j];
+                    wire_value + betas[i] * s_sigma + gammas[i]
+                }));
 
-            // The partial products considered for this iteration of `i`.
-            let current_partial_products = &partial_products[i * num_prods..(i + 1) * num_prods];
-            // Check the numerator partial products.
-            let partial_product_checks = check_partial_products(
-                &numerator_values,
-                &denominator_values,
-                current_partial_products,
-                z_x,
-                z_gx,
-                max_degree,
-            );
-            vanishing_partial_products_terms.extend(partial_product_checks);
+                // The partial products considered for this iteration of `i`.
+                let current_partial_products =
+                    &partial_products[i * num_prods..(i + 1) * num_prods];
+                // Check the numerator partial products.
+                let partial_product_checks = check_partial_products(
+                    &numerator_values,
+                    &denominator_values,
+                    current_partial_products,
+                    z_x,
+                    z_gx,
+                    max_degree,
+                );
+                vanishing_partial_products_terms.extend(partial_product_checks);
 
-            numerator_values.clear();
-            denominator_values.clear();
+                numerator_values.clear();
+                denominator_values.clear();
+            }
         }
 
-        let vanishing_terms = vanishing_z_1_terms
-            .iter()
-            .chain(vanishing_partial_products_terms.iter())
-            .chain(vanishing_all_lookup_terms.iter())
-            .chain(constraint_terms);
-        let res = plonk_common::reduce_with_powers_multi(vanishing_terms, alphas);
+        let constraint_terms = PackedStridedView::new(&constraint_terms_batch, n, k);
+        let res = if let Some(precomputed_perm) = precomputed_perm {
+            let vanishing_terms = vanishing_all_lookup_terms.iter().chain(constraint_terms);
+            let mut remainder = crate::plonk::prover::qp_profile::timed(
+                &crate::plonk::prover::qp_profile::REDUCE_NS,
+                || plonk_common::reduce_with_powers_multi(vanishing_terms, alphas),
+            );
+            let perm_alpha_powers = perm_alpha_powers.as_ref().unwrap();
+            for ((dst, &perm), &alpha_power) in remainder
+                .iter_mut()
+                .zip(precomputed_perm)
+                .zip(perm_alpha_powers)
+            {
+                *dst = perm + alpha_power * *dst;
+            }
+            remainder
+        } else {
+            let vanishing_terms = vanishing_z_1_terms
+                .iter()
+                .chain(vanishing_partial_products_terms.iter())
+                .chain(vanishing_all_lookup_terms.iter())
+                .chain(constraint_terms);
+            crate::plonk::prover::qp_profile::timed(
+                &crate::plonk::prover::qp_profile::REDUCE_NS,
+                || plonk_common::reduce_with_powers_multi(vanishing_terms, alphas),
+            )
+        };
         res_batch.push(res);
 
         vanishing_z_1_terms.clear();

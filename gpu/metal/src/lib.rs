@@ -183,6 +183,7 @@ pub struct MetalRuntime {
     pipeline_fft_stage: ComputePipelineState,
     pipeline_fft_stage_pair: ComputePipelineState,
     pipeline_fft_stage_triple: ComputePipelineState,
+    pipeline_quotient_perm_reduce: ComputePipelineState,
     fft_root_buffers: Mutex<HashMap<usize, Vec<Buffer>>>,
     fft_flat_root_buffers: Mutex<HashMap<usize, Buffer>>,
     coset_shift_buffers: Mutex<HashMap<usize, Buffer>>,
@@ -198,6 +199,7 @@ lazy_static! {
         let lib = device
             .new_library_with_source(&shader_source(), &CompileOptions::new())
             .or_else(|source_error| {
+                eprintln!("failed to compile Metal shader source: {source_error}");
                 device.new_library_with_data(SHADERLIB).map_err(|data_error| {
                     format!(
                         "failed to compile Metal shader source: {source_error}; failed to load bundled metallib: {data_error}"
@@ -224,6 +226,7 @@ lazy_static! {
         let f_fft_stage = lib.get_function("fft_stage", None).unwrap();
         let f_fft_stage_pair = lib.get_function("fft_stage_pair", None).unwrap();
         let f_fft_stage_triple = lib.get_function("fft_stage_triple", None).unwrap();
+        let f_quotient_perm_reduce = lib.get_function("quotient_perm_reduce", None).unwrap();
         let pipeline_poseidon_hash_leaves = device
             .new_compute_pipeline_state_with_function(&f_poseidon_hash_leaves)
             .unwrap();
@@ -257,6 +260,9 @@ lazy_static! {
         let pipeline_fft_stage_triple = device
             .new_compute_pipeline_state_with_function(&f_fft_stage_triple)
             .unwrap();
+        let pipeline_quotient_perm_reduce = device
+            .new_compute_pipeline_state_with_function(&f_quotient_perm_reduce)
+            .unwrap();
 
         MetalRuntime {
             device: Mutex::new(device),
@@ -272,6 +278,7 @@ lazy_static! {
             pipeline_fft_stage,
             pipeline_fft_stage_pair,
             pipeline_fft_stage_triple,
+            pipeline_quotient_perm_reduce,
             fft_root_buffers: Mutex::new(HashMap::new()),
             fft_flat_root_buffers: Mutex::new(HashMap::new()),
             coset_shift_buffers: Mutex::new(HashMap::new()),
@@ -710,6 +717,156 @@ impl MetalRuntime {
                 }
             }
 
+            encoder.end_encoding();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+        });
+
+        output
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn quotient_perm_reduce(
+        &self,
+        wires_lde: &[GoldilocksField],
+        constants_sigmas_lde: &[GoldilocksField],
+        zpp_lde: &[GoldilocksField],
+        shifted_xs: &[GoldilocksField],
+        l0_values: &[GoldilocksField],
+        k_is: &[GoldilocksField],
+        betas: &[GoldilocksField],
+        gammas: &[GoldilocksField],
+        alphas: &[GoldilocksField],
+        point_count: usize,
+        leaf_count: usize,
+        step: usize,
+        next_step: usize,
+        num_constants: usize,
+        num_routed_wires: usize,
+        num_challenges: usize,
+        num_partial_products: usize,
+        max_degree: usize,
+    ) -> Vec<GoldilocksField> {
+        assert_eq!(shifted_xs.len(), point_count);
+        assert_eq!(l0_values.len(), point_count);
+        assert_eq!(k_is.len(), num_routed_wires);
+        assert_eq!(betas.len(), num_challenges);
+        assert_eq!(gammas.len(), num_challenges);
+        assert!(alphas.len() <= 64);
+        assert!(point_count <= u32::MAX as usize);
+        assert!(leaf_count <= u32::MAX as usize);
+        assert!(step <= u32::MAX as usize);
+        assert!(next_step <= u32::MAX as usize);
+
+        let output_len = point_count
+            .checked_mul(alphas.len())
+            .expect("Metal quotient output length overflow");
+        let mut output = goldilocks_vec_for_gpu_overwrite(output_len);
+
+        autoreleasepool::<(), _>(|| {
+            let device = self.device.lock().unwrap();
+            let wires_buffer = device.new_buffer_with_bytes_no_copy(
+                wires_lde.as_ptr() as *const core::ffi::c_void,
+                (wires_lde.len() * std::mem::size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            );
+            let constants_sigmas_buffer = device.new_buffer_with_bytes_no_copy(
+                constants_sigmas_lde.as_ptr() as *const core::ffi::c_void,
+                (constants_sigmas_lde.len() * std::mem::size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            );
+            let zpp_buffer = device.new_buffer_with_bytes_no_copy(
+                zpp_lde.as_ptr() as *const core::ffi::c_void,
+                (zpp_lde.len() * std::mem::size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            );
+            let shifted_xs_buffer = device.new_buffer_with_bytes_no_copy(
+                shifted_xs.as_ptr() as *const core::ffi::c_void,
+                (shifted_xs.len() * std::mem::size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            );
+            let l0_buffer = device.new_buffer_with_bytes_no_copy(
+                l0_values.as_ptr() as *const core::ffi::c_void,
+                (l0_values.len() * std::mem::size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            );
+            let k_is_buffer = device.new_buffer_with_bytes_no_copy(
+                k_is.as_ptr() as *const core::ffi::c_void,
+                (k_is.len() * std::mem::size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            );
+            let betas_buffer = device.new_buffer_with_bytes_no_copy(
+                betas.as_ptr() as *const core::ffi::c_void,
+                (betas.len() * std::mem::size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            );
+            let gammas_buffer = device.new_buffer_with_bytes_no_copy(
+                gammas.as_ptr() as *const core::ffi::c_void,
+                (gammas.len() * std::mem::size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            );
+            let alphas_buffer = device.new_buffer_with_bytes_no_copy(
+                alphas.as_ptr() as *const core::ffi::c_void,
+                (alphas.len() * std::mem::size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            );
+            let output_buffer = device.new_buffer_with_bytes_no_copy(
+                output.as_mut_ptr() as *const core::ffi::c_void,
+                (output.len() * std::mem::size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            );
+            drop(device);
+
+            let uniforms = [
+                point_count as u32,
+                leaf_count as u32,
+                step as u32,
+                next_step as u32,
+                num_constants as u32,
+                num_routed_wires as u32,
+                num_challenges as u32,
+                num_partial_products as u32,
+                max_degree as u32,
+                alphas.len() as u32,
+            ];
+
+            let command_buffer = self.command_queue.new_command_buffer();
+            let compute_pass_descriptor = ComputePassDescriptor::new();
+            let encoder =
+                command_buffer.compute_command_encoder_with_descriptor(compute_pass_descriptor);
+            encoder.set_compute_pipeline_state(&self.pipeline_quotient_perm_reduce);
+            encoder.set_buffer(0, Some(&wires_buffer), 0);
+            encoder.set_buffer(1, Some(&constants_sigmas_buffer), 0);
+            encoder.set_buffer(2, Some(&zpp_buffer), 0);
+            encoder.set_buffer(3, Some(&shifted_xs_buffer), 0);
+            encoder.set_buffer(4, Some(&l0_buffer), 0);
+            encoder.set_buffer(5, Some(&k_is_buffer), 0);
+            encoder.set_buffer(6, Some(&betas_buffer), 0);
+            encoder.set_buffer(7, Some(&gammas_buffer), 0);
+            encoder.set_buffer(8, Some(&alphas_buffer), 0);
+            encoder.set_buffer(9, Some(&output_buffer), 0);
+            encoder.set_bytes(
+                10,
+                (uniforms.len() * std::mem::size_of::<u32>()) as u64,
+                uniforms.as_ptr() as *mut core::ffi::c_void,
+            );
+            let threads_per_grid = get_size_for_count(point_count);
+            let thread_group_size = MTLSize {
+                width: self.pipeline_quotient_perm_reduce.thread_execution_width(),
+                height: 1,
+                depth: 1,
+            };
+            encoder.dispatch_threads(threads_per_grid, thread_group_size);
             encoder.end_encoding();
             command_buffer.commit();
             command_buffer.wait_until_completed();

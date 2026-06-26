@@ -11,8 +11,12 @@ use plonky2_maybe_rayon::*;
 
 use super::circuit_builder::{LookupChallenges, LookupWire};
 use crate::field::extension::Extendable;
+#[cfg(feature = "metal")]
+use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::polynomial::PolynomialValues;
 use crate::field::types::Field;
+#[cfg(feature = "metal")]
+use crate::field::types::PrimeField64;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 use crate::fri::oracle::PolynomialBatch;
 use crate::gates::lookup::LookupGate;
@@ -593,6 +597,366 @@ fn compute_all_lookup_polys<
 
 const BATCH_SIZE: usize = 32;
 
+/// Optional sub-phase profiling for `compute_quotient_polys_pre_transpose`.
+///
+/// Accumulates per-phase time (summed across rayon threads, so totals exceed wall-clock; the
+/// *ratios* are what matter) and prints a breakdown when the `QUOTIENT_PROFILE` env var is set.
+/// Counters are `core` atomics so this compiles under `no_std`; timing/printing is `std`-only.
+pub(crate) mod qp_profile {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    pub static GATHER_NS: AtomicU64 = AtomicU64::new(0);
+    pub static EVAL_NS: AtomicU64 = AtomicU64::new(0);
+    pub static GATE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static REDUCE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static DIV_NS: AtomicU64 = AtomicU64::new(0);
+    pub static METAL_PERM_NS: AtomicU64 = AtomicU64::new(0);
+
+    #[allow(unused)]
+    pub(crate) static COUNTERS: [&AtomicU64; 6] = [
+        &GATHER_NS,
+        &EVAL_NS,
+        &GATE_NS,
+        &REDUCE_NS,
+        &DIV_NS,
+        &METAL_PERM_NS,
+    ];
+
+    #[cfg(feature = "std")]
+    fn enabled() -> bool {
+        use std::sync::OnceLock;
+        static E: OnceLock<bool> = OnceLock::new();
+        *E.get_or_init(|| std::env::var("QUOTIENT_PROFILE").is_ok())
+    }
+
+    #[cfg(feature = "std")]
+    pub fn timed<R>(counter: &AtomicU64, f: impl FnOnce() -> R) -> R {
+        if !enabled() {
+            return f();
+        }
+        let start = std::time::Instant::now();
+        let r = f();
+        counter.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        r
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub fn timed<R>(_counter: &AtomicU64, f: impl FnOnce() -> R) -> R {
+        f()
+    }
+
+    #[cfg(feature = "std")]
+    pub fn reset() {
+        if enabled() {
+            for c in COUNTERS {
+                c.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub fn reset() {}
+
+    #[cfg(feature = "std")]
+    pub fn report() {
+        if !enabled() {
+            return;
+        }
+        let g = GATHER_NS.load(Ordering::Relaxed) as f64 / 1e6;
+        let e = EVAL_NS.load(Ordering::Relaxed) as f64 / 1e6;
+        let gate = GATE_NS.load(Ordering::Relaxed) as f64 / 1e6;
+        let reduce = REDUCE_NS.load(Ordering::Relaxed) as f64 / 1e6;
+        let metal_perm = METAL_PERM_NS.load(Ordering::Relaxed) as f64 / 1e6;
+        // perm-arithmetic = whole eval minus gate eval minus the alpha reduction.
+        let perm_arith = (e - gate - reduce).max(0.0);
+        let d = DIV_NS.load(Ordering::Relaxed) as f64 / 1e6;
+        let total = (g + e + d + metal_perm).max(1e-9);
+        eprintln!(
+            "[quotient-profile] thread-summed (ratios matter): gather={g:.0}ms eval={e:.0}ms \
+             (gate={gate:.0}ms perm_arith={perm_arith:.0}ms reduce={reduce:.0}ms) \
+             metal_perm={metal_perm:.0}ms div={d:.0}ms | \
+             gather={:.0}% gate={:.0}% perm_arith={:.0}% reduce={:.0}% metal_perm={:.0}% div={:.0}%",
+            100.0 * g / total,
+            100.0 * gate / total,
+            100.0 * perm_arith / total,
+            100.0 * reduce / total,
+            100.0 * metal_perm / total,
+            100.0 * d / total,
+        );
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub fn report() {}
+}
+
+#[cfg(feature = "metal")]
+fn goldilocks_slice_from_field_slice<F: Field>(values: &[F]) -> &[GoldilocksField] {
+    assert_eq!(
+        core::any::type_name::<F>(),
+        core::any::type_name::<GoldilocksField>()
+    );
+    assert_eq!(
+        core::mem::size_of::<F>(),
+        core::mem::size_of::<GoldilocksField>()
+    );
+    assert_eq!(
+        core::mem::align_of::<F>(),
+        core::mem::align_of::<GoldilocksField>()
+    );
+    unsafe { core::slice::from_raw_parts(values.as_ptr() as *const GoldilocksField, values.len()) }
+}
+
+/// Cheap predicate mirroring `try_metal_quotient_perm_contribution`'s guards, so the caller can
+/// decide to overlap the GPU kernel with CPU work knowing the kernel will run (returns `Some`).
+#[cfg(feature = "metal")]
+fn metal_quotient_perm_applicable<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    common_data: &CommonCircuitData<F, D>,
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    wires_commitment: &PolynomialBatch<F, C, D>,
+    zs_partial_products_and_lookup_commitment: &PolynomialBatch<F, C, D>,
+    alphas: &[F],
+) -> bool {
+    if core::any::type_name::<F>() != core::any::type_name::<GoldilocksField>()
+        || D != 2
+        || common_data.num_lookup_polys != 0
+        || alphas.len() > 64
+        || !plonky2_metal::is_available()
+    {
+        return false;
+    }
+    let (Some(cs), Some(w), Some(z)) = (
+        prover_data.constants_sigmas_commitment.lde_values.as_ref(),
+        wires_commitment.lde_values.as_ref(),
+        zs_partial_products_and_lookup_commitment
+            .lde_values
+            .as_ref(),
+    ) else {
+        return false;
+    };
+    let leaf_count = 1usize << (wires_commitment.degree_log + wires_commitment.rate_bits);
+    cs.len() % leaf_count == 0 && w.len() % leaf_count == 0 && z.len() % leaf_count == 0
+}
+
+#[cfg(feature = "metal")]
+#[allow(clippy::too_many_arguments)]
+fn try_metal_quotient_perm_contribution<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    common_data: &CommonCircuitData<F, D>,
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    wires_commitment: &PolynomialBatch<F, C, D>,
+    zs_partial_products_and_lookup_commitment: &PolynomialBatch<F, C, D>,
+    points: &[F],
+    step: usize,
+    next_step: usize,
+    betas: &[F],
+    gammas: &[F],
+    alphas: &[F],
+    z_h_on_coset: &ZeroPolyOnCoset<F>,
+) -> Option<Vec<F>> {
+    if core::any::type_name::<F>() != core::any::type_name::<GoldilocksField>()
+        || D != 2
+        || common_data.num_lookup_polys != 0
+        || alphas.len() > 64
+        || !plonky2_metal::is_available()
+    {
+        return None;
+    }
+
+    let constants_sigmas_lde = prover_data
+        .constants_sigmas_commitment
+        .lde_values
+        .as_ref()?;
+    let wires_lde = wires_commitment.lde_values.as_ref()?;
+    let zpp_lde = zs_partial_products_and_lookup_commitment
+        .lde_values
+        .as_ref()?;
+    let leaf_count = 1usize << (wires_commitment.degree_log + wires_commitment.rate_bits);
+    if constants_sigmas_lde.len() % leaf_count != 0
+        || wires_lde.len() % leaf_count != 0
+        || zpp_lde.len() % leaf_count != 0
+    {
+        return None;
+    }
+
+    let shifted_xs = points
+        .iter()
+        .map(|&x| F::coset_shift() * x)
+        .collect::<Vec<_>>();
+    let l0_values = points
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| z_h_on_coset.eval_l_0(i, F::coset_shift() * x))
+        .collect::<Vec<_>>();
+
+    let output = plonky2_metal::MetalRuntime::get().quotient_perm_reduce(
+        goldilocks_slice_from_field_slice(wires_lde),
+        goldilocks_slice_from_field_slice(constants_sigmas_lde),
+        goldilocks_slice_from_field_slice(zpp_lde),
+        goldilocks_slice_from_field_slice(&shifted_xs),
+        goldilocks_slice_from_field_slice(&l0_values),
+        goldilocks_slice_from_field_slice(&common_data.k_is),
+        goldilocks_slice_from_field_slice(betas),
+        goldilocks_slice_from_field_slice(gammas),
+        goldilocks_slice_from_field_slice(alphas),
+        points.len(),
+        leaf_count,
+        step,
+        next_step,
+        common_data.num_constants,
+        common_data.config.num_routed_wires,
+        common_data.config.num_challenges,
+        common_data.num_partial_products,
+        common_data.quotient_degree_factor,
+    );
+
+    let output = output
+        .into_iter()
+        .map(|value| F::from_canonical_u64(value.to_canonical_u64()))
+        .collect::<Vec<_>>();
+
+    #[cfg(feature = "std")]
+    if std::env::var("VERIFY_METAL_QUOTIENT_PERM").is_ok() {
+        verify_metal_quotient_perm_contribution(
+            common_data,
+            constants_sigmas_lde,
+            wires_lde,
+            zpp_lde,
+            &shifted_xs,
+            &l0_values,
+            step,
+            next_step,
+            betas,
+            gammas,
+            alphas,
+            leaf_count,
+            &output,
+        );
+    }
+
+    Some(output)
+}
+
+#[cfg(all(feature = "metal", feature = "std"))]
+#[allow(clippy::too_many_arguments)]
+fn verify_metal_quotient_perm_contribution<F: RichField + Extendable<D>, const D: usize>(
+    common_data: &CommonCircuitData<F, D>,
+    constants_sigmas_lde: &[F],
+    wires_lde: &[F],
+    zpp_lde: &[F],
+    shifted_xs: &[F],
+    l0_values: &[F],
+    step: usize,
+    next_step: usize,
+    betas: &[F],
+    gammas: &[F],
+    alphas: &[F],
+    leaf_count: usize,
+    metal_output: &[F],
+) {
+    let point_count = shifted_xs.len();
+    let num_challenges = common_data.config.num_challenges;
+    let num_routed_wires = common_data.config.num_routed_wires;
+    let num_prods = common_data.num_partial_products;
+    let max_degree = common_data.quotient_degree_factor;
+
+    for point in 0..point_count {
+        let lde_point = point * step;
+        let next_lde_point = ((point + next_step) % point_count) * step;
+        let x = shifted_xs[point];
+        let l_0_x = l0_values[point];
+        let mut accum = vec![F::ZERO; alphas.len()];
+        let mut powers = vec![F::ONE; alphas.len()];
+        let mut add_term = |term: F| {
+            for ((acc, power), &alpha) in accum.iter_mut().zip(&mut powers).zip(alphas) {
+                *acc += term * *power;
+                *power *= alpha;
+            }
+        };
+
+        for challenge in 0..num_challenges {
+            let z_x = zpp_lde[challenge * leaf_count + lde_point];
+            add_term(l_0_x * z_x.sub_one());
+        }
+
+        for challenge in 0..num_challenges {
+            let beta = betas[challenge];
+            let gamma = gammas[challenge];
+            let z_x = zpp_lde[challenge * leaf_count + lde_point];
+            let z_gx = zpp_lde[challenge * leaf_count + next_lde_point];
+
+            for chunk in 0..=num_prods {
+                let start_wire = chunk * max_degree;
+                let end_wire = (start_wire + max_degree).min(num_routed_wires);
+                let mut numerator_product = F::ONE;
+                let mut denominator_product = F::ONE;
+                for wire in start_wire..end_wire {
+                    let wire_value = wires_lde[wire * leaf_count + lde_point];
+                    let s_id = common_data.k_is[wire] * x;
+                    let s_sigma = constants_sigmas_lde
+                        [(common_data.num_constants + wire) * leaf_count + lde_point];
+                    numerator_product *= wire_value + beta * s_id + gamma;
+                    denominator_product *= wire_value + beta * s_sigma + gamma;
+                }
+
+                let prev_acc = if chunk == 0 {
+                    z_x
+                } else {
+                    zpp_lde[(num_challenges + challenge * num_prods + chunk - 1) * leaf_count
+                        + lde_point]
+                };
+                let next_acc = if chunk < num_prods {
+                    zpp_lde
+                        [(num_challenges + challenge * num_prods + chunk) * leaf_count + lde_point]
+                } else {
+                    z_gx
+                };
+                add_term(prev_acc * numerator_product - next_acc * denominator_product);
+            }
+        }
+
+        let start = point * alphas.len();
+        for (alpha_i, (&expected, &actual)) in accum
+            .iter()
+            .zip(&metal_output[start..start + alphas.len()])
+            .enumerate()
+        {
+            if expected != actual {
+                panic!(
+                    "Metal quotient permutation mismatch at point {point}, alpha {alpha_i}: expected {expected:?}, got {actual:?}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "metal"))]
+#[allow(clippy::too_many_arguments, dead_code)]
+fn try_metal_quotient_perm_contribution<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    _common_data: &CommonCircuitData<F, D>,
+    _prover_data: &ProverOnlyCircuitData<F, C, D>,
+    _wires_commitment: &PolynomialBatch<F, C, D>,
+    _zs_partial_products_and_lookup_commitment: &PolynomialBatch<F, C, D>,
+    _points: &[F],
+    _step: usize,
+    _next_step: usize,
+    _betas: &[F],
+    _gammas: &[F],
+    _alphas: &[F],
+    _z_h_on_coset: &ZeroPolyOnCoset<F>,
+) -> Option<Vec<F>> {
+    None
+}
 
 fn compute_quotient_polys_pre_transpose<
     'a,
@@ -618,6 +982,8 @@ fn compute_quotient_polys_pre_transpose<
         quotient_degree_bits <= common_data.config.fri_config.rate_bits,
         "Having constraints of degree higher than the rate is not supported yet."
     );
+
+    qp_profile::reset();
 
     let step = 1 << (common_data.config.fri_config.rate_bits - quotient_degree_bits);
     let next_step = 1 << quotient_degree_bits;
@@ -650,136 +1016,260 @@ fn compute_quotient_polys_pre_transpose<
     let lut_re_poly_evals_refs: Vec<&[F]> =
         lut_re_poly_evals.iter().map(|v| v.as_slice()).collect();
 
-    let points_batches = points.par_chunks(BATCH_SIZE);
-    //let num_batches = points.len().div_ceil(BATCH_SIZE);
+    // The per-point quotient loop, parameterized by the (optional) precomputed permutation
+    // contribution. With `Some(..)` the loop only evaluates gate constraints and combines them with
+    // the supplied permutation terms; with `None` it computes the permutation argument on the CPU.
+    let run_quotient_loop = |metal_perm_contribution: Option<&[F]>| -> Vec<Vec<F>> {
+        points
+            .par_chunks(BATCH_SIZE)
+            .enumerate()
+            .flat_map(|(batch_i, xs_batch)| {
+                let n = xs_batch.len();
+                let indices_batch: Vec<usize> =
+                    (BATCH_SIZE * batch_i..BATCH_SIZE * batch_i + n).collect();
 
-    let quotient_values: Vec<Vec<F>> = points_batches
-        .enumerate()
-        .flat_map(|(batch_i, xs_batch)| {
-            let n = xs_batch.len();
-            let indices_batch: Vec<usize> = (BATCH_SIZE * batch_i..BATCH_SIZE * batch_i + n).collect();
+                let mut shifted_xs_batch = Vec::with_capacity(n);
+                let mut local_zs_batch_vecs = Vec::with_capacity(n);
+                let mut next_zs_batch_vecs = Vec::with_capacity(n);
+                let mut local_lookup_batch_vecs = Vec::with_capacity(n);
+                let mut next_lookup_batch_vecs = Vec::with_capacity(n);
+                let mut partial_products_batch_vecs = Vec::with_capacity(n);
+                let mut s_sigmas_batch_vecs = Vec::with_capacity(n);
 
-            let mut shifted_xs_batch = Vec::with_capacity(n);
-            let mut local_zs_batch_vecs = Vec::with_capacity(n);
-            let mut next_zs_batch_vecs = Vec::with_capacity(n);
-            let mut local_lookup_batch_vecs = Vec::with_capacity(n);
-            let mut next_lookup_batch_vecs = Vec::with_capacity(n);
-            let mut partial_products_batch_vecs = Vec::with_capacity(n);
-            let mut s_sigmas_batch_vecs = Vec::with_capacity(n);
-
-            let mut local_constants_batch = vec![F::ZERO; n * common_data.num_constants];
-            let mut local_wires_batch = vec![F::ZERO; n * common_data.config.num_wires];
-            let use_poly_major_lde = prover_data
-                .constants_sigmas_commitment
-                .has_poly_major_lde_values()
-                || wires_commitment.has_poly_major_lde_values()
-                || zs_partial_products_and_lookup_commitment.has_poly_major_lde_values();
-
-            if use_poly_major_lde {
-                let next_indices_batch = indices_batch
-                    .iter()
-                    .map(|&i| (i + next_step) % lde_size)
-                    .collect::<Vec<_>>();
-
-                s_sigmas_batch_vecs = prover_data
+                let mut local_constants_batch = vec![F::ZERO; n * common_data.num_constants];
+                let mut local_wires_batch = vec![F::ZERO; n * common_data.config.num_wires];
+                let use_poly_major_lde = prover_data
                     .constants_sigmas_commitment
-                    .get_lde_values_batch(&indices_batch, step, common_data.sigmas_range());
-                local_zs_batch_vecs = zs_partial_products_and_lookup_commitment
-                    .get_lde_values_batch(&indices_batch, step, common_data.zs_range());
-                next_zs_batch_vecs = zs_partial_products_and_lookup_commitment
-                    .get_lde_values_batch(&next_indices_batch, step, common_data.zs_range());
-                partial_products_batch_vecs = zs_partial_products_and_lookup_commitment
-                    .get_lde_values_batch(&indices_batch, step, common_data.partial_products_range());
-                if has_lookup {
-                    local_lookup_batch_vecs = zs_partial_products_and_lookup_commitment
-                        .get_lde_values_batch(&indices_batch, step, common_data.lookup_range());
-                    next_lookup_batch_vecs = zs_partial_products_and_lookup_commitment
-                        .get_lde_values_batch(&next_indices_batch, step, common_data.lookup_range());
-                }
+                    .has_poly_major_lde_values()
+                    || wires_commitment.has_poly_major_lde_values()
+                    || zs_partial_products_and_lookup_commitment.has_poly_major_lde_values();
 
-                prover_data.constants_sigmas_commitment.fill_lde_values_batch(
-                    &indices_batch,
-                    step,
-                    common_data.constants_range(),
-                    &mut local_constants_batch,
+                qp_profile::timed(&qp_profile::GATHER_NS, || {
+                    if use_poly_major_lde {
+                        let next_indices_batch = indices_batch
+                            .iter()
+                            .map(|&i| (i + next_step) % lde_size)
+                            .collect::<Vec<_>>();
+
+                        s_sigmas_batch_vecs = prover_data
+                            .constants_sigmas_commitment
+                            .get_lde_values_batch(&indices_batch, step, common_data.sigmas_range());
+                        local_zs_batch_vecs = zs_partial_products_and_lookup_commitment
+                            .get_lde_values_batch(&indices_batch, step, common_data.zs_range());
+                        next_zs_batch_vecs = zs_partial_products_and_lookup_commitment
+                            .get_lde_values_batch(
+                                &next_indices_batch,
+                                step,
+                                common_data.zs_range(),
+                            );
+                        partial_products_batch_vecs = zs_partial_products_and_lookup_commitment
+                            .get_lde_values_batch(
+                                &indices_batch,
+                                step,
+                                common_data.partial_products_range(),
+                            );
+                        if has_lookup {
+                            local_lookup_batch_vecs = zs_partial_products_and_lookup_commitment
+                                .get_lde_values_batch(
+                                    &indices_batch,
+                                    step,
+                                    common_data.lookup_range(),
+                                );
+                            next_lookup_batch_vecs = zs_partial_products_and_lookup_commitment
+                                .get_lde_values_batch(
+                                    &next_indices_batch,
+                                    step,
+                                    common_data.lookup_range(),
+                                );
+                        }
+
+                        prover_data
+                            .constants_sigmas_commitment
+                            .fill_lde_values_batch(
+                                &indices_batch,
+                                step,
+                                common_data.constants_range(),
+                                &mut local_constants_batch,
+                            );
+                        wires_commitment.fill_lde_values_batch(
+                            &indices_batch,
+                            step,
+                            0..common_data.config.num_wires,
+                            &mut local_wires_batch,
+                        );
+                    }
+
+                    for (k, (&i, &x)) in indices_batch.iter().zip(xs_batch).enumerate() {
+                        shifted_xs_batch.push(F::coset_shift() * x);
+
+                        let i_next = (i + next_step) % lde_size;
+                        if !use_poly_major_lde {
+                            let local_constants_sigmas = prover_data
+                                .constants_sigmas_commitment
+                                .get_lde_values(i, step);
+                            let local_wires = wires_commitment.get_lde_values(i, step);
+                            let local_zs_partial_and_lookup =
+                                zs_partial_products_and_lookup_commitment.get_lde_values(i, step);
+                            let next_zs_partial_and_lookup =
+                                zs_partial_products_and_lookup_commitment
+                                    .get_lde_values(i_next, step);
+
+                            s_sigmas_batch_vecs
+                                .push(local_constants_sigmas[common_data.sigmas_range()].to_vec());
+                            local_zs_batch_vecs
+                                .push(local_zs_partial_and_lookup[common_data.zs_range()].to_vec());
+                            next_zs_batch_vecs
+                                .push(next_zs_partial_and_lookup[common_data.zs_range()].to_vec());
+                            partial_products_batch_vecs.push(
+                                local_zs_partial_and_lookup[common_data.partial_products_range()]
+                                    .to_vec(),
+                            );
+                            if has_lookup {
+                                local_lookup_batch_vecs.push(
+                                    local_zs_partial_and_lookup[common_data.lookup_range()]
+                                        .to_vec(),
+                                );
+                                next_lookup_batch_vecs.push(
+                                    next_zs_partial_and_lookup[common_data.lookup_range()].to_vec(),
+                                );
+                            }
+
+                            for (j, &c) in local_constants_sigmas[common_data.constants_range()]
+                                .iter()
+                                .enumerate()
+                            {
+                                local_constants_batch[j * n + k] = c;
+                            }
+                            for (j, &w) in local_wires.iter().enumerate() {
+                                local_wires_batch[j * n + k] = w;
+                            }
+                        }
+                    }
+                });
+
+                let local_zs_batch: Vec<&[F]> =
+                    local_zs_batch_vecs.iter().map(|v| v.as_slice()).collect();
+                let next_zs_batch: Vec<&[F]> =
+                    next_zs_batch_vecs.iter().map(|v| v.as_slice()).collect();
+                let local_lookup_batch: Vec<&[F]> = local_lookup_batch_vecs
+                    .iter()
+                    .map(|v| v.as_slice())
+                    .collect();
+                let next_lookup_batch: Vec<&[F]> = next_lookup_batch_vecs
+                    .iter()
+                    .map(|v| v.as_slice())
+                    .collect();
+                let partial_products_batch: Vec<&[F]> = partial_products_batch_vecs
+                    .iter()
+                    .map(|v| v.as_slice())
+                    .collect();
+                let s_sigmas_batch: Vec<&[F]> =
+                    s_sigmas_batch_vecs.iter().map(|v| v.as_slice()).collect();
+                let precomputed_perm_batch_vecs = metal_perm_contribution.map(|perm| {
+                    indices_batch
+                        .iter()
+                        .map(|&i| &perm[i * alphas.len()..(i + 1) * alphas.len()])
+                        .collect::<Vec<_>>()
+                });
+
+                let vars_batch = EvaluationVarsBaseBatch::new(
+                    n,
+                    &local_constants_batch,
+                    &local_wires_batch,
+                    public_inputs_hash,
                 );
-                wires_commitment.fill_lde_values_batch(
-                    &indices_batch,
-                    step,
-                    0..common_data.config.num_wires,
-                    &mut local_wires_batch,
-                );
-            }
 
-            for (k, (&i, &x)) in indices_batch.iter().zip(xs_batch).enumerate() {
-                shifted_xs_batch.push(F::coset_shift() * x);
+                let mut quotient_values_batch = qp_profile::timed(&qp_profile::EVAL_NS, || {
+                    eval_vanishing_poly_base_batch::<F, D>(
+                        common_data,
+                        &indices_batch,
+                        &shifted_xs_batch,
+                        vars_batch,
+                        &local_zs_batch,
+                        &next_zs_batch,
+                        &local_lookup_batch,
+                        &next_lookup_batch,
+                        &partial_products_batch,
+                        &s_sigmas_batch,
+                        betas,
+                        gammas,
+                        deltas,
+                        alphas,
+                        &z_h_on_coset,
+                        &lut_re_poly_evals_refs,
+                        precomputed_perm_batch_vecs.as_deref(),
+                    )
+                });
 
-                let i_next = (i + next_step) % lde_size;
-                if !use_poly_major_lde {
-                    let local_constants_sigmas = prover_data.constants_sigmas_commitment.get_lde_values(i, step);
-                    let local_wires = wires_commitment.get_lde_values(i, step);
-                    let local_zs_partial_and_lookup = zs_partial_products_and_lookup_commitment.get_lde_values(i, step);
-                    let next_zs_partial_and_lookup = zs_partial_products_and_lookup_commitment.get_lde_values(i_next, step);
-
-                    s_sigmas_batch_vecs.push(local_constants_sigmas[common_data.sigmas_range()].to_vec());
-                    local_zs_batch_vecs.push(local_zs_partial_and_lookup[common_data.zs_range()].to_vec());
-                    next_zs_batch_vecs.push(next_zs_partial_and_lookup[common_data.zs_range()].to_vec());
-                    partial_products_batch_vecs.push(local_zs_partial_and_lookup[common_data.partial_products_range()].to_vec());
-                    if has_lookup {
-                        local_lookup_batch_vecs.push(local_zs_partial_and_lookup[common_data.lookup_range()].to_vec());
-                        next_lookup_batch_vecs.push(next_zs_partial_and_lookup[common_data.lookup_range()].to_vec());
+                qp_profile::timed(&qp_profile::DIV_NS, || {
+                    for (&i, quotient_values) in
+                        indices_batch.iter().zip(quotient_values_batch.iter_mut())
+                    {
+                        let denominator_inv = z_h_on_coset.eval_inverse(i);
+                        quotient_values
+                            .iter_mut()
+                            .for_each(|v| *v *= denominator_inv);
                     }
+                });
+                quotient_values_batch
+            })
+            .collect()
+    };
 
-                    for (j, &c) in local_constants_sigmas[common_data.constants_range()].iter().enumerate() {
-                        local_constants_batch[j * n + k] = c;
-                    }
-                    for (j, &w) in local_wires.iter().enumerate() {
-                        local_wires_batch[j * n + k] = w;
-                    }
-                }
-            }
-            
-            let local_zs_batch: Vec<&[F]> = local_zs_batch_vecs.iter().map(|v| v.as_slice()).collect();
-            let next_zs_batch: Vec<&[F]> = next_zs_batch_vecs.iter().map(|v| v.as_slice()).collect();
-            let local_lookup_batch: Vec<&[F]> = local_lookup_batch_vecs.iter().map(|v| v.as_slice()).collect();
-            let next_lookup_batch: Vec<&[F]> = next_lookup_batch_vecs.iter().map(|v| v.as_slice()).collect();
-            let partial_products_batch: Vec<&[F]> = partial_products_batch_vecs.iter().map(|v| v.as_slice()).collect();
-            let s_sigmas_batch: Vec<&[F]> = s_sigmas_batch_vecs.iter().map(|v| v.as_slice()).collect();
-            
-            let vars_batch = EvaluationVarsBaseBatch::new(
-                n,
-                &local_constants_batch,
-                &local_wires_batch,
-                public_inputs_hash,
-            );
-
-            let mut quotient_values_batch = eval_vanishing_poly_base_batch::<F, D>(
-                common_data,
-                &indices_batch,
-                &shifted_xs_batch,
-                vars_batch,
-                &local_zs_batch,
-                &next_zs_batch,
-                &local_lookup_batch,
-                &next_lookup_batch,
-                &partial_products_batch,
-                &s_sigmas_batch,
-                betas,
-                gammas,
-                deltas,
-                alphas,
-                &z_h_on_coset,
-                &lut_re_poly_evals_refs,
-            );
-
-            for (&i, quotient_values) in indices_batch.iter().zip(quotient_values_batch.iter_mut()) {
+    // GPU↔CPU overlap: when the Metal permutation kernel is applicable, run it on a background
+    // thread while the CPU evaluates gate constraints (fed a zero permutation contribution), then
+    // fold the GPU's already-reduced permutation terms in and divide by Z_H. This hides the GPU
+    // latency behind the CPU gate work instead of running them serially.
+    #[cfg(all(feature = "metal", feature = "std"))]
+    let quotient_values = if metal_quotient_perm_applicable(
+        common_data,
+        prover_data,
+        wires_commitment,
+        zs_partial_products_and_lookup_commitment,
+        alphas,
+    ) {
+        let alpha_len = alphas.len();
+        let zero_perm = vec![F::ZERO; points.len() * alpha_len];
+        let (mut quotient_values, perm) = std::thread::scope(|scope| {
+            let gpu = scope.spawn(|| {
+                qp_profile::timed(&qp_profile::METAL_PERM_NS, || {
+                    try_metal_quotient_perm_contribution(
+                        common_data,
+                        prover_data,
+                        wires_commitment,
+                        zs_partial_products_and_lookup_commitment,
+                        &points,
+                        step,
+                        next_step,
+                        betas,
+                        gammas,
+                        alphas,
+                        &z_h_on_coset,
+                    )
+                    .expect("metal quotient perm applicable but returned None")
+                })
+            });
+            let quotient_values = run_quotient_loop(Some(&zero_perm));
+            let perm = gpu.join().expect("metal quotient perm thread panicked");
+            (quotient_values, perm)
+        });
+        quotient_values
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(i, qs)| {
                 let denominator_inv = z_h_on_coset.eval_inverse(i);
-                quotient_values
-                    .iter_mut()
-                    .for_each(|v| *v *= denominator_inv);
-            }
-            quotient_values_batch
-        })
-        .collect();
+                for (c, q) in qs.iter_mut().enumerate() {
+                    *q += perm[i * alpha_len + c] * denominator_inv;
+                }
+            });
+        quotient_values
+    } else {
+        run_quotient_loop(None)
+    };
+
+    #[cfg(not(all(feature = "metal", feature = "std")))]
+    let quotient_values = run_quotient_loop(None);
+
+    qp_profile::report();
     quotient_values
 }

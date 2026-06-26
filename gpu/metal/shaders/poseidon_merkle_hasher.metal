@@ -92,6 +92,120 @@ struct SingleCosetLdeUniforms {
     uint thread_count;
 };
 
+struct QuotientPermUniforms {
+    uint point_count;
+    uint leaf_count;
+    uint step;
+    uint next_step;
+    uint num_constants;
+    uint num_routed_wires;
+    uint num_challenges;
+    uint num_partial_products;
+    uint max_degree;
+    uint alpha_count;
+};
+
+constant uint MAX_QUOTIENT_ALPHAS = 64;
+
+inline void quotient_accum_term(
+    Fp term,
+    constant Fp * alphas,
+    thread Fp * accum,
+    thread Fp * powers,
+    uint alpha_count
+) {
+    for (uint i = 0; i < alpha_count; i++) {
+        Fp alpha = alphas[i];
+        accum[i] = accum[i] + term * powers[i];
+        powers[i] = powers[i] * alpha;
+    }
+}
+
+kernel void quotient_perm_reduce(
+    constant Fp * wires_lde[[buffer(0)]],
+    constant Fp * constants_sigmas_lde[[buffer(1)]],
+    constant Fp * zpp_lde[[buffer(2)]],
+    constant Fp * shifted_xs[[buffer(3)]],
+    constant Fp * l0_values[[buffer(4)]],
+    constant Fp * k_is[[buffer(5)]],
+    constant Fp * betas[[buffer(6)]],
+    constant Fp * gammas[[buffer(7)]],
+    constant Fp * alphas[[buffer(8)]],
+    device Fp * output[[buffer(9)]],
+    constant QuotientPermUniforms & uniforms[[buffer(10)]],
+    uint2 gid[[thread_position_in_grid]]
+) {
+    uint point = gid[1] * 32768 + gid[0];
+    if (point >= uniforms.point_count || uniforms.alpha_count > MAX_QUOTIENT_ALPHAS) {
+        return;
+    }
+
+    uint lde_point = point * uniforms.step;
+    uint next_lde_point = ((point + uniforms.next_step) % uniforms.point_count) * uniforms.step;
+    Fp x = shifted_xs[point];
+    Fp l0_x = l0_values[point];
+
+    Fp accum[MAX_QUOTIENT_ALPHAS];
+    Fp powers[MAX_QUOTIENT_ALPHAS];
+    for (uint a = 0; a < uniforms.alpha_count; a++) {
+        accum[a] = Fp(0);
+        powers[a] = Fp(1);
+    }
+
+    for (uint challenge = 0; challenge < uniforms.num_challenges; challenge++) {
+        Fp z_x = zpp_lde[challenge * uniforms.leaf_count + lde_point];
+        quotient_accum_term(l0_x * fp_sub(z_x, Fp(1)), alphas, accum, powers, uniforms.alpha_count);
+    }
+
+    for (uint challenge = 0; challenge < uniforms.num_challenges; challenge++) {
+        Fp beta = betas[challenge];
+        Fp gamma = gammas[challenge];
+        Fp z_x = zpp_lde[challenge * uniforms.leaf_count + lde_point];
+        Fp z_gx = zpp_lde[challenge * uniforms.leaf_count + next_lde_point];
+
+        for (uint chunk = 0; chunk <= uniforms.num_partial_products; chunk++) {
+            uint start_wire = chunk * uniforms.max_degree;
+            uint end_wire = min(start_wire + uniforms.max_degree, uniforms.num_routed_wires);
+            Fp numerator_product = Fp(1);
+            Fp denominator_product = Fp(1);
+
+            for (uint wire = start_wire; wire < end_wire; wire++) {
+                Fp wire_value = wires_lde[wire * uniforms.leaf_count + lde_point];
+                Fp k_i = k_is[wire];
+                Fp s_id = k_i * x;
+                Fp s_sigma = constants_sigmas_lde[
+                    (uniforms.num_constants + wire) * uniforms.leaf_count + lde_point
+                ];
+                numerator_product = numerator_product * (wire_value + beta * s_id + gamma);
+                denominator_product = denominator_product * (wire_value + beta * s_sigma + gamma);
+            }
+
+            Fp prev_acc = chunk == 0
+                ? z_x
+                : zpp_lde[
+                    (uniforms.num_challenges
+                        + challenge * uniforms.num_partial_products
+                        + chunk
+                        - 1) * uniforms.leaf_count + lde_point
+                ];
+            Fp next_acc = chunk < uniforms.num_partial_products
+                ? zpp_lde[
+                    (uniforms.num_challenges
+                        + challenge * uniforms.num_partial_products
+                        + chunk) * uniforms.leaf_count + lde_point
+                ]
+                : z_gx;
+            Fp term = fp_sub(prev_acc * numerator_product, next_acc * denominator_product);
+            quotient_accum_term(term, alphas, accum, powers, uniforms.alpha_count);
+        }
+    }
+
+    uint output_offset = point * uniforms.alpha_count;
+    for (uint a = 0; a < uniforms.alpha_count; a++) {
+        output[output_offset + a] = accum[a];
+    }
+}
+
 kernel void fft_init_reverse_zero(
     constant Fp * input[[buffer(0)]],
     device Fp * values[[buffer(1)]],
