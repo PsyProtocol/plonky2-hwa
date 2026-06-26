@@ -13,7 +13,7 @@ categories.workspace = true
 
 [features]
 default = ["gate_testing", "parallel", "rand_chacha", "std", "timing", "ts-rs", "serialize_speedy"]
-cuda = ["std", "dep:plonky2_cuda"]
+cuda = ["std", "dep:plonky2_cuda", "plonky2_cuda/runtime"]
 metal = ["std", "dep:plonky2_metal"]
 metal-lde = ["metal", "plonky2_metal/lde"]
 gate_testing = []

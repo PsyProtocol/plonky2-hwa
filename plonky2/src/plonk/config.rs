@@ -22,13 +22,15 @@ use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::fft::FftRootTable;
 use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::polynomial::PolynomialCoeffs;
+#[cfg(any(feature = "metal", feature = "cuda"))]
+use crate::field::types::Field;
 #[cfg(feature = "metal")]
-use crate::field::types::{Field, Sample};
+use crate::field::types::Sample;
 use crate::fri::oracle::PolynomialBatch;
 use crate::hash::hash_types::{HashOut, RichField};
 use crate::hash::hashing::PlonkyPermutation;
 use crate::hash::keccak::KeccakHash;
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "metal", feature = "cuda"))]
 use crate::hash::merkle_tree::MerkleCap;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::hash::poseidon::PoseidonHash;
@@ -388,7 +390,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct CudaBackend;
 
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "metal", feature = "cuda"))]
 fn get_node_hash_index_in_digests(
     num_layers: usize,
     tree_length: usize,
@@ -406,8 +408,8 @@ fn get_node_hash_index_in_digests(
     d_index + (tree_index * tree_length)
 }
 
-#[cfg(feature = "metal")]
-fn metal_merkle_tree_from_digests(
+#[cfg(any(feature = "metal", feature = "cuda"))]
+fn gpu_merkle_tree_from_digests(
     leaves: Vec<Vec<GoldilocksField>>,
     leaf_count: usize,
     digests: Vec<HashOut<GoldilocksField>>,
@@ -535,7 +537,7 @@ impl<C: GenericConfig<2, F = GoldilocksField, Hasher = PoseidonHash>>
                     .collect::<Vec<_>>()
                 );
                 let merkle_tree =
-                    metal_merkle_tree_from_digests(Vec::new(), leaf_count, digests, cap_height);
+                    gpu_merkle_tree_from_digests(Vec::new(), leaf_count, digests, cap_height);
 
                 return Ok(PolynomialBatch {
                     polynomials,
@@ -620,7 +622,7 @@ impl<C: GenericConfig<2, F = GoldilocksField, Hasher = PoseidonHash>>
                         .collect::<Vec<_>>();
 
                 let leaf_count = leaves.len();
-                return Ok(metal_merkle_tree_from_digests(
+                return Ok(gpu_merkle_tree_from_digests(
                     leaves, leaf_count, digests, cap_height,
                 ));
             }
@@ -639,8 +641,177 @@ impl<C: GenericConfig<2, F = GoldilocksField, Hasher = PoseidonHash>>
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct PlaceholderGpuProverCompute<B>(PhantomData<B>);
 
-/// Placeholder for a CUDA-backed prover compute implementation.
-pub type CudaProverCompute = PlaceholderGpuProverCompute<CudaBackend>;
+/// CUDA-backed prover compute.
+///
+/// Phase 1 accelerates the LDE + Poseidon-Merkle commitment (`compute_from_coeffs`) for large trees
+/// on the GPU and delegates everything else (and the no-`cuda`-feature build) to the CPU path.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct CudaProverCompute;
+
+/// Reinterpret a Goldilocks slice as raw `u64`s. Sound because `GoldilocksField` is
+/// `#[repr(transparent)]` over `u64`.
+#[cfg(feature = "cuda")]
+fn cuda_as_u64(values: &[GoldilocksField]) -> &[u64] {
+    unsafe { core::slice::from_raw_parts(values.as_ptr() as *const u64, values.len()) }
+}
+
+impl<C: GenericConfig<2, F = GoldilocksField, Hasher = PoseidonHash>>
+    ProverCompute<GoldilocksField, C, 2> for CudaProverCompute
+{
+    fn compute_from_coeffs(
+        timing: &mut TimingTree,
+        polynomials: Vec<PolynomialCoeffs<GoldilocksField>>,
+        cap_height: usize,
+        rate_bits: usize,
+        blinding: bool,
+        fft_root_table: Option<&FftRootTable<GoldilocksField>>,
+    ) -> anyhow::Result<PolynomialBatch<GoldilocksField, C, 2>> {
+        #[cfg(feature = "cuda")]
+        {
+            const SALT_SIZE: usize = 4;
+            let salt_size = if blinding { SALT_SIZE } else { 0 };
+            let degree = polynomials[0].len();
+            let degree_log = log2_strict(degree);
+            let leaf_count = degree << rate_bits;
+            let tree_height = log2_strict(leaf_count);
+
+            if cap_height < tree_height && tree_height >= 13 && plonky2_cuda::is_available() {
+                let poly_num = polynomials.len();
+
+                // Poly-major coefficients as raw u64.
+                let mut coeffs = vec![0u64; poly_num * degree];
+                coeffs
+                    .par_chunks_mut(degree)
+                    .zip(polynomials.par_iter())
+                    .for_each(|(dst, poly)| dst.copy_from_slice(cuda_as_u64(&poly.coeffs)));
+
+                // Twiddle tables / coset-shift powers (see plonky2_cuda::runtime docs).
+                let root_table = crate::field::fft::fft_root_table::<GoldilocksField>(degree).concat();
+                let root_table2 =
+                    crate::field::fft::fft_root_table::<GoldilocksField>(leaf_count).concat();
+                let shift_powers: Vec<GoldilocksField> = GoldilocksField::coset_shift()
+                    .powers()
+                    .take(degree)
+                    .collect();
+
+                let result = timed!(
+                    timing,
+                    "CUDA LDE + Merkle tree",
+                    plonky2_cuda::CudaRuntime::get()
+                        .commit_from_coeffs(
+                            &coeffs,
+                            poly_num,
+                            degree,
+                            rate_bits,
+                            cap_height,
+                            salt_size,
+                            cuda_as_u64(&root_table),
+                            cuda_as_u64(&root_table2),
+                            cuda_as_u64(&shift_powers),
+                        )
+                        .map_err(|e| anyhow::anyhow!("CUDA commit_from_coeffs failed: {e}"))?
+                );
+
+                // The GPU buffer is `[num_digests internal/leaf digests | len_cap caps]`; plonky2's
+                // `merkle_tree.digests` holds only the `num_digests` part (caps are rebuilt below).
+                let len_cap = 1usize << cap_height;
+                let num_digests = 2 * (leaf_count - len_cap);
+                let digests = result
+                    .digests_and_caps
+                    .into_iter()
+                    .take(num_digests)
+                    .map(|c| HashOut {
+                        elements: [
+                            GoldilocksField(c[0]),
+                            GoldilocksField(c[1]),
+                            GoldilocksField(c[2]),
+                            GoldilocksField(c[3]),
+                        ],
+                    })
+                    .collect::<Vec<_>>();
+                // The GPU returns leaf-major values in the CPU Merkle tree's leaf order, so populate
+                // `merkle_tree.leaves` directly (leaf length = polys + salt) and leave
+                // `lde_values` empty.
+                let leaf_len = poly_num + salt_size;
+                let leaves = result
+                    .leaves_flat
+                    .chunks_exact(leaf_len)
+                    .map(|leaf| leaf.iter().map(|&v| GoldilocksField(v)).collect())
+                    .collect::<Vec<_>>();
+                let merkle_tree =
+                    gpu_merkle_tree_from_digests(leaves, leaf_count, digests, cap_height);
+
+                return Ok(PolynomialBatch {
+                    polynomials,
+                    merkle_tree,
+                    lde_values: None,
+                    degree_log,
+                    rate_bits,
+                    blinding,
+                });
+            }
+        }
+
+        compute_from_coeffs_with_prover_compute::<Self, GoldilocksField, C, 2>(
+            timing,
+            polynomials,
+            cap_height,
+            rate_bits,
+            blinding,
+            fft_root_table,
+        )
+    }
+
+    fn compute_from_values(
+        timing: &mut TimingTree,
+        values: Vec<PolynomialValues<GoldilocksField>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        fft_root_table: Option<&FftRootTable<GoldilocksField>>,
+    ) -> anyhow::Result<PolynomialBatch<GoldilocksField, C, 2>> {
+        compute_from_values_with_prover_compute::<Self, GoldilocksField, C, 2>(
+            timing,
+            values,
+            rate_bits,
+            blinding,
+            cap_height,
+            fft_root_table,
+        )
+    }
+
+    fn transpose_and_compute_from_coeffs(
+        timing: &mut TimingTree,
+        pre_transposed_quotient_polys: Vec<Vec<GoldilocksField>>,
+        quotient_degree: usize,
+        degree: usize,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        fft_root_table: Option<&FftRootTable<GoldilocksField>>,
+    ) -> anyhow::Result<PolynomialBatch<GoldilocksField, C, 2>> {
+        transpose_and_compute_from_coeffs_with_prover_compute::<Self, GoldilocksField, C, 2>(
+            timing,
+            pre_transposed_quotient_polys,
+            quotient_degree,
+            degree,
+            rate_bits,
+            blinding,
+            cap_height,
+            fft_root_table,
+        )
+    }
+
+    fn build_merkle_tree(
+        timing: &mut TimingTree,
+        leaves: Vec<Vec<GoldilocksField>>,
+        cap_height: usize,
+    ) -> anyhow::Result<MerkleTree<GoldilocksField, C::Hasher>> {
+        <CpuProverCompute as ProverCompute<GoldilocksField, C, 2>>::build_merkle_tree(
+            timing, leaves, cap_height,
+        )
+    }
+}
 
 impl<
         B: 'static + Debug + Clone + Send + Sync,
@@ -903,6 +1074,145 @@ mod tests {
         for &index in &[0, 1, 17, 4096, 8191] {
             assert_eq!(metal.get_leaf_values(index), cpu.get_leaf_values(index));
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_compute_from_coeffs_matches_cpu_for_large_tree() {
+        if !plonky2_cuda::is_available() {
+            eprintln!("skipping CUDA compute_from_coeffs test: no CUDA device available");
+            return;
+        }
+
+        // degree 1024, rate_bits 3 => leaf_count 8192 (tree_height 13) so the GPU path triggers.
+        let polynomials = (0..6)
+            .map(|poly| {
+                PolynomialCoeffs::new(
+                    (0..1024)
+                        .map(|i| GoldilocksField::from_canonical_usize(poly * 31 + i * 17 + 5))
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut cpu_timing = TimingTree::new("cpu", Level::Debug);
+        let mut cuda_timing = TimingTree::new("cuda", Level::Debug);
+        let cpu = PolynomialBatch::<GoldilocksField, PoseidonGoldilocksConfig, 2>::from_coeffs(
+            polynomials.clone(),
+            3,
+            false,
+            4,
+            &mut cpu_timing,
+            None,
+        )
+        .unwrap();
+        let cuda =
+            PolynomialBatch::<GoldilocksField, PoseidonGoldilocksCudaConfig, 2>::from_coeffs(
+                polynomials,
+                3,
+                false,
+                4,
+                &mut cuda_timing,
+                None,
+            )
+            .unwrap();
+
+        // Check from the bottom up so a failure pinpoints the layer:
+        // leaves (LDE correctness) -> cap (hashing) -> full digest array (layout).
+        for &index in &[0, 1, 17, 4096, 8191] {
+            assert_eq!(
+                cuda.get_leaf_values(index),
+                cpu.get_leaf_values(index),
+                "leaf {index} mismatch (LDE / root-table convention)"
+            );
+        }
+        assert_eq!(cuda.merkle_tree.cap, cpu.merkle_tree.cap, "cap mismatch");
+        assert_eq!(
+            cuda.merkle_tree.digests, cpu.merkle_tree.digests,
+            "digest array mismatch (GPU digest ordering vs plonky2 layout)"
+        );
+    }
+
+    /// Wall-clock comparison of `from_coeffs` (the Phase 1 accelerated path) on CPU vs CUDA for a
+    /// large tree. Run with: `cargo test --features cuda cuda_from_coeffs_timing -- --ignored
+    /// --nocapture`.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "benchmark; run explicitly with --ignored --nocapture"]
+    fn cuda_from_coeffs_timing() {
+        use std::time::Instant;
+
+        if !plonky2_cuda::is_available() {
+            eprintln!("skipping CUDA timing: no CUDA device available");
+            return;
+        }
+
+        let degree_bits = 15;
+        let degree = 1usize << degree_bits;
+        let poly_num = 88; // ~ num_constants + num_routed_wires for a recursion circuit
+        let rate_bits = 3;
+        let cap_height = 4;
+        let polynomials = (0..poly_num)
+            .map(|p| {
+                PolynomialCoeffs::new(
+                    (0..degree)
+                        .map(|i| GoldilocksField::from_canonical_usize(p * 31 + i * 17 + 5))
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let run_cpu = || {
+            let mut t = TimingTree::new("cpu", Level::Debug);
+            PolynomialBatch::<GoldilocksField, PoseidonGoldilocksConfig, 2>::from_coeffs(
+                polynomials.clone(),
+                rate_bits,
+                false,
+                cap_height,
+                &mut t,
+                None,
+            )
+            .unwrap()
+        };
+        let run_cuda = || {
+            let mut t = TimingTree::new("cuda", Level::Debug);
+            PolynomialBatch::<GoldilocksField, PoseidonGoldilocksCudaConfig, 2>::from_coeffs(
+                polynomials.clone(),
+                rate_bits,
+                false,
+                cap_height,
+                &mut t,
+                None,
+            )
+            .unwrap()
+        };
+
+        // Warm up (CUDA context creation + JIT, allocator warmup).
+        let _ = run_cpu();
+        let _ = run_cuda();
+
+        let runs = 5;
+        let mut cpu_ms = vec![];
+        let mut cuda_ms = vec![];
+        for _ in 0..runs {
+            let s = Instant::now();
+            let _ = run_cpu();
+            cpu_ms.push(s.elapsed().as_secs_f64() * 1e3);
+            let s = Instant::now();
+            let _ = run_cuda();
+            cuda_ms.push(s.elapsed().as_secs_f64() * 1e3);
+        }
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        let c = median(cpu_ms);
+        let g = median(cuda_ms);
+        eprintln!(
+            "[from_coeffs timing] degree=2^{degree_bits} polys={poly_num} rate_bits={rate_bits} \
+             leaf_count=2^{} | CPU={c:.1}ms CUDA={g:.1}ms speedup={:.2}x",
+            degree_bits + rate_bits,
+            c / g,
+        );
     }
 
     #[cfg(feature = "metal")]

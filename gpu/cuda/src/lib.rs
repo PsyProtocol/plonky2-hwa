@@ -16,6 +16,11 @@
 
 extern crate core;
 
+#[cfg(feature = "runtime")]
+mod runtime;
+#[cfg(feature = "runtime")]
+pub use runtime::{is_available, CommitResult, CudaRuntime};
+
 use std::ffi::c_void;
 
 pub mod cuda {
