@@ -148,4 +148,31 @@ extern "C" {
         ctx: *mut c_void,
     ) -> cuda::Error;
 
+    pub fn quotient_perm(
+        degree_log: i32,
+        rate_bits: i32,
+        step: i32,
+        next_step: i32,
+        point_count: i32,
+        shifted_xs: *const u64,
+        l0_values: *const u64,
+        perm_out: *mut u64,
+        constants_sigmas_leaves: *const u64,
+        constants_sigmas_leaf_len: i32,
+        zs_partial_products_leaves: *const u64,
+        zs_partial_products_leaf_len: i32,
+        wires_leaves: *const u64,
+        wires_leaf_len: i32,
+        num_constants: i32,
+        num_routed_wires: i32,
+        num_challenges: i32,
+        quotient_degree_factor: i32,
+        num_partial_products: i32,
+        k_is: *const u64,
+        alphas: *const u64,
+        betas: *const u64,
+        gammas: *const u64,
+        ctx: *mut c_void,
+    ) -> cuda::Error;
+
 }

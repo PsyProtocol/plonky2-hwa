@@ -877,6 +877,117 @@ void compute_quotient_values_kernel(
 
 }
 
+// Generic (circuit-parameter-agnostic) permutation-argument contribution for the quotient.
+//
+// Computes, per LDE point `index` and per challenge `c`, the alpha-reduced sum of the permutation
+// terms only -- the partial-product checks plus the `z_1` (l_0 * (Z - 1)) term -- in the SAME power
+// order the monolithic kernel uses (partial products higher, z_1 lowest), WITHOUT dividing by Z_H.
+// Gate constraints (and lookups) are left to the CPU, which folds them in above these via
+// `alpha^perm_term_count`. Counts come in as runtime args, so this works for any circuit.
+//
+// `perm_out` is laid out `[index * num_challenges + c]`.
+#define QP_MAX_CHALLENGES 8
+#define QP_MAX_PP_TERMS 256
+__global__
+void quotient_perm_kernel(
+        int degree_log, int rate_bits, int step, int next_step, int point_count,
+        const GoldilocksField* shifted_xs,
+        const GoldilocksField* l0_values,
+        GoldilocksField* perm_out,
+
+        const GoldilocksField* constants_sigmas_leaves, int constants_sigmas_leaf_len,
+        const GoldilocksField* zs_partial_products_leaves, int zs_partial_products_leaf_len,
+        const GoldilocksField* wires_leaves, int wires_leaf_len,
+
+        int num_constants, int num_routed_wires,
+        int num_challenges,
+        int quotient_degree_factor,
+        int num_partial_products,
+
+        const GoldilocksField* k_is,
+        const GoldilocksField* alphas,
+        const GoldilocksField* betas,
+        const GoldilocksField* gammas)
+{
+    int thCnt = get_global_thcnt();
+    int gid = get_global_id();
+
+    int max_degree = quotient_degree_factor;
+    int num_prods = num_partial_products;
+
+    // Leaves live on the rate-`rate_bits` LDE (bit-reversed). A quotient-domain point `i` maps to
+    // rate-LDE index `i*step`; bitrev over `degree_log+rate_bits` gives the stored leaf row.
+    auto get_lde_values = [degree_log, rate_bits, step](const GoldilocksField* leaves, int leaf_len, int i) -> GoldilocksFieldView {
+        int index = bitrev(i * step, degree_log + rate_bits);
+        return GoldilocksFieldView{(GoldilocksField*)&leaves[index * leaf_len], leaf_len};
+    };
+
+    for (int index = gid; index < point_count; index += thCnt) {
+        GoldilocksField x = shifted_xs[index];
+        int i_next = (index + next_step) % point_count;
+
+        auto local_constants_sigmas = get_lde_values(constants_sigmas_leaves, constants_sigmas_leaf_len, index);
+        auto s_sigmas = local_constants_sigmas.view(num_constants, num_constants + num_routed_wires);
+        auto local_wires = get_lde_values(wires_leaves, wires_leaf_len, index);
+        auto local_zs_partial_products = get_lde_values(zs_partial_products_leaves, zs_partial_products_leaf_len, index);
+        auto local_zs = local_zs_partial_products.view(0, num_challenges);
+        auto next_zs = get_lde_values(zs_partial_products_leaves, zs_partial_products_leaf_len, i_next).view(0, num_challenges);
+        auto partial_products = local_zs_partial_products.view(num_challenges);
+
+        GoldilocksField res[QP_MAX_CHALLENGES] = {0};
+        auto reduce_with_powers = [&res, &alphas, num_challenges](GoldilocksField term) {
+            for (int i = 0; i < num_challenges; ++i) {
+                res[i] = term + res[i] * alphas[i];
+            }
+        };
+
+        // Partial-product checks (numerator/denominator with betas, gammas, k_is, s_sigmas).
+        int partial_product_rounds = num_routed_wires / max_degree;
+        int vanishing_partial_products_terms_len = num_challenges * partial_product_rounds;
+        GoldilocksField vanishing_partial_products_terms[QP_MAX_PP_TERMS];
+        for (int i = 0; i < num_challenges; ++i) {
+            auto z_x = local_zs[i];
+            auto z_gx = next_zs[i];
+            auto current_partial_products = partial_products.view(i * num_prods, (i + 1) * num_prods);
+
+            GoldilocksField prev_acc, next_acc;
+            for (int k = 0; k < partial_product_rounds; ++k) {
+                GoldilocksField num_chunk_product = GoldilocksField::from_canonical_u64(1);
+                for (int j = k * max_degree; j < (k + 1) * max_degree; ++j) {
+                    auto wire_value = local_wires[j];
+                    auto k_i = k_is[j];
+                    auto s_id = k_i * x;
+                    num_chunk_product *= wire_value + betas[i] * s_id + gammas[i];
+                }
+                GoldilocksField den_chunk_product = GoldilocksField::from_canonical_u64(1);
+                for (int j = k * max_degree; j < (k + 1) * max_degree; ++j) {
+                    auto wire_value = local_wires[j];
+                    auto s_sigma = s_sigmas[j];
+                    den_chunk_product *= wire_value + betas[i] * s_sigma + gammas[i];
+                }
+                prev_acc = (k == 0) ? z_x : next_acc;
+                next_acc = (k == partial_product_rounds - 1) ? z_gx : current_partial_products[k];
+                vanishing_partial_products_terms[i * partial_product_rounds + k] =
+                        prev_acc * num_chunk_product - next_acc * den_chunk_product;
+            }
+        }
+        for (int i = vanishing_partial_products_terms_len - 1; i >= 0; --i) {
+            reduce_with_powers(vanishing_partial_products_terms[i]);
+        }
+
+        // z_1 terms: l_0(x) * (Z(x) - 1), lowest powers. `l0_values` is precomputed on the host.
+        auto l_0_x = l0_values[index];
+        for (int i = num_challenges - 1; i >= 0; --i) {
+            GoldilocksField z_x = local_zs[i];
+            reduce_with_powers(l_0_x * z_x.sub_one());
+        }
+
+        for (int c = 0; c < num_challenges; ++c) {
+            perm_out[index * num_challenges + c] = res[c];
+        }
+    }
+}
+
 __global__
 void mul_kernel(GoldilocksField* values_flatten, int poly_num, int values_num_per_poly, const GoldilocksField* mul_values)
 {

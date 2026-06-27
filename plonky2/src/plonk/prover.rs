@@ -11,7 +11,7 @@ use plonky2_maybe_rayon::*;
 
 use super::circuit_builder::{LookupChallenges, LookupWire};
 use crate::field::extension::Extendable;
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "metal", feature = "cuda"))]
 use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::polynomial::PolynomialValues;
 use crate::field::types::Field;
@@ -689,7 +689,7 @@ pub(crate) mod qp_profile {
     pub fn report() {}
 }
 
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "metal", feature = "cuda"))]
 fn goldilocks_slice_from_field_slice<F: Field>(values: &[F]) -> &[GoldilocksField] {
     assert_eq!(
         core::any::type_name::<F>(),
@@ -704,6 +704,146 @@ fn goldilocks_slice_from_field_slice<F: Field>(values: &[F]) -> &[GoldilocksFiel
         core::mem::align_of::<GoldilocksField>()
     );
     unsafe { core::slice::from_raw_parts(values.as_ptr() as *const GoldilocksField, values.len()) }
+}
+
+#[cfg(feature = "cuda")]
+fn u64_slice_from_field_slice<F: Field>(values: &[F]) -> &[u64] {
+    let g = goldilocks_slice_from_field_slice(values);
+    // SAFETY: GoldilocksField is #[repr(transparent)] over u64.
+    unsafe { core::slice::from_raw_parts(g.as_ptr() as *const u64, g.len()) }
+}
+
+#[cfg(feature = "cuda")]
+fn flatten_leaves_u64<F: Field>(leaves: &[Vec<F>]) -> Vec<u64> {
+    let leaf_len = leaves.first().map_or(0, |l| l.len());
+    let mut out = Vec::with_capacity(leaves.len() * leaf_len);
+    for leaf in leaves {
+        out.extend_from_slice(u64_slice_from_field_slice(leaf));
+    }
+    out
+}
+
+/// Whether to offload the quotient permutation argument to CUDA. OFF by default: on a discrete GPU
+/// the per-call leaf upload (no device residency yet) makes it a net loss vs the CPU path. Enable
+/// with `CUDA_QUOTIENT_PERM=1` to experiment (and for the eventual device-resident path).
+#[cfg(all(feature = "cuda", feature = "std"))]
+fn cuda_quotient_perm_enabled() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("CUDA_QUOTIENT_PERM").is_ok())
+}
+
+/// Cheap predicate (no uploads) mirroring `try_cuda_quotient_perm_contribution`'s guards, so the
+/// caller can decide to overlap the GPU kernel with CPU gate evaluation.
+#[cfg(all(feature = "cuda", feature = "std"))]
+fn cuda_quotient_perm_applicable<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    common_data: &CommonCircuitData<F, D>,
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    wires_commitment: &PolynomialBatch<F, C, D>,
+    zs_partial_products_and_lookup_commitment: &PolynomialBatch<F, C, D>,
+    alphas: &[F],
+) -> bool {
+    cuda_quotient_perm_enabled()
+        && core::any::type_name::<F>() == core::any::type_name::<GoldilocksField>()
+        && D == 2
+        && common_data.num_lookup_polys == 0
+        && alphas.len() <= 8
+        && plonky2_cuda::is_available()
+        && !prover_data.constants_sigmas_commitment.merkle_tree.leaves.is_empty()
+        && !wires_commitment.merkle_tree.leaves.is_empty()
+        && !zs_partial_products_and_lookup_commitment.merkle_tree.leaves.is_empty()
+}
+
+/// CUDA analogue of `try_metal_quotient_perm_contribution`. Computes the (un-Z_H-divided) permutation
+/// contribution on the GPU from the commitments' leaf-major Merkle leaves, returning a flat
+/// `[point * num_challenges + challenge]` vector to feed `run_quotient_loop`'s precomputed-perm path.
+/// Phase B1: uploads all leaves each call (correctness first).
+#[cfg(all(feature = "cuda", feature = "std"))]
+#[allow(clippy::too_many_arguments)]
+fn try_cuda_quotient_perm_contribution<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    common_data: &CommonCircuitData<F, D>,
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    wires_commitment: &PolynomialBatch<F, C, D>,
+    zs_partial_products_and_lookup_commitment: &PolynomialBatch<F, C, D>,
+    points: &[F],
+    step: usize,
+    next_step: usize,
+    betas: &[F],
+    gammas: &[F],
+    alphas: &[F],
+    z_h_on_coset: &ZeroPolyOnCoset<F>,
+) -> Option<Vec<F>> {
+    if core::any::type_name::<F>() != core::any::type_name::<GoldilocksField>()
+        || D != 2
+        || common_data.num_lookup_polys != 0
+        || alphas.len() > 8
+        || !plonky2_cuda::is_available()
+    {
+        return None;
+    }
+
+    let cs_leaves = &prover_data.constants_sigmas_commitment.merkle_tree.leaves;
+    let wires_leaves = &wires_commitment.merkle_tree.leaves;
+    let zs_leaves = &zs_partial_products_and_lookup_commitment.merkle_tree.leaves;
+    if cs_leaves.is_empty() || wires_leaves.is_empty() || zs_leaves.is_empty() {
+        return None;
+    }
+    let cs_leaf_len = cs_leaves[0].len();
+    let wires_leaf_len = wires_leaves[0].len();
+    let zs_leaf_len = zs_leaves[0].len();
+
+    let cs_flat = flatten_leaves_u64(cs_leaves);
+    let wires_flat = flatten_leaves_u64(wires_leaves);
+    let zs_flat = flatten_leaves_u64(zs_leaves);
+
+    let shifted_xs: Vec<F> = points.iter().map(|&x| F::coset_shift() * x).collect();
+    let l0_values: Vec<F> = shifted_xs
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| z_h_on_coset.eval_l_0(i, x))
+        .collect();
+
+    let perm_u64 = plonky2_cuda::CudaRuntime::get()
+        .quotient_perm(
+            common_data.degree_bits(),
+            common_data.config.fri_config.rate_bits,
+            step,
+            next_step,
+            u64_slice_from_field_slice(&shifted_xs),
+            u64_slice_from_field_slice(&l0_values),
+            &cs_flat,
+            cs_leaf_len,
+            &zs_flat,
+            zs_leaf_len,
+            &wires_flat,
+            wires_leaf_len,
+            common_data.num_constants,
+            common_data.config.num_routed_wires,
+            common_data.config.num_challenges,
+            common_data.quotient_degree_factor,
+            common_data.num_partial_products,
+            u64_slice_from_field_slice(&common_data.k_is),
+            u64_slice_from_field_slice(alphas),
+            u64_slice_from_field_slice(betas),
+            u64_slice_from_field_slice(gammas),
+        )
+        .expect("cuda quotient_perm failed");
+
+    // SAFETY: F == GoldilocksField (checked above), #[repr(transparent)] over u64.
+    Some(
+        perm_u64
+            .into_iter()
+            .map(|v| unsafe { core::mem::transmute_copy::<u64, F>(&v) })
+            .collect(),
+    )
 }
 
 /// Cheap predicate mirroring `try_metal_quotient_perm_contribution`'s guards, so the caller can
@@ -1267,7 +1407,60 @@ fn compute_quotient_polys_pre_transpose<
         run_quotient_loop(None)
     };
 
-    #[cfg(not(all(feature = "metal", feature = "std")))]
+    // CUDA path (Phase B1.5): run the GPU permutation kernel on a background thread while the CPU
+    // evaluates gate constraints (fed a zero perm), then fold the GPU's perm terms in and divide by
+    // Z_H -- hiding the GPU latency (and the leaf upload) behind the CPU gate work.
+    #[cfg(all(feature = "cuda", feature = "std", not(feature = "metal")))]
+    let quotient_values = if cuda_quotient_perm_applicable(
+        common_data,
+        prover_data,
+        wires_commitment,
+        zs_partial_products_and_lookup_commitment,
+        alphas,
+    ) {
+        let alpha_len = alphas.len();
+        let zero_perm = vec![F::ZERO; points.len() * alpha_len];
+        let (mut quotient_values, perm) = std::thread::scope(|scope| {
+            let gpu = scope.spawn(|| {
+                qp_profile::timed(&qp_profile::METAL_PERM_NS, || {
+                    try_cuda_quotient_perm_contribution(
+                        common_data,
+                        prover_data,
+                        wires_commitment,
+                        zs_partial_products_and_lookup_commitment,
+                        &points,
+                        step,
+                        next_step,
+                        betas,
+                        gammas,
+                        alphas,
+                        &z_h_on_coset,
+                    )
+                    .expect("cuda quotient perm applicable but returned None")
+                })
+            });
+            let quotient_values = run_quotient_loop(Some(&zero_perm));
+            let perm = gpu.join().expect("cuda quotient perm thread panicked");
+            (quotient_values, perm)
+        });
+        quotient_values
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(i, qs)| {
+                let denominator_inv = z_h_on_coset.eval_inverse(i);
+                for (c, q) in qs.iter_mut().enumerate() {
+                    *q += perm[i * alpha_len + c] * denominator_inv;
+                }
+            });
+        quotient_values
+    } else {
+        run_quotient_loop(None)
+    };
+
+    #[cfg(not(any(
+        all(feature = "metal", feature = "std"),
+        all(feature = "cuda", feature = "std", not(feature = "metal"))
+    )))]
     let quotient_values = run_quotient_loop(None);
 
     qp_profile::report();

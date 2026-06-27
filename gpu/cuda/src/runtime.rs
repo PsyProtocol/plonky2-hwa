@@ -241,4 +241,93 @@ impl CudaRuntime {
             leaves_flat,
         })
     }
+
+    /// Generic permutation-argument contribution for the quotient (Phase B, correctness-first:
+    /// uploads all commitment leaves each call). Returns the alpha-reduced, NOT-yet-Z_H-divided perm
+    /// terms, laid out `[point_index * num_challenges + challenge]` (length `lde_size * num_challenges`).
+    ///
+    /// All leaf slices are leaf-major (the layout produced by `commit_from_coeffs`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn quotient_perm(
+        &self,
+        degree_log: usize,
+        rate_bits: usize,
+        step: usize,
+        next_step: usize,
+        shifted_xs: &[u64],
+        l0_values: &[u64],
+        constants_sigmas_leaves: &[u64],
+        constants_sigmas_leaf_len: usize,
+        zs_partial_products_leaves: &[u64],
+        zs_partial_products_leaf_len: usize,
+        wires_leaves: &[u64],
+        wires_leaf_len: usize,
+        num_constants: usize,
+        num_routed_wires: usize,
+        num_challenges: usize,
+        quotient_degree_factor: usize,
+        num_partial_products: usize,
+        k_is: &[u64],
+        alphas: &[u64],
+        betas: &[u64],
+        gammas: &[u64],
+    ) -> Result<Vec<u64>, String> {
+        // Iterate over the quotient domain (one entry per point), not the rate LDE.
+        let point_count = shifted_xs.len();
+        assert_eq!(l0_values.len(), point_count);
+
+        let mut guard = self.inner.lock().unwrap();
+        let inner = &mut *guard;
+        CurrentContext::set_current(&inner.context).map_err(|e| format!("{e:?}"))?;
+
+        let mk = |s: &[u64]| DeviceBuffer::from_slice(s).map_err(|e| format!("{e:?}"));
+        let mut d_xs = mk(shifted_xs)?;
+        let mut d_l0 = mk(l0_values)?;
+        let mut d_cs = mk(constants_sigmas_leaves)?;
+        let mut d_zs = mk(zs_partial_products_leaves)?;
+        let mut d_wires = mk(wires_leaves)?;
+        let mut d_kis = mk(k_is)?;
+        let mut d_alphas = mk(alphas)?;
+        let mut d_betas = mk(betas)?;
+        let mut d_gammas = mk(gammas)?;
+        let mut d_perm: DeviceBuffer<u64> =
+            unsafe { DeviceBuffer::uninitialized(point_count * num_challenges) }
+                .map_err(|e| format!("{e:?}"))?;
+
+        let err = unsafe {
+            crate::quotient_perm(
+                degree_log as i32,
+                rate_bits as i32,
+                step as i32,
+                next_step as i32,
+                point_count as i32,
+                d_xs.as_device_ptr().as_raw(),
+                d_l0.as_device_ptr().as_raw(),
+                d_perm.as_device_ptr().as_raw_mut(),
+                d_cs.as_device_ptr().as_raw(),
+                constants_sigmas_leaf_len as i32,
+                d_zs.as_device_ptr().as_raw(),
+                zs_partial_products_leaf_len as i32,
+                d_wires.as_device_ptr().as_raw(),
+                wires_leaf_len as i32,
+                num_constants as i32,
+                num_routed_wires as i32,
+                num_challenges as i32,
+                quotient_degree_factor as i32,
+                num_partial_products as i32,
+                d_kis.as_device_ptr().as_raw(),
+                d_alphas.as_device_ptr().as_raw(),
+                d_betas.as_device_ptr().as_raw(),
+                d_gammas.as_device_ptr().as_raw(),
+                &mut inner.inner_ctx as *mut CudaInnerContext as *mut c_void,
+            )
+        };
+        if err.code != 0 {
+            return Err(String::from(err));
+        }
+
+        let mut perm = vec![0u64; point_count * num_challenges];
+        d_perm.copy_to(&mut perm[..]).map_err(|e| format!("{e:?}"))?;
+        Ok(perm)
+    }
 }

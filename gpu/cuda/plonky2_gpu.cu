@@ -673,6 +673,42 @@ extern "C" {
         return RustError{cudaSuccess};
     }
 
+    // Launch the generic permutation-argument kernel. All pointers are device pointers (memory and
+    // copies are managed by the Rust caller, matching the other entry points).
+    RustError quotient_perm(
+            int degree_log, int rate_bits, int step, int next_step, int point_count,
+            const GoldilocksField* d_shifted_xs,
+            const GoldilocksField* d_l0_values,
+            GoldilocksField* d_perm_out,
+            const GoldilocksField* d_constants_sigmas_leaves, int constants_sigmas_leaf_len,
+            const GoldilocksField* d_zs_partial_products_leaves, int zs_partial_products_leaf_len,
+            const GoldilocksField* d_wires_leaves, int wires_leaf_len,
+            int num_constants, int num_routed_wires, int num_challenges,
+            int quotient_degree_factor, int num_partial_products,
+            const GoldilocksField* d_k_is,
+            const GoldilocksField* d_alphas,
+            const GoldilocksField* d_betas,
+            const GoldilocksField* d_gammas,
+            CudaInvContext* ctx)
+    {
+        auto stream = ctx->stream;
+        int nthreads = 64;
+        int thcnt = 20000;
+        quotient_perm_kernel<<<(thcnt + nthreads - 1) / nthreads, nthreads, 0, stream>>>(
+                degree_log, rate_bits, step, next_step, point_count,
+                d_shifted_xs, d_l0_values, d_perm_out,
+                d_constants_sigmas_leaves, constants_sigmas_leaf_len,
+                d_zs_partial_products_leaves, zs_partial_products_leaf_len,
+                d_wires_leaves, wires_leaf_len,
+                num_constants, num_routed_wires, num_challenges,
+                quotient_degree_factor, num_partial_products,
+                d_k_is, d_alphas, d_betas, d_gammas);
+        cudaStreamSynchronize(stream);
+        if (auto code = cudaGetLastError(); code != cudaSuccess)
+            return RustError{code};
+        return RustError{cudaSuccess};
+    }
+
 }
 
 #endif
