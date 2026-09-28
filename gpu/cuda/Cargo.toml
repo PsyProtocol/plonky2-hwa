@@ -1,0 +1,25 @@
+[package]
+name = "plonky2_cuda"
+version = "0.1.0"
+authors = [ "unknown" ]
+description = "gpu accelerate for plonky2"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[features]
+# Build the native CUDA kernels and enable the rustacuda-backed host runtime.
+# Without this, the crate exposes only the FFI declarations (no device calls), so it builds on
+# machines without a CUDA toolchain.
+default = []
+runtime = ["dep:rustacuda", "dep:rustacuda_core"]
+
+[dependencies]
+rustacuda = { version = "0.1.3", optional = true }
+rustacuda_core = { version = "0.1.2", optional = true }
+plonky2_field = { version = "1.0.0", path = "../../field" }
+
+[build-dependencies.cc]
+version = "^1.0.70"
+
+[build-dependencies.which]
+version = "^4.0"

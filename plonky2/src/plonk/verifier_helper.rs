@@ -6,11 +6,13 @@ use plonky2_util::log2_strict;
 
 use crate::field::extension::Extendable;
 use crate::field::types::Field;
-use crate::fri::FriParams;
 use crate::fri::proof::{FriChallenges, FriInitialTreeProof, FriProof, FriQueryRound};
 use crate::fri::structure::{FriInstanceInfo, FriOpenings};
 use crate::fri::validate_shape::validate_fri_proof_shape;
-use crate::fri::verifier::{PrecomputedReducedOpenings, compute_evaluation, fri_combine_initial, fri_verify_proof_of_work};
+use crate::fri::verifier::{
+    compute_evaluation, fri_combine_initial, fri_verify_proof_of_work, PrecomputedReducedOpenings,
+};
+use crate::fri::FriParams;
 use crate::hash::hash_types::RichField;
 use crate::hash::merkle_proofs::MerkleProof;
 use crate::hash::merkle_tree::MerkleCap;
@@ -23,7 +25,11 @@ use crate::plonk::vanishing_poly::eval_vanishing_poly;
 use crate::plonk::vars::EvaluationVars;
 use crate::util::reverse_bits;
 
-pub fn verify_proof_borrowed<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
+pub fn verify_proof_borrowed<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
     proof_with_pis: &ProofWithPublicInputs<F, C, D>,
     verifier_data: &VerifierOnlyCircuitData<C, D>,
     common_data: &CommonCircuitData<F, D>,
@@ -182,8 +188,6 @@ fn verify_batch_merkle_proof_to_cap<F: RichField, H: Hasher<F>>(
     Ok(())
 }
 
-
-
 fn fri_verify_initial_proof<F: RichField, H: Hasher<F>>(
     x_index: usize,
     proof: &FriInitialTreeProof<F, H>,
@@ -195,8 +199,6 @@ fn fri_verify_initial_proof<F: RichField, H: Hasher<F>>(
 
     Ok(())
 }
-
-
 
 fn fri_verifier_query_round<
     F: RichField + Extendable<D>,
@@ -277,12 +279,7 @@ fn fri_verifier_query_round<
     Ok(())
 }
 
-
-fn verify_fri_proof<
-    F: RichField + Extendable<D>,
-    C: GenericConfig<D, F = F>,
-    const D: usize,
->(
+fn verify_fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     instance: &FriInstanceInfo<F, D>,
     openings: &FriOpenings<F, D>,
     challenges: &FriChallenges<F, D>,

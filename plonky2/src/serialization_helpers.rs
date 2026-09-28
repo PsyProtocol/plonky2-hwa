@@ -9,36 +9,39 @@ mod speedy_impls {
     use crate::plonk::circuit_data::VerifierOnlyCircuitData;
     use crate::plonk::config::{GenericConfig, Hasher};
     use crate::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
-impl<'a, C: Context, F, H, const D: usize> Readable<'a, C> for FriQueryStep<F, H, D>
-where
-    F: RichField + Extendable<D> + Readable<'a, C>,
-    H: Hasher<F>,
-    H::Hash: Readable<'a, C>,
-    F::Extension: Readable<'a, C>, // Ensure the extension field is readable
-{
-    #[inline]
-    fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
-        let evals = reader.read_value()?;
-        let merkle_proof = reader.read_value()?;
-        Ok(FriQueryStep { evals, merkle_proof })
+    impl<'a, C: Context, F, H, const D: usize> Readable<'a, C> for FriQueryStep<F, H, D>
+    where
+        F: RichField + Extendable<D> + Readable<'a, C>,
+        H: Hasher<F>,
+        H::Hash: Readable<'a, C>,
+        F::Extension: Readable<'a, C>, // Ensure the extension field is readable
+    {
+        #[inline]
+        fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
+            let evals = reader.read_value()?;
+            let merkle_proof = reader.read_value()?;
+            Ok(FriQueryStep {
+                evals,
+                merkle_proof,
+            })
+        }
     }
-}
 
-impl<C: Context, F, H, const D: usize> Writable<C> for FriQueryStep<F, H, D>
-where
-    F: RichField + Extendable<D>,
-    H: Hasher<F>,
-    H::Hash: Writable<C>,
-    F::Extension: Writable<C>, // Ensure the extension field is writable
-    F: Writable<C>,
-{
-    #[inline]
-    fn write_to<T: ?Sized + Writer<C>>(&self, writer: &mut T) -> Result<(), C::Error> {
-        writer.write_value(&self.evals)?;
-        writer.write_value(&self.merkle_proof)?;
-        Ok(())
+    impl<C: Context, F, H, const D: usize> Writable<C> for FriQueryStep<F, H, D>
+    where
+        F: RichField + Extendable<D>,
+        H: Hasher<F>,
+        H::Hash: Writable<C>,
+        F::Extension: Writable<C>, // Ensure the extension field is writable
+        F: Writable<C>,
+    {
+        #[inline]
+        fn write_to<T: ?Sized + Writer<C>>(&self, writer: &mut T) -> Result<(), C::Error> {
+            writer.write_value(&self.evals)?;
+            writer.write_value(&self.merkle_proof)?;
+            Ok(())
+        }
     }
-}
     // --- FriQueryRound ---
     impl<'a, C: Context, F: RichField + Extendable<D>, H: Hasher<F>, const D: usize> Readable<'a, C>
         for FriQueryRound<F, H, D>
@@ -58,7 +61,7 @@ where
 
     impl<C: Context, F: RichField + Extendable<D>, H: Hasher<F>, const D: usize> Writable<C>
         for FriQueryRound<F, H, D>
-    where 
+    where
         F::Extension: Writable<C>,
         F: Writable<C>,
         H::Hash: Writable<C>,
@@ -174,7 +177,7 @@ where
             C: GenericConfig<D, F = F>,
             const D: usize,
         > Readable<'a, Ctx> for Proof<F, C, D>
-    where 
+    where
         F: Readable<'a, Ctx>,
         F::Extension: Readable<'a, Ctx>,
         <<C as GenericConfig<D>>::Hasher as Hasher<F>>::Hash: Readable<'a, Ctx>,

@@ -8,6 +8,12 @@ extern crate alloc;
 
 #[cfg(not(feature = "std"))]
 use alloc::sync::Arc;
+use core::num::ParseIntError;
+use core::ops::RangeInclusive;
+use core::str::FromStr;
+
+use anyhow::{Context as _, Result};
+use log::{info, Level, LevelFilter};
 use plonky2::gates::arithmetic_base::ArithmeticGate;
 use plonky2::gates::arithmetic_extension::ArithmeticExtensionGate;
 use plonky2::gates::base_sum::BaseSumGate;
@@ -15,30 +21,26 @@ use plonky2::gates::constant::ConstantGate;
 use plonky2::gates::coset_interpolation::CosetInterpolationGate;
 use plonky2::gates::gate::GateRef;
 use plonky2::gates::multiplication_extension::MulExtensionGate;
+use plonky2::gates::noop::NoopGate;
 use plonky2::gates::poseidon::PoseidonGate;
 use plonky2::gates::poseidon_mds::PoseidonMdsGate;
 use plonky2::gates::random_access::RandomAccessGate;
 use plonky2::gates::reducing::ReducingGate;
 use plonky2::gates::reducing_extension::ReducingExtensionGate;
-use plonky2::plonk::verifier_helper::verify_proof_borrowed;
-use plonky2_field::interpolation::barycentric_weights;
-use plonky2_field::types::Sample;
-use core::num::ParseIntError;
-use core::ops::RangeInclusive;
-use core::str::FromStr;
-
-use anyhow::{Context as _, Result};
-use log::{info, Level, LevelFilter};
-use plonky2::gates::noop::NoopGate;
 use plonky2::hash::hash_types::{HashOut, HashOutTarget, RichField};
 use plonky2::iop::witness::{PartialWitness, WitnessWrite};
 use plonky2::plonk::circuit_builder::CircuitBuilder;
-use plonky2::plonk::circuit_data::{CircuitConfig, CircuitData, CommonCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData};
+use plonky2::plonk::circuit_data::{
+    CircuitConfig, CircuitData, CommonCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData,
+};
 use plonky2::plonk::config::{AlgebraicHasher, GenericConfig, PoseidonGoldilocksConfig};
 use plonky2::plonk::proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget};
 use plonky2::plonk::prover::prove;
+use plonky2::plonk::verifier_helper::verify_proof_borrowed;
 use plonky2::util::timing::TimingTree;
 use plonky2_field::extension::Extendable;
+use plonky2_field::interpolation::barycentric_weights;
+use plonky2_field::types::Sample;
 use plonky2_maybe_rayon::rayon;
 use rand::rngs::OsRng;
 use rand::{RngCore, SeedableRng};
@@ -138,10 +140,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderQEDCommonGates<
             4,
         )));
 
-        let coset_gate = GateRef::new(new_coset_gate_with_max_degree::<F, D>(
-            4,
-            8,
-        ));
+        let coset_gate = GateRef::new(new_coset_gate_with_max_degree::<F, D>(4, 8));
         self.add_gate_to_gate_set(coset_gate);
 
         self.add_gate_to_gate_set(GateRef::new(PoseidonGate::<F, D>::new()));
@@ -159,7 +158,6 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderQEDCommonGates<
             &self.config,
         )));
     }
-
 
     fn add_qed_type_c_common_gates(&mut self) {
         self.add_gate_to_gate_set(GateRef::new(ConstantGate::new(self.config.num_constants)));
@@ -168,10 +166,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderQEDCommonGates<
             4,
         )));
 
-        let coset_gate = GateRef::new(new_coset_gate_with_max_degree::<F, D>(
-            4,
-            8,
-        ));
+        let coset_gate = GateRef::new(new_coset_gate_with_max_degree::<F, D>(4, 8));
         self.add_gate_to_gate_set(coset_gate);
 
         self.add_gate_to_gate_set(GateRef::new(PoseidonGate::<F, D>::new()));
@@ -189,7 +184,6 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderQEDCommonGates<
             &self.config,
         )));
     }
-
 
     fn add_qed_type_d_common_gates(&mut self) {
         self.add_gate_to_gate_set(GateRef::new(ConstantGate::new(self.config.num_constants)));
@@ -199,10 +193,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderQEDCommonGates<
             4,
         )));
 
-        let coset_gate = GateRef::new(new_coset_gate_with_max_degree::<F, D>(
-            4,
-            8,
-        ));
+        let coset_gate = GateRef::new(new_coset_gate_with_max_degree::<F, D>(4, 8));
         self.add_gate_to_gate_set(coset_gate);
 
         self.add_gate_to_gate_set(GateRef::new(PoseidonGate::<F, D>::new()));
@@ -228,10 +219,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderQEDCommonGates<
             4,
         )));
 
-        let coset_gate = GateRef::new(new_coset_gate_with_max_degree::<F, D>(
-            4,
-            8,
-        ));
+        let coset_gate = GateRef::new(new_coset_gate_with_max_degree::<F, D>(4, 8));
         self.add_gate_to_gate_set(coset_gate);
 
         self.add_gate_to_gate_set(GateRef::new(PoseidonGate::<F, D>::new()));
@@ -249,7 +237,6 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderQEDCommonGates<
             &self.config,
         )));
     }
-
 
     fn add_qed_type_f_common_gates(&mut self) {
         self.add_gate_to_gate_set(GateRef::new(ConstantGate::new(self.config.num_constants)));
@@ -258,10 +245,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderQEDCommonGates<
             4,
         )));
 
-        let coset_gate = GateRef::new(new_coset_gate_with_max_degree::<F, D>(
-            4,
-            8,
-        ));
+        let coset_gate = GateRef::new(new_coset_gate_with_max_degree::<F, D>(4, 8));
         self.add_gate_to_gate_set(coset_gate);
 
         self.add_gate_to_gate_set(GateRef::new(PoseidonGate::<F, D>::new()));
@@ -281,26 +265,30 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderQEDCommonGates<
     }
 }
 
-pub struct DummyPsyTypeCCircuit<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> {
+pub struct DummyPsyTypeCCircuit<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+> {
     pub dummy_public_inputs: HashOutTarget,
     pub circuit_data: CircuitData<F, C, D>,
 }
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
-    DummyPsyTypeCCircuit<F, C, D> where C::Hasher: AlgebraicHasher<F>
+    DummyPsyTypeCCircuit<F, C, D>
+where
+    C::Hasher: AlgebraicHasher<F>,
 {
     pub fn new(config: &CircuitConfig) -> Self {
         let mut builder = CircuitBuilder::<F, D>::new(config.clone());
 
         let dummy_public_inputs = builder.add_virtual_hash();
-        let mut res_linear = builder.hash_n_to_hash_no_pad::<C::Hasher>(vec![
-            dummy_public_inputs.elements,
-            dummy_public_inputs.elements
-        ].concat());
+        let mut res_linear = builder.hash_n_to_hash_no_pad::<C::Hasher>(
+            vec![dummy_public_inputs.elements, dummy_public_inputs.elements].concat(),
+        );
         for _ in 0..8000 {
-            res_linear = builder.hash_n_to_hash_no_pad::<C::Hasher>(vec![
-                res_linear.elements,
-                dummy_public_inputs.elements
-            ].concat());
+            res_linear = builder.hash_n_to_hash_no_pad::<C::Hasher>(
+                vec![res_linear.elements, dummy_public_inputs.elements].concat(),
+            );
         }
 
         let zero = builder.zero();
@@ -313,8 +301,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         builder.register_public_inputs(&dummy_public_inputs.elements);
         builder.add_qed_type_c_common_gates();
         pad_circuit_degree(&mut builder, 12);
-
-
 
         let circuit_data = builder.build::<C>();
         println!("common_data: {:?}", circuit_data.common);
@@ -329,13 +315,10 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     pub fn get_common_data(&self) -> &CommonCircuitData<F, D> {
         &self.circuit_data.common
     }
-    pub fn prove(
-        &self,
-        dummy_public_inputs: HashOut<F>,
-    ) -> Result<ProofWithPublicInputs<F, C, D>> {
+    pub fn prove(&self, dummy_public_inputs: HashOut<F>) -> Result<ProofWithPublicInputs<F, C, D>> {
         let mut pw = PartialWitness::new();
         pw.set_hash_target(self.dummy_public_inputs, dummy_public_inputs)?;
-        println!("Starting to prove dummy psy type c...");  
+        println!("Starting to prove dummy psy type c...");
         let mut timing = TimingTree::new("prove dummy psy type c", Level::Debug);
         let proof = prove::<F, C, D>(
             &self.circuit_data.prover_only,
@@ -347,7 +330,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         Ok(proof)
     }
 }
-pub struct DummyPsyTypeCRecursiveVerifierCircuit<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> {
+pub struct DummyPsyTypeCRecursiveVerifierCircuit<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+> {
     pub proof_a_target: ProofWithPublicInputsTarget<D>,
     pub proof_a_verifier_data_target: VerifierCircuitTarget,
 
@@ -358,22 +345,21 @@ pub struct DummyPsyTypeCRecursiveVerifierCircuit<F: RichField + Extendable<D>, C
 }
 
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
-    DummyPsyTypeCRecursiveVerifierCircuit<F, C, D> where C::Hasher: AlgebraicHasher<F>
+    DummyPsyTypeCRecursiveVerifierCircuit<F, C, D>
+where
+    C::Hasher: AlgebraicHasher<F>,
 {
-    pub fn new(config: &CircuitConfig, child_cap_height: usize, child_common_data: &CommonCircuitData<F, D>) -> Self {
+    pub fn new(
+        config: &CircuitConfig,
+        child_cap_height: usize,
+        child_common_data: &CommonCircuitData<F, D>,
+    ) -> Self {
         let mut builder = CircuitBuilder::<F, D>::new(config.clone());
-        let proof_a_target =
-            builder.add_virtual_proof_with_pis(child_common_data);
-        let proof_a_verifier_data_target =
-            builder.add_virtual_verifier_data(child_cap_height);
+        let proof_a_target = builder.add_virtual_proof_with_pis(child_common_data);
+        let proof_a_verifier_data_target = builder.add_virtual_verifier_data(child_cap_height);
 
-        let proof_b_target =
-            builder.add_virtual_proof_with_pis(child_common_data);
-        let proof_b_verifier_data_target =
-            builder.add_virtual_verifier_data(child_cap_height);
-
-
-
+        let proof_b_target = builder.add_virtual_proof_with_pis(child_common_data);
+        let proof_b_verifier_data_target = builder.add_virtual_verifier_data(child_cap_height);
 
         builder.verify_proof::<C>(
             &proof_a_target,
@@ -386,10 +372,13 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             child_common_data,
         );
 
-        let public_inputs_output = builder.hash_n_to_hash_no_pad::<C::Hasher>([
-            proof_a_target.public_inputs.clone(),
-            proof_b_target.public_inputs.clone(),
-        ].concat());
+        let public_inputs_output = builder.hash_n_to_hash_no_pad::<C::Hasher>(
+            [
+                proof_a_target.public_inputs.clone(),
+                proof_b_target.public_inputs.clone(),
+            ]
+            .concat(),
+        );
         builder.register_public_inputs(&public_inputs_output.elements);
 
         builder.add_qed_type_c_common_gates();
@@ -454,12 +443,9 @@ struct Options {
     /// value or a rust style range.
     #[structopt(long, parse(try_from_str = parse_range_usize))]
     threads: Option<RangeInclusive<usize>>,
-
-
 }
 
-
-fn run_psy_bench_recursion() -> Result<()>{
+fn run_psy_bench_recursion() -> Result<()> {
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
     type F = <C as GenericConfig<D>>::F;
@@ -467,26 +453,39 @@ fn run_psy_bench_recursion() -> Result<()>{
     let dummy_inner = DummyPsyTypeCCircuit::<F, C, D>::new(&config);
     let dummy_recursive = DummyPsyTypeCRecursiveVerifierCircuit::<F, C, D>::new(
         &config,
-        dummy_inner.circuit_data.verifier_only.constants_sigmas_cap.height(),
+        dummy_inner
+            .circuit_data
+            .verifier_only
+            .constants_sigmas_cap
+            .height(),
         dummy_inner.get_common_data(),
     );
     let dummy_proof_1 = dummy_inner.prove(HashOut::rand())?;
     let dummy_proof_2 = dummy_inner.prove(HashOut::rand())?;
 
-    let start_time =std::time::Instant::now();
-    let recursive_proof = dummy_recursive
-        .prove(&dummy_proof_1, &dummy_proof_2, dummy_inner.get_verifier_data())?;
+    let start_time = std::time::Instant::now();
+    let recursive_proof = dummy_recursive.prove(
+        &dummy_proof_1,
+        &dummy_proof_2,
+        dummy_inner.get_verifier_data(),
+    )?;
 
     println!("Recursive proof time: {:?}", start_time.elapsed());
     dummy_inner.circuit_data.verify(dummy_proof_1.clone())?;
     dummy_inner.circuit_data.verify(dummy_proof_2.clone())?;
-    dummy_recursive.circuit_data.verify(recursive_proof.clone())?;
+    dummy_recursive
+        .circuit_data
+        .verify(recursive_proof.clone())?;
 
     let p = recursive_proof.clone();
     let mut ctr = 0;
     let start = std::time::Instant::now();
     for i in 0..2000 {
-        let res = verify_proof_borrowed(&p, &dummy_recursive.circuit_data.verifier_only, &dummy_recursive.circuit_data.common);
+        let res = verify_proof_borrowed(
+            &p,
+            &dummy_recursive.circuit_data.verifier_only,
+            &dummy_recursive.circuit_data.common,
+        );
         if res.is_err() {
             println!("Failed to verify at iteration {}", i);
             break;
@@ -496,7 +495,12 @@ fn run_psy_bench_recursion() -> Result<()>{
     println!("Verified {} times successfully", ctr);
     let duration = start.elapsed();
     let avg_time = duration.as_secs_f64() / ctr as f64;
-    println!("verying {} proofs took {:?}, avg time per proof: {:.6} ms", ctr, duration, avg_time * 1000.0);
+    println!(
+        "verying {} proofs took {:?}, avg time per proof: {:.6} ms",
+        ctr,
+        duration,
+        avg_time * 1000.0
+    );
     let clones: [_; 100] = core::array::from_fn(|_| recursive_proof.clone());
     let start = std::time::Instant::now();
     for p in clones {
@@ -505,7 +509,12 @@ fn run_psy_bench_recursion() -> Result<()>{
     println!("Verified [cd] {} times successfully", 100);
     let duration = start.elapsed();
     let avg_time = duration.as_secs_f64() / 100 as f64;
-    println!("verying [cd] {} proofs took {:?}, avg time per proof: {:.6} ms", 100, duration, avg_time * 1000.0);
+    println!(
+        "verying [cd] {} proofs took {:?}, avg time per proof: {:.6} ms",
+        100,
+        duration,
+        avg_time * 1000.0
+    );
 
     println!("Psy benchmark recursion proof verified successfully");
     Ok(())
@@ -535,25 +544,24 @@ fn main() -> Result<()> {
     let num_cpus = num_cpus::get();
     let threads = options.threads.unwrap_or(num_cpus..=num_cpus);
 
+    // Since the `size` is most likely to be an unbounded range we make that the outer iterator.
+    for threads in threads.clone() {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .context("Failed to build thread pool.")?
+            .install(|| {
+                info!(
+                    "Using {} compute threads on {} cores",
+                    rayon::current_num_threads(),
+                    num_cpus
+                );
+                // Run the benchmark. `options.lookup_type` determines which benchmark to run.
+                //benchmark_function(&config, log2_inner_size, options.lookup_type)
 
-        // Since the `size` is most likely to be an unbounded range we make that the outer iterator.
-        for threads in threads.clone() {
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .context("Failed to build thread pool.")?
-                .install(|| {
-                    info!(
-                        "Using {} compute threads on {} cores",
-                        rayon::current_num_threads(),
-                        num_cpus
-                    );
-                    // Run the benchmark. `options.lookup_type` determines which benchmark to run.
-                    //benchmark_function(&config, log2_inner_size, options.lookup_type)
-
-                    run_psy_bench_recursion()
-                })?;
-        }
+                run_psy_bench_recursion()
+            })?;
+    }
 
     Ok(())
 }

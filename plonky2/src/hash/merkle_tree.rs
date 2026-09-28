@@ -15,8 +15,14 @@ use crate::util::log2_strict;
 /// It can be used in place of the root to verify Merkle paths, which are `h` elements shorter.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(bound = "")]
-#[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
-#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
+#[cfg_attr(
+    feature = "serialize_rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
+#[cfg_attr(
+    feature = "serialize_speedy",
+    derive(speedy::Readable, speedy::Writable)
+)]
 #[repr(transparent)]
 // TODO: Change H to GenericHashOut<F>, since this only cares about the hash, not the hasher.
 pub struct MerkleCap<F: RichField, H: Hasher<F>>(pub Vec<H::Hash>);
@@ -46,7 +52,10 @@ impl<F: RichField, H: Hasher<F>> MerkleCap<F, H> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
+#[cfg_attr(
+    feature = "serialize_speedy",
+    derive(speedy::Readable, speedy::Writable)
+)]
 #[repr(C)]
 pub struct MerkleTree<F: RichField, H: Hasher<F>> {
     /// The data in the leaves of the Merkle tree.
@@ -235,8 +244,12 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
     /// Create a Merkle proof from a leaf index.
     pub fn prove(&self, leaf_index: usize) -> MerkleProof<F, H> {
         let cap_height = log2_strict(self.cap.len());
-        let siblings =
-            merkle_tree_prove::<F, H>(leaf_index, self.leaves.len(), cap_height, &self.digests);
+        let leaves_len = if self.leaves.is_empty() {
+            self.digests.len() / 2 + self.cap.len()
+        } else {
+            self.leaves.len()
+        };
+        let siblings = merkle_tree_prove::<F, H>(leaf_index, leaves_len, cap_height, &self.digests);
 
         MerkleProof { siblings }
     }

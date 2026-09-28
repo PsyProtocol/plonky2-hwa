@@ -17,7 +17,10 @@ use crate::plonk::config::{AlgebraicHasher, GenericHashOut, Hasher};
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(bound = "")]
-#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
+#[cfg_attr(
+    feature = "serialize_speedy",
+    derive(speedy::Readable, speedy::Writable)
+)]
 #[repr(transparent)]
 pub struct MerkleProof<F: RichField, H: Hasher<F>> {
     /// The Merkle digest of each sibling subtree, staying from the bottommost layer.

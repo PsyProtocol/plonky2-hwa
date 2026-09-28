@@ -740,9 +740,12 @@ pub trait Read {
         Ok(PolynomialBatch {
             polynomials,
             merkle_tree,
+            lde_values: None,
             degree_log,
             rate_bits,
             blinding,
+            #[cfg(feature = "cuda")]
+            cuda_leaves: None,
         })
     }
 

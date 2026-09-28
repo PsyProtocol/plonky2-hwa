@@ -21,25 +21,43 @@ pub const NUM_HASH_OUT_ELTS: usize = 4;
 
 /// Represents a ~256 bit hash output.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
-#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
-#[cfg_attr(feature = "serialize_bytemuck", derive(bytemuck::Pod, bytemuck::Zeroable))]
+#[cfg_attr(
+    feature = "serialize_rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
+#[cfg_attr(
+    feature = "serialize_speedy",
+    derive(speedy::Readable, speedy::Writable)
+)]
+#[cfg_attr(
+    feature = "serialize_bytemuck",
+    derive(bytemuck::Pod, bytemuck::Zeroable)
+)]
 #[serde(bound = "")]
 #[repr(transparent)]
 pub struct HashOut<F: Field> {
     pub elements: [F; NUM_HASH_OUT_ELTS],
 }
 
-
 #[cfg(feature = "ts-rs")]
 impl<F: Field> ts_rs::TS for HashOut<F> {
     type WithoutGenerics = HashOut<GoldilocksField>;
 
-    fn name() -> String { "HashOut".to_string() }
-    fn inline() -> String { "{ elements: [bigint, bigint, bigint, bigint] }".to_string() }
-    fn inline_flattened() -> String { "elements: [bigint, bigint, bigint, bigint]".to_string() }
-    fn decl() -> String { "export type HashOut = { elements: [bigint, bigint, bigint, bigint] };".to_string() }
-    fn decl_concrete() -> String { Self::decl() }
+    fn name() -> String {
+        "HashOut".to_string()
+    }
+    fn inline() -> String {
+        "{ elements: [bigint, bigint, bigint, bigint] }".to_string()
+    }
+    fn inline_flattened() -> String {
+        "elements: [bigint, bigint, bigint, bigint]".to_string()
+    }
+    fn decl() -> String {
+        "export type HashOut = { elements: [bigint, bigint, bigint, bigint] };".to_string()
+    }
+    fn decl_concrete() -> String {
+        Self::decl()
+    }
 }
 
 impl<F: Field> HashOut<F> {

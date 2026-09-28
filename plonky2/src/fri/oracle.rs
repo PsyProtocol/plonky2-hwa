@@ -1,39 +1,76 @@
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec::Vec};
+use core::ops::{Bound, RangeBounds};
 
 use itertools::Itertools;
 use plonky2_field::types::Field;
-use plonky2_maybe_rayon::*;
 
 use crate::field::extension::Extendable;
 use crate::field::fft::FftRootTable;
 use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::proof::FriProof;
-use crate::fri::prover::fri_proof;
+use crate::fri::prover::{fri_proof, FriInitialTree};
 use crate::fri::structure::{FriBatchInfo, FriInstanceInfo};
 use crate::fri::FriParams;
 use crate::hash::hash_types::RichField;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::GenericConfig;
+use crate::plonk::config::{GenericConfig, ProverCompute};
 use crate::timed;
 use crate::util::reducing::ReducingFactor;
-use crate::util::timing::TimingTree;
 use crate::util::reverse_bits;
-use crate::plonk::config::ProverCompute;
+use crate::util::timing::TimingTree;
 /// Four (~64 bit) field elements gives ~128 bit security.
 pub const SALT_SIZE: usize = 4;
 
+#[derive(Debug)]
+pub enum LdeValues<'a, F> {
+    Borrowed(&'a [F]),
+    Owned(Vec<F>),
+}
+
+impl<'a, F> core::ops::Deref for LdeValues<'a, F> {
+    type Target = [F];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(values) => values,
+            Self::Owned(values) => values,
+        }
+    }
+}
+
 /// Represents a FRI oracle, i.e. a batch of polynomials which have been Merklized.
-#[derive(Eq, PartialEq, Debug)]
+#[derive(Debug)]
 pub struct PolynomialBatch<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
 {
     pub polynomials: Vec<PolynomialCoeffs<F>>,
     pub merkle_tree: MerkleTree<F, C::Hasher>,
+    pub lde_values: Option<Vec<F>>,
     pub degree_log: usize,
     pub rate_bits: usize,
     pub blinding: bool,
+    #[cfg(feature = "cuda")]
+    pub cuda_leaves: Option<plonky2_cuda::CudaLeafHandle>,
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> PartialEq
+    for PolynomialBatch<F, C, D>
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.polynomials == other.polynomials
+            && self.merkle_tree == other.merkle_tree
+            && self.lde_values == other.lde_values
+            && self.degree_log == other.degree_log
+            && self.rate_bits == other.rate_bits
+            && self.blinding == other.blinding
+    }
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> Eq
+    for PolynomialBatch<F, C, D>
+{
 }
 
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> Default
@@ -43,9 +80,12 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> D
         PolynomialBatch {
             polynomials: Vec::new(),
             merkle_tree: MerkleTree::default(),
+            lde_values: None,
             degree_log: 0,
             rate_bits: 0,
             blinding: false,
+            #[cfg(feature = "cuda")]
+            cuda_leaves: None,
         }
     }
 }
@@ -107,11 +147,208 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     }
 
     /// Fetches LDE values at the `index * step`th point.
-    pub fn get_lde_values(&self, index: usize, step: usize) -> &[F] {
+    pub fn get_lde_values(&self, index: usize, step: usize) -> LdeValues<'_, F> {
         let index = index * step;
-        let index = reverse_bits(index, self.degree_log + self.rate_bits);
-        let slice = &self.merkle_tree.leaves[index];
-        &slice[..slice.len() - if self.blinding { SALT_SIZE } else { 0 }]
+        if let Some(lde_values) = &self.lde_values {
+            let leaf_count = 1 << (self.degree_log + self.rate_bits);
+            let leaf_length = lde_values.len() / leaf_count;
+            let value_length = leaf_length - if self.blinding { SALT_SIZE } else { 0 };
+            LdeValues::Owned(
+                (0..value_length)
+                    .map(|poly_index| lde_values[poly_index * leaf_count + index])
+                    .collect(),
+            )
+        } else {
+            let index = reverse_bits(index, self.degree_log + self.rate_bits);
+            let slice = &self.merkle_tree.leaves[index];
+            LdeValues::Borrowed(&slice[..slice.len() - if self.blinding { SALT_SIZE } else { 0 }])
+        }
+    }
+
+    pub fn has_poly_major_lde_values(&self) -> bool {
+        self.lde_values.is_some()
+    }
+
+    pub fn get_lde_values_range(
+        &self,
+        index: usize,
+        step: usize,
+        range: impl RangeBounds<usize>,
+    ) -> LdeValues<'_, F> {
+        let index = index * step;
+        let leaf_length = if let Some(lde_values) = &self.lde_values {
+            let leaf_count = 1 << (self.degree_log + self.rate_bits);
+            lde_values.len() / leaf_count
+        } else {
+            let leaf_index = reverse_bits(index, self.degree_log + self.rate_bits);
+            self.merkle_tree.leaves[leaf_index].len()
+        };
+        let (start, end) = normalize_range(range, leaf_length, self.blinding);
+        if let Some(lde_values) = &self.lde_values {
+            let leaf_count = 1 << (self.degree_log + self.rate_bits);
+            LdeValues::Owned(
+                (start..end)
+                    .map(|poly_index| lde_values[poly_index * leaf_count + index])
+                    .collect(),
+            )
+        } else {
+            let index = reverse_bits(index, self.degree_log + self.rate_bits);
+            let slice = &self.merkle_tree.leaves[index];
+            LdeValues::Borrowed(&slice[start..end])
+        }
+    }
+
+    pub fn for_each_lde_values_range(
+        &self,
+        index: usize,
+        step: usize,
+        range: impl RangeBounds<usize>,
+        mut f: impl FnMut(usize, F),
+    ) {
+        let index = index * step;
+        let leaf_length = if let Some(lde_values) = &self.lde_values {
+            let leaf_count = 1 << (self.degree_log + self.rate_bits);
+            lde_values.len() / leaf_count
+        } else {
+            let leaf_index = reverse_bits(index, self.degree_log + self.rate_bits);
+            self.merkle_tree.leaves[leaf_index].len()
+        };
+        let (start, end) = normalize_range(range, leaf_length, self.blinding);
+        if let Some(lde_values) = &self.lde_values {
+            let leaf_count = 1 << (self.degree_log + self.rate_bits);
+            for (j, poly_index) in (start..end).enumerate() {
+                f(j, lde_values[poly_index * leaf_count + index]);
+            }
+        } else {
+            let index = reverse_bits(index, self.degree_log + self.rate_bits);
+            let slice = &self.merkle_tree.leaves[index];
+            for (j, &value) in slice[start..end].iter().enumerate() {
+                f(j, value);
+            }
+        }
+    }
+
+    /// Returns LDE values for `indices` over `range`, grouped by evaluation point.
+    ///
+    /// The returned outer vector follows `indices` order. Each inner vector contains the selected
+    /// polynomial values in `range` order for that evaluation point.
+    pub fn get_lde_values_batch(
+        &self,
+        indices: &[usize],
+        step: usize,
+        range: impl RangeBounds<usize>,
+    ) -> Vec<Vec<F>> {
+        let leaf_length = if let Some(lde_values) = &self.lde_values {
+            let leaf_count = 1 << (self.degree_log + self.rate_bits);
+            lde_values.len() / leaf_count
+        } else {
+            self.merkle_tree.leaves[0].len()
+        };
+        let (start, end) = normalize_range(range, leaf_length, self.blinding);
+        let value_len = end - start;
+        let mut values = vec![vec![F::ZERO; value_len]; indices.len()];
+
+        if let Some(lde_values) = &self.lde_values {
+            let leaf_count = 1 << (self.degree_log + self.rate_bits);
+            for (j, poly_index) in (start..end).enumerate() {
+                let poly_values =
+                    &lde_values[poly_index * leaf_count..(poly_index + 1) * leaf_count];
+                for (k, &index) in indices.iter().enumerate() {
+                    values[k][j] = poly_values[index * step];
+                }
+            }
+        } else {
+            for (k, &index) in indices.iter().enumerate() {
+                let index = reverse_bits(index * step, self.degree_log + self.rate_bits);
+                values[k].copy_from_slice(&self.merkle_tree.leaves[index][start..end]);
+            }
+        }
+
+        values
+    }
+
+    /// Fills `dst` with LDE values for `indices` over `range` in polynomial-major batch order.
+    ///
+    /// Let `n = indices.len()`. The value for the `j`-th polynomial in `range` and the `k`-th
+    /// batch element is written to `dst[j * n + k]`.
+    pub fn fill_lde_values_batch(
+        &self,
+        indices: &[usize],
+        step: usize,
+        range: impl RangeBounds<usize>,
+        dst: &mut [F],
+    ) {
+        let leaf_length = if let Some(lde_values) = &self.lde_values {
+            let leaf_count = 1 << (self.degree_log + self.rate_bits);
+            lde_values.len() / leaf_count
+        } else {
+            self.merkle_tree.leaves[0].len()
+        };
+        let (start, end) = normalize_range(range, leaf_length, self.blinding);
+        let n = indices.len();
+        assert_eq!(dst.len(), n * (end - start));
+
+        if let Some(lde_values) = &self.lde_values {
+            let leaf_count = 1 << (self.degree_log + self.rate_bits);
+            for (j, poly_index) in (start..end).enumerate() {
+                let poly_values =
+                    &lde_values[poly_index * leaf_count..(poly_index + 1) * leaf_count];
+                let dst_chunk = &mut dst[j * n..(j + 1) * n];
+                for (k, &index) in indices.iter().enumerate() {
+                    dst_chunk[k] = poly_values[index * step];
+                }
+            }
+        } else {
+            for (k, &index) in indices.iter().enumerate() {
+                let index = reverse_bits(index * step, self.degree_log + self.rate_bits);
+                let leaf = &self.merkle_tree.leaves[index][start..end];
+                for (j, &value) in leaf.iter().enumerate() {
+                    dst[j * n + k] = value;
+                }
+            }
+        }
+    }
+
+    pub fn get_leaf_values(&self, index: usize) -> Vec<F> {
+        if let Some(lde_values) = &self.lde_values {
+            let leaf_count = 1 << (self.degree_log + self.rate_bits);
+            let leaf_length = lde_values.len() / leaf_count;
+            let point_index = reverse_bits(index, self.degree_log + self.rate_bits);
+            (0..leaf_length)
+                .map(|poly_index| lde_values[poly_index * leaf_count + point_index])
+                .collect()
+        } else {
+            #[cfg(feature = "cuda")]
+            if let Some(leaf) = self.cuda_leaf_values(index) {
+                return leaf;
+            }
+            self.merkle_tree.get(index).to_vec()
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_leaf_values(&self, index: usize) -> Option<Vec<F>> {
+        let cuda_leaves = self.cuda_leaves.as_ref()?;
+        if !self.merkle_tree.leaves.is_empty()
+            && std::env::var_os("CUDA_FRI_LEAVES_FROM_DEVICE").is_none()
+        {
+            return None;
+        }
+
+        let leaf_count = 1 << (self.degree_log + self.rate_bits);
+        let leaf_len = cuda_leaves.len() / leaf_count;
+        if leaf_len == 0 || cuda_leaves.len() != leaf_count * leaf_len {
+            return None;
+        }
+
+        Some(
+            cuda_leaves
+                .copy_leaf_to_vec(index, leaf_len)
+                .unwrap_or_else(|e| panic!("CUDA FRI leaf copy failed: {e}"))
+                .into_iter()
+                .map(F::from_canonical_u64)
+                .collect(),
+        )
     }
 
     /// Like `get_lde_values`, but fetches LDE values from a batch of `P::WIDTH` points, and returns
@@ -176,11 +413,13 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             lde_final_poly.coset_fft(F::coset_shift().into())
         );
 
+        let initial_oracles = oracles
+            .iter()
+            .map(|&c| c as &dyn FriInitialTree<F, C::Hasher>)
+            .collect::<Vec<_>>();
+
         let fri_proof = fri_proof::<F, C, D>(
-            &oracles
-                .par_iter()
-                .map(|c| &c.merkle_tree)
-                .collect::<Vec<_>>(),
+            &initial_oracles,
             lde_final_poly,
             lde_final_values,
             challenger,
@@ -191,5 +430,35 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         );
 
         fri_proof
+    }
+}
+
+fn normalize_range(
+    range: impl RangeBounds<usize>,
+    leaf_length: usize,
+    blinding: bool,
+) -> (usize, usize) {
+    let start = match range.start_bound() {
+        Bound::Included(&start) => start,
+        Bound::Excluded(&start) => start + 1,
+        Bound::Unbounded => 0,
+    };
+    let end = match range.end_bound() {
+        Bound::Included(&end) => end + 1,
+        Bound::Excluded(&end) => end,
+        Bound::Unbounded => leaf_length - if blinding { SALT_SIZE } else { 0 },
+    };
+    (start, end)
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
+    FriInitialTree<F, C::Hasher> for PolynomialBatch<F, C, D>
+{
+    fn leaf(&self, index: usize) -> Vec<F> {
+        self.get_leaf_values(index)
+    }
+
+    fn prove(&self, index: usize) -> crate::hash::merkle_proofs::MerkleProof<F, C::Hasher> {
+        self.merkle_tree.prove(index)
     }
 }
