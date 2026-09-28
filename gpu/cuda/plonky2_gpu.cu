@@ -464,6 +464,14 @@ extern "C" {
         nthreads = 32;
         init_lde_kernel<<<(thcnt+nthreads-1)/nthreads, nthreads, 0, stream>>>(d_ext_values_flatten, poly_num, values_num_per_poly, rate_bits);
 
+        if (salt_size > 0) {
+            CUDA_ASSERT(cudaMemsetAsync(
+                    d_ext_values_flatten + (uint64_t)values_num_per_extpoly * poly_num,
+                    0,
+                    (uint64_t)values_num_per_extpoly * salt_size * sizeof(GoldilocksField),
+                    stream));
+        }
+
         thcnt = values_num_per_poly*poly_num;
         nthreads = 32;
         mul_shift_kernel<<<(thcnt+nthreads-1)/nthreads, nthreads, 0, stream>>>(d_ext_values_flatten, poly_num, values_num_per_poly, rate_bits, d_shift_powers);
@@ -492,7 +500,9 @@ extern "C" {
         nthreads = 32;
         transpose_kernel<<<(thcnt+nthreads-1)/nthreads, nthreads, 0, stream>>>(d_ext_values_flatten, d_ext_values_flatten - pad_extvalues_len, ext_poly_num, values_num_per_extpoly);
 
-        cudaStreamSynchronize(stream);
+        CUDA_ASSERT(cudaStreamSynchronize(stream));
+        if (auto code = cudaGetLastError(); code != cudaSuccess)
+            return RustError{code};
         return RustError{cudaSuccess};
     }
 

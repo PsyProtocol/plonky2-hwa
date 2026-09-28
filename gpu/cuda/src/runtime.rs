@@ -18,7 +18,8 @@
 //!   backend performs (`get_node_hash_index_in_digests`).
 
 use std::ffi::c_void;
-use std::sync::{Mutex, OnceLock};
+use std::fmt;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rustacuda::context::{Context, ContextFlags, CurrentContext};
 use rustacuda::device::Device;
@@ -65,6 +66,113 @@ pub struct CudaRuntime {
     inner: Mutex<Inner>,
 }
 
+struct LeafBuffer {
+    buffer: DeviceBuffer<u64>,
+    len: usize,
+}
+
+// SAFETY: the device allocation is process-global, and all access to it is serialized by the
+// enclosing Mutex. CUDA context switching is handled before issuing copies or kernels.
+unsafe impl Send for LeafBuffer {}
+
+impl Drop for LeafBuffer {
+    fn drop(&mut self) {
+        if let Some(runtime) = runtime_slot().as_ref() {
+            if let Ok(guard) = runtime.inner.lock() {
+                let _ = CurrentContext::set_current(&guard.context);
+            }
+        }
+    }
+}
+
+/// RAII handle for leaf-major commitment values resident on the CUDA device.
+#[derive(Clone)]
+pub struct CudaLeafHandle {
+    inner: Arc<Mutex<LeafBuffer>>,
+}
+
+impl CudaLeafHandle {
+    fn from_buffer(buffer: DeviceBuffer<u64>, len: usize) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(LeafBuffer { buffer, len })),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns the device pointer for low-level kernel arguments. The allocation is kept alive by
+    /// the handle; callers must still ensure no kernel outlives the handle itself.
+    pub fn device_ptr(&self) -> *const u64 {
+        self.inner.lock().unwrap().buffer.as_device_ptr().as_raw()
+    }
+
+    pub fn copy_to_vec(&self) -> Result<Vec<u64>, String> {
+        if let Some(runtime) = runtime_slot().as_ref() {
+            let inner = runtime.inner.lock().unwrap();
+            CurrentContext::set_current(&inner.context).map_err(|e| format!("{e:?}"))?;
+        }
+        let guard = self.inner.lock().unwrap();
+        let mut out = vec![0u64; guard.len];
+        guard
+            .buffer
+            .copy_to(&mut out[..])
+            .map_err(|e| format!("{e:?}"))?;
+        Ok(out)
+    }
+
+    pub fn copy_leaf_to_vec(&self, leaf_index: usize, leaf_len: usize) -> Result<Vec<u64>, String> {
+        if let Some(runtime) = runtime_slot().as_ref() {
+            let inner = runtime.inner.lock().unwrap();
+            CurrentContext::set_current(&inner.context).map_err(|e| format!("{e:?}"))?;
+        }
+        let offset = leaf_index
+            .checked_mul(leaf_len)
+            .ok_or_else(|| "CUDA leaf offset overflow".to_string())?;
+        let end = offset
+            .checked_add(leaf_len)
+            .ok_or_else(|| "CUDA leaf end overflow".to_string())?;
+        let guard = self.inner.lock().unwrap();
+        if end > guard.len {
+            return Err(format!(
+                "CUDA leaf range out of bounds: leaf_index={leaf_index}, leaf_len={leaf_len}, len={}",
+                guard.len
+            ));
+        }
+        let mut out = vec![0u64; leaf_len];
+        guard
+            .buffer
+            .split_at(offset)
+            .1
+            .split_at(leaf_len)
+            .0
+            .copy_to(&mut out[..])
+            .map_err(|e| format!("{e:?}"))?;
+        Ok(out)
+    }
+}
+
+impl fmt::Debug for CudaLeafHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CudaLeafHandle")
+            .field("len", &self.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for CudaLeafHandle {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner) && self.len() == other.len()
+    }
+}
+
+impl Eq for CudaLeafHandle {}
+
 /// Output of [`CudaRuntime::commit_from_coeffs`].
 pub struct CommitResult {
     /// `num_digests_and_caps` hashes, each 4 `u64` limbs, in the kernel's native ordering.
@@ -72,6 +180,8 @@ pub struct CommitResult {
     /// Leaf-major LDE values, `leaf_count` leaves of `ext_poly_num` limbs each, in the same leaf
     /// order as the CPU Merkle tree. Reconstruct `MerkleTree::leaves` by chunking on `ext_poly_num`.
     pub leaves_flat: Vec<u64>,
+    /// Device-resident copy of `leaves_flat`, kept alive for later CUDA quotient/FRI stages.
+    pub leaves_device: CudaLeafHandle,
 }
 
 const SALT_SIZE: usize = 4;
@@ -111,6 +221,14 @@ impl CudaRuntime {
         runtime_slot()
             .as_ref()
             .expect("CudaRuntime::get called but no CUDA device is available")
+    }
+
+    /// Uploads an already-computed leaf-major buffer and returns a resident handle.
+    pub fn leaf_handle_from_host(&self, leaves_flat: &[u64]) -> Result<CudaLeafHandle, String> {
+        let guard = self.inner.lock().unwrap();
+        CurrentContext::set_current(&guard.context).map_err(|e| format!("{e:?}"))?;
+        let buffer = DeviceBuffer::from_slice(leaves_flat).map_err(|e| format!("{e:?}"))?;
+        Ok(CudaLeafHandle::from_buffer(buffer, leaves_flat.len()))
     }
 
     /// Runs LDE + Poseidon-Merkle on the GPU for poly-major coefficients.
@@ -214,8 +332,19 @@ impl CudaRuntime {
             return Err(String::from(err));
         }
 
-        // Read back the leaf-major leaves ([0, ext)) and the digests/caps (at `digests_offset`).
+        // Retain a device-resident copy of the leaf-major leaves ([0, ext)) before the scratch
+        // buffer can be reused by another commitment.
         let cache = inner.cache.as_ref().unwrap();
+        let mut leaves_device = unsafe { DeviceBuffer::uninitialized(ext_values_flatten_len) }
+            .map_err(|e| format!("{e:?}"))?;
+        cache
+            .split_at(ext_values_flatten_len)
+            .0
+            .copy_to(&mut leaves_device)
+            .map_err(|e| format!("{e:?}"))?;
+        // Read back the leaf-major leaves for the current host FRI path, and the digests/caps
+        // (at `digests_offset`). Keep the allocation as a DeviceBuffer until all fallible
+        // readbacks finish; dropping a leaf handle would try to lock `self.inner` again.
         let mut leaves_flat = vec![0u64; ext_values_flatten_len];
         cache
             .split_at(ext_values_flatten_len)
@@ -235,10 +364,12 @@ impl CudaRuntime {
             .chunks_exact(4)
             .map(|c| [c[0], c[1], c[2], c[3]])
             .collect();
+        let leaves_device = CudaLeafHandle::from_buffer(leaves_device, ext_values_flatten_len);
 
         Ok(CommitResult {
             digests_and_caps,
             leaves_flat,
+            leaves_device,
         })
     }
 
@@ -327,7 +458,108 @@ impl CudaRuntime {
         }
 
         let mut perm = vec![0u64; point_count * num_challenges];
-        d_perm.copy_to(&mut perm[..]).map_err(|e| format!("{e:?}"))?;
+        d_perm
+            .copy_to(&mut perm[..])
+            .map_err(|e| format!("{e:?}"))?;
+        Ok(perm)
+    }
+
+    /// Generic permutation-argument quotient contribution using resident device leaves. Only the
+    /// small auxiliary arrays are uploaded; the three large commitment leaf sets are read in place.
+    #[allow(clippy::too_many_arguments)]
+    pub fn quotient_perm_resident(
+        &self,
+        degree_log: usize,
+        rate_bits: usize,
+        step: usize,
+        next_step: usize,
+        shifted_xs: &[u64],
+        l0_values: &[u64],
+        constants_sigmas_leaves: &CudaLeafHandle,
+        constants_sigmas_leaf_len: usize,
+        zs_partial_products_leaves: &CudaLeafHandle,
+        zs_partial_products_leaf_len: usize,
+        wires_leaves: &CudaLeafHandle,
+        wires_leaf_len: usize,
+        num_constants: usize,
+        num_routed_wires: usize,
+        num_challenges: usize,
+        quotient_degree_factor: usize,
+        num_partial_products: usize,
+        k_is: &[u64],
+        alphas: &[u64],
+        betas: &[u64],
+        gammas: &[u64],
+    ) -> Result<Vec<u64>, String> {
+        let point_count = shifted_xs.len();
+        assert_eq!(l0_values.len(), point_count);
+
+        let leaf_count = 1usize << (degree_log + rate_bits);
+        if constants_sigmas_leaves.len() != leaf_count * constants_sigmas_leaf_len {
+            return Err("constants/sigmas CUDA leaf handle has unexpected length".to_string());
+        }
+        if zs_partial_products_leaves.len() != leaf_count * zs_partial_products_leaf_len {
+            return Err("Zs/partial-products CUDA leaf handle has unexpected length".to_string());
+        }
+        if wires_leaves.len() != leaf_count * wires_leaf_len {
+            return Err("wires CUDA leaf handle has unexpected length".to_string());
+        }
+
+        let mut guard = self.inner.lock().unwrap();
+        let inner = &mut *guard;
+        CurrentContext::set_current(&inner.context).map_err(|e| format!("{e:?}"))?;
+
+        let mut cs_guard = constants_sigmas_leaves.inner.lock().unwrap();
+        let mut zs_guard = zs_partial_products_leaves.inner.lock().unwrap();
+        let mut wires_guard = wires_leaves.inner.lock().unwrap();
+
+        let mk = |s: &[u64]| DeviceBuffer::from_slice(s).map_err(|e| format!("{e:?}"));
+        let mut d_xs = mk(shifted_xs)?;
+        let mut d_l0 = mk(l0_values)?;
+        let mut d_kis = mk(k_is)?;
+        let mut d_alphas = mk(alphas)?;
+        let mut d_betas = mk(betas)?;
+        let mut d_gammas = mk(gammas)?;
+        let mut d_perm: DeviceBuffer<u64> =
+            unsafe { DeviceBuffer::uninitialized(point_count * num_challenges) }
+                .map_err(|e| format!("{e:?}"))?;
+
+        let err = unsafe {
+            crate::quotient_perm(
+                degree_log as i32,
+                rate_bits as i32,
+                step as i32,
+                next_step as i32,
+                point_count as i32,
+                d_xs.as_device_ptr().as_raw(),
+                d_l0.as_device_ptr().as_raw(),
+                d_perm.as_device_ptr().as_raw_mut(),
+                cs_guard.buffer.as_device_ptr().as_raw(),
+                constants_sigmas_leaf_len as i32,
+                zs_guard.buffer.as_device_ptr().as_raw(),
+                zs_partial_products_leaf_len as i32,
+                wires_guard.buffer.as_device_ptr().as_raw(),
+                wires_leaf_len as i32,
+                num_constants as i32,
+                num_routed_wires as i32,
+                num_challenges as i32,
+                quotient_degree_factor as i32,
+                num_partial_products as i32,
+                d_kis.as_device_ptr().as_raw(),
+                d_alphas.as_device_ptr().as_raw(),
+                d_betas.as_device_ptr().as_raw(),
+                d_gammas.as_device_ptr().as_raw(),
+                &mut inner.inner_ctx as *mut CudaInnerContext as *mut c_void,
+            )
+        };
+        if err.code != 0 {
+            return Err(String::from(err));
+        }
+
+        let mut perm = vec![0u64; point_count * num_challenges];
+        d_perm
+            .copy_to(&mut perm[..])
+            .map_err(|e| format!("{e:?}"))?;
         Ok(perm)
     }
 }

@@ -744,6 +744,8 @@ pub trait Read {
             degree_log,
             rate_bits,
             blinding,
+            #[cfg(feature = "cuda")]
+            cuda_leaves: None,
         })
     }
 

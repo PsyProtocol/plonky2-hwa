@@ -42,7 +42,7 @@ impl<'a, F> core::ops::Deref for LdeValues<'a, F> {
 }
 
 /// Represents a FRI oracle, i.e. a batch of polynomials which have been Merklized.
-#[derive(Eq, PartialEq, Debug)]
+#[derive(Debug)]
 pub struct PolynomialBatch<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
 {
     pub polynomials: Vec<PolynomialCoeffs<F>>,
@@ -51,6 +51,26 @@ pub struct PolynomialBatch<F: RichField + Extendable<D>, C: GenericConfig<D, F =
     pub degree_log: usize,
     pub rate_bits: usize,
     pub blinding: bool,
+    #[cfg(feature = "cuda")]
+    pub cuda_leaves: Option<plonky2_cuda::CudaLeafHandle>,
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> PartialEq
+    for PolynomialBatch<F, C, D>
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.polynomials == other.polynomials
+            && self.merkle_tree == other.merkle_tree
+            && self.lde_values == other.lde_values
+            && self.degree_log == other.degree_log
+            && self.rate_bits == other.rate_bits
+            && self.blinding == other.blinding
+    }
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> Eq
+    for PolynomialBatch<F, C, D>
+{
 }
 
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> Default
@@ -64,6 +84,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> D
             degree_log: 0,
             rate_bits: 0,
             blinding: false,
+            #[cfg(feature = "cuda")]
+            cuda_leaves: None,
         }
     }
 }
@@ -296,8 +318,37 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 .map(|poly_index| lde_values[poly_index * leaf_count + point_index])
                 .collect()
         } else {
+            #[cfg(feature = "cuda")]
+            if let Some(leaf) = self.cuda_leaf_values(index) {
+                return leaf;
+            }
             self.merkle_tree.get(index).to_vec()
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_leaf_values(&self, index: usize) -> Option<Vec<F>> {
+        let cuda_leaves = self.cuda_leaves.as_ref()?;
+        if !self.merkle_tree.leaves.is_empty()
+            && std::env::var_os("CUDA_FRI_LEAVES_FROM_DEVICE").is_none()
+        {
+            return None;
+        }
+
+        let leaf_count = 1 << (self.degree_log + self.rate_bits);
+        let leaf_len = cuda_leaves.len() / leaf_count;
+        if leaf_len == 0 || cuda_leaves.len() != leaf_count * leaf_len {
+            return None;
+        }
+
+        Some(
+            cuda_leaves
+                .copy_leaf_to_vec(index, leaf_len)
+                .unwrap_or_else(|e| panic!("CUDA FRI leaf copy failed: {e}"))
+                .into_iter()
+                .map(F::from_canonical_u64)
+                .collect(),
+        )
     }
 
     /// Like `get_lde_values`, but fetches LDE values from a batch of `P::WIDTH` points, and returns

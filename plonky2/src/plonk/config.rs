@@ -225,6 +225,8 @@ fn compute_from_coeffs_with_prover_compute<
         degree_log,
         rate_bits,
         blinding,
+        #[cfg(feature = "cuda")]
+        cuda_leaves: None,
     })
 }
 
@@ -546,6 +548,8 @@ impl<C: GenericConfig<2, F = GoldilocksField, Hasher = PoseidonHash>>
                     degree_log,
                     rate_bits,
                     blinding,
+                    #[cfg(feature = "cuda")]
+                    cuda_leaves: None,
                 });
             }
         }
@@ -655,6 +659,16 @@ fn cuda_as_u64(values: &[GoldilocksField]) -> &[u64] {
     unsafe { core::slice::from_raw_parts(values.as_ptr() as *const u64, values.len()) }
 }
 
+#[cfg(feature = "cuda")]
+fn cuda_flatten_goldilocks_leaves(leaves: &[Vec<GoldilocksField>]) -> Vec<u64> {
+    let leaf_len = leaves.first().map_or(0, |leaf| leaf.len());
+    let mut out = Vec::with_capacity(leaves.len() * leaf_len);
+    for leaf in leaves {
+        out.extend_from_slice(cuda_as_u64(leaf));
+    }
+    out
+}
+
 impl<C: GenericConfig<2, F = GoldilocksField, Hasher = PoseidonHash>>
     ProverCompute<GoldilocksField, C, 2> for CudaProverCompute
 {
@@ -675,9 +689,48 @@ impl<C: GenericConfig<2, F = GoldilocksField, Hasher = PoseidonHash>>
             let leaf_count = degree << rate_bits;
             let tree_height = log2_strict(leaf_count);
 
-            if cap_height < tree_height && tree_height >= 13 && plonky2_cuda::is_available() {
-                let poly_num = polynomials.len();
+            let poly_num = polynomials.len();
+            // Small fixed chunk counts (notably quotient chunks = 16 and Z/partial-products = 20)
+            // are not stable on the current CUDA LDE/Merkle path. B2 needs Z leaves resident for
+            // quotient permutation, so for poly_num == 20 we compute the commitment on CPU and
+            // upload those leaves once as a resident handle.
+            if cap_height < tree_height
+                && tree_height >= 13
+                && !blinding
+                && poly_num == 20
+                && plonky2_cuda::is_available()
+            {
+                let mut batch = compute_from_coeffs_with_prover_compute::<
+                    CpuProverCompute,
+                    GoldilocksField,
+                    C,
+                    2,
+                >(
+                    timing,
+                    polynomials,
+                    cap_height,
+                    rate_bits,
+                    blinding,
+                    fft_root_table,
+                )?;
+                let leaves_flat = cuda_flatten_goldilocks_leaves(&batch.merkle_tree.leaves);
+                batch.cuda_leaves = Some(
+                    plonky2_cuda::CudaRuntime::get()
+                        .leaf_handle_from_host(&leaves_flat)
+                        .map_err(|e| anyhow::anyhow!("CUDA leaf upload failed: {e}"))?,
+                );
+                return Ok(batch);
+            }
 
+            // The quotient commitment has a small fixed chunk count (typically
+            // num_challenges * quotient_degree_factor = 16). Keep it on CPU until Stage 4 handles
+            // quotient commitment chaining deliberately.
+            if cap_height < tree_height
+                && tree_height >= 13
+                && !blinding
+                && poly_num > 20
+                && plonky2_cuda::is_available()
+            {
                 // Poly-major coefficients as raw u64.
                 let mut coeffs = vec![0u64; poly_num * degree];
                 coeffs
@@ -686,7 +739,8 @@ impl<C: GenericConfig<2, F = GoldilocksField, Hasher = PoseidonHash>>
                     .for_each(|(dst, poly)| dst.copy_from_slice(cuda_as_u64(&poly.coeffs)));
 
                 // Twiddle tables / coset-shift powers (see plonky2_cuda::runtime docs).
-                let root_table = crate::field::fft::fft_root_table::<GoldilocksField>(degree).concat();
+                let root_table =
+                    crate::field::fft::fft_root_table::<GoldilocksField>(degree).concat();
                 let root_table2 =
                     crate::field::fft::fft_root_table::<GoldilocksField>(leaf_count).concat();
                 let shift_powers: Vec<GoldilocksField> = GoldilocksField::coset_shift()
@@ -741,6 +795,66 @@ impl<C: GenericConfig<2, F = GoldilocksField, Hasher = PoseidonHash>>
                 let merkle_tree =
                     gpu_merkle_tree_from_digests(leaves, leaf_count, digests, cap_height);
 
+                if std::env::var_os("VERIFY_CUDA_COMMIT").is_some() && !blinding {
+                    let mut cpu_timing = TimingTree::default();
+                    let cpu = compute_from_coeffs_with_prover_compute::<
+                        CpuProverCompute,
+                        GoldilocksField,
+                        C,
+                        2,
+                    >(
+                        &mut cpu_timing,
+                        polynomials.clone(),
+                        cap_height,
+                        rate_bits,
+                        blinding,
+                        fft_root_table,
+                    )?;
+                    if merkle_tree.leaves != cpu.merkle_tree.leaves {
+                        let (leaf_i, (cuda_leaf, cpu_leaf)) = merkle_tree
+                            .leaves
+                            .iter()
+                            .zip(&cpu.merkle_tree.leaves)
+                            .enumerate()
+                            .find(|(_, (cuda_leaf, cpu_leaf))| cuda_leaf != cpu_leaf)
+                            .expect("leaf vectors differ but no differing common leaf found");
+                        let (value_i, (&cuda_value, &cpu_value)) = cuda_leaf
+                            .iter()
+                            .zip(cpu_leaf)
+                            .enumerate()
+                            .find(|(_, (cuda_value, cpu_value))| cuda_value != cpu_value)
+                            .expect("leaf differs but no differing common value found");
+                        panic!(
+                            "CUDA commitment leaves mismatch (poly_num={poly_num}, degree={degree}, rate_bits={rate_bits}, leaf={leaf_i}, value={value_i}): cuda={cuda_value:?}, cpu={cpu_value:?}"
+                        );
+                    }
+                    if merkle_tree.digests != cpu.merkle_tree.digests {
+                        let (digest_i, (cuda_digest, cpu_digest)) = merkle_tree
+                            .digests
+                            .iter()
+                            .zip(&cpu.merkle_tree.digests)
+                            .enumerate()
+                            .find(|(_, (cuda_digest, cpu_digest))| cuda_digest != cpu_digest)
+                            .expect("digest vectors differ but no differing common digest found");
+                        panic!(
+                            "CUDA commitment digest mismatch (poly_num={poly_num}, degree={degree}, rate_bits={rate_bits}, digest={digest_i}): cuda={cuda_digest:?}, cpu={cpu_digest:?}"
+                        );
+                    }
+                    if merkle_tree.cap != cpu.merkle_tree.cap {
+                        let (cap_i, (cuda_cap, cpu_cap)) = merkle_tree
+                            .cap
+                            .0
+                            .iter()
+                            .zip(&cpu.merkle_tree.cap.0)
+                            .enumerate()
+                            .find(|(_, (cuda_cap, cpu_cap))| cuda_cap != cpu_cap)
+                            .expect("cap vectors differ but no differing common cap found");
+                        panic!(
+                            "CUDA commitment cap mismatch (poly_num={poly_num}, degree={degree}, rate_bits={rate_bits}, cap={cap_i}): cuda={cuda_cap:?}, cpu={cpu_cap:?}"
+                        );
+                    }
+                }
+
                 return Ok(PolynomialBatch {
                     polynomials,
                     merkle_tree,
@@ -748,6 +862,7 @@ impl<C: GenericConfig<2, F = GoldilocksField, Hasher = PoseidonHash>>
                     degree_log,
                     rate_bits,
                     blinding,
+                    cuda_leaves: Some(result.leaves_device),
                 });
             }
         }
@@ -1084,8 +1199,9 @@ mod tests {
             return;
         }
 
-        // degree 1024, rate_bits 3 => leaf_count 8192 (tree_height 13) so the GPU path triggers.
-        let polynomials = (0..6)
+        // degree 1024, rate_bits 3 => leaf_count 8192 (tree_height 13), and poly_num > 20 keeps
+        // this on the stable CUDA LDE/Merkle path.
+        let polynomials = (0..24)
             .map(|poly| {
                 PolynomialCoeffs::new(
                     (0..1024)
@@ -1129,6 +1245,118 @@ mod tests {
         assert_eq!(
             cuda.merkle_tree.digests, cpu.merkle_tree.digests,
             "digest array mismatch (GPU digest ordering vs plonky2 layout)"
+        );
+
+        let cuda_leaves = cuda
+            .cuda_leaves
+            .as_ref()
+            .expect("CUDA commit should retain resident leaves")
+            .copy_to_vec()
+            .expect("failed to copy resident CUDA leaves to host");
+        let mut host_leaves = Vec::with_capacity(cuda_leaves.len());
+        for leaf in &cuda.merkle_tree.leaves {
+            host_leaves.extend_from_slice(cuda_as_u64(leaf));
+        }
+        assert_eq!(
+            cuda_leaves, host_leaves,
+            "resident CUDA leaves differ from host Merkle leaves"
+        );
+    }
+
+    /// Stage B2 smoke test: prove+verify with the CUDA quotient gate enabled and assert that the
+    /// quotient permutation read resident commitment leaves rather than uploading host leaves.
+    ///
+    /// Run on a CUDA host with:
+    /// `CUDA_ARCH=sm_80 cargo test -p plonky2 --features cuda cuda_resident_quotient_proves_and_verifies -- --ignored --nocapture`
+    #[cfg(all(feature = "cuda", feature = "std"))]
+    #[test]
+    #[ignore = "requires CUDA device; validates Stage B2 resident quotient path"]
+    fn cuda_resident_quotient_proves_and_verifies() {
+        use crate::hash::hash_types::HashOutTarget;
+        use crate::iop::witness::WitnessWrite;
+        use crate::plonk::prover::{
+            cuda_quotient_perm_resident_calls, reset_cuda_quotient_perm_resident_calls,
+        };
+
+        if !plonky2_cuda::is_available() {
+            eprintln!("skipping CUDA resident quotient test: no CUDA device available");
+            return;
+        }
+
+        struct EnvGuard {
+            quotient_perm: Option<std::ffi::OsString>,
+            force_upload: Option<std::ffi::OsString>,
+        }
+
+        impl EnvGuard {
+            fn capture() -> Self {
+                Self {
+                    quotient_perm: std::env::var_os("CUDA_QUOTIENT_PERM"),
+                    force_upload: std::env::var_os("CUDA_QUOTIENT_PERM_FORCE_UPLOAD"),
+                }
+            }
+        }
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                if let Some(value) = &self.quotient_perm {
+                    std::env::set_var("CUDA_QUOTIENT_PERM", value);
+                } else {
+                    std::env::remove_var("CUDA_QUOTIENT_PERM");
+                }
+                if let Some(value) = &self.force_upload {
+                    std::env::set_var("CUDA_QUOTIENT_PERM_FORCE_UPLOAD", value);
+                } else {
+                    std::env::remove_var("CUDA_QUOTIENT_PERM_FORCE_UPLOAD");
+                }
+            }
+        }
+
+        let _env_guard = EnvGuard::capture();
+        std::env::set_var("CUDA_QUOTIENT_PERM", "1");
+        std::env::remove_var("CUDA_QUOTIENT_PERM_FORCE_UPLOAD");
+        reset_cuda_quotient_perm_resident_calls();
+
+        let mut builder =
+            CircuitBuilder::<GoldilocksField, 2>::new(CircuitConfig::standard_recursion_config());
+        let seed = builder.add_virtual_hash();
+        let mut cur: HashOutTarget = seed;
+        for i in 0..16384 {
+            let c = builder.constant(GoldilocksField::from_canonical_usize(i));
+            cur = builder.hash_n_to_hash_no_pad::<PoseidonHash>(vec![
+                c,
+                c,
+                c,
+                c,
+                cur.elements[0],
+                cur.elements[1],
+                cur.elements[2],
+                cur.elements[3],
+            ]);
+        }
+        builder.register_public_inputs(&cur.elements);
+
+        let data = builder.build::<PoseidonGoldilocksCudaConfig>();
+        let mut pw = PartialWitness::new();
+        pw.set_hash_target(
+            seed,
+            HashOut {
+                elements: [
+                    GoldilocksField::from_canonical_u64(1),
+                    GoldilocksField::from_canonical_u64(2),
+                    GoldilocksField::from_canonical_u64(3),
+                    GoldilocksField::from_canonical_u64(4),
+                ],
+            },
+        )
+        .unwrap();
+
+        let proof = data.prove(pw).unwrap();
+        data.verify(proof).unwrap();
+
+        assert!(
+            cuda_quotient_perm_resident_calls() > 0,
+            "CUDA quotient gate was enabled, but resident leaf path was not used"
         );
     }
 

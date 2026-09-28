@@ -18,10 +18,10 @@ extern crate core;
 
 #[cfg(feature = "runtime")]
 mod runtime;
-#[cfg(feature = "runtime")]
-pub use runtime::{is_available, CommitResult, CudaRuntime};
-
 use std::ffi::c_void;
+
+#[cfg(feature = "runtime")]
+pub use runtime::{is_available, CommitResult, CudaLeafHandle, CudaRuntime};
 
 pub mod cuda {
     #[repr(C)]

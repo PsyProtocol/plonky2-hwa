@@ -723,14 +723,42 @@ fn flatten_leaves_u64<F: Field>(leaves: &[Vec<F>]) -> Vec<u64> {
     out
 }
 
+#[cfg(feature = "cuda")]
+fn polynomial_batch_leaf_len<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    batch: &PolynomialBatch<F, C, D>,
+) -> usize {
+    batch.polynomials.len()
+        + if batch.blinding {
+            crate::fri::oracle::SALT_SIZE
+        } else {
+            0
+        }
+}
+
 /// Whether to offload the quotient permutation argument to CUDA. OFF by default: on a discrete GPU
 /// the per-call leaf upload (no device residency yet) makes it a net loss vs the CPU path. Enable
 /// with `CUDA_QUOTIENT_PERM=1` to experiment (and for the eventual device-resident path).
 #[cfg(all(feature = "cuda", feature = "std"))]
 fn cuda_quotient_perm_enabled() -> bool {
-    use std::sync::OnceLock;
-    static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| std::env::var("CUDA_QUOTIENT_PERM").is_ok())
+    std::env::var_os("CUDA_QUOTIENT_PERM").is_some()
+}
+
+#[cfg(all(feature = "cuda", feature = "std"))]
+static CUDA_QUOTIENT_PERM_RESIDENT_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(feature = "cuda", feature = "std", test))]
+pub(crate) fn reset_cuda_quotient_perm_resident_calls() {
+    CUDA_QUOTIENT_PERM_RESIDENT_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(all(feature = "cuda", feature = "std", test))]
+pub(crate) fn cuda_quotient_perm_resident_calls() -> usize {
+    CUDA_QUOTIENT_PERM_RESIDENT_CALLS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Cheap predicate (no uploads) mirroring `try_cuda_quotient_perm_contribution`'s guards, so the
@@ -753,9 +781,37 @@ fn cuda_quotient_perm_applicable<
         && common_data.num_lookup_polys == 0
         && alphas.len() <= 8
         && plonky2_cuda::is_available()
-        && !prover_data.constants_sigmas_commitment.merkle_tree.leaves.is_empty()
-        && !wires_commitment.merkle_tree.leaves.is_empty()
-        && !zs_partial_products_and_lookup_commitment.merkle_tree.leaves.is_empty()
+        && {
+            let force_upload = std::env::var_os("CUDA_QUOTIENT_PERM_FORCE_UPLOAD").is_some();
+            let resident = prover_data
+                .constants_sigmas_commitment
+                .cuda_leaves
+                .as_ref()
+                .map_or(false, |h| !h.is_empty())
+                && wires_commitment
+                    .cuda_leaves
+                    .as_ref()
+                    .map_or(false, |h| !h.is_empty())
+                && zs_partial_products_and_lookup_commitment
+                    .cuda_leaves
+                    .as_ref()
+                    .map_or(false, |h| !h.is_empty());
+            let host = !prover_data
+                .constants_sigmas_commitment
+                .merkle_tree
+                .leaves
+                .is_empty()
+                && !wires_commitment.merkle_tree.leaves.is_empty()
+                && !zs_partial_products_and_lookup_commitment
+                    .merkle_tree
+                    .leaves
+                    .is_empty();
+            if force_upload {
+                host
+            } else {
+                resident || host
+            }
+        }
 }
 
 /// CUDA analogue of `try_metal_quotient_perm_contribution`. Computes the (un-Z_H-divided) permutation
@@ -790,20 +846,6 @@ fn try_cuda_quotient_perm_contribution<
         return None;
     }
 
-    let cs_leaves = &prover_data.constants_sigmas_commitment.merkle_tree.leaves;
-    let wires_leaves = &wires_commitment.merkle_tree.leaves;
-    let zs_leaves = &zs_partial_products_and_lookup_commitment.merkle_tree.leaves;
-    if cs_leaves.is_empty() || wires_leaves.is_empty() || zs_leaves.is_empty() {
-        return None;
-    }
-    let cs_leaf_len = cs_leaves[0].len();
-    let wires_leaf_len = wires_leaves[0].len();
-    let zs_leaf_len = zs_leaves[0].len();
-
-    let cs_flat = flatten_leaves_u64(cs_leaves);
-    let wires_flat = flatten_leaves_u64(wires_leaves);
-    let zs_flat = flatten_leaves_u64(zs_leaves);
-
     let shifted_xs: Vec<F> = points.iter().map(|&x| F::coset_shift() * x).collect();
     let l0_values: Vec<F> = shifted_xs
         .iter()
@@ -811,31 +853,112 @@ fn try_cuda_quotient_perm_contribution<
         .map(|(i, &x)| z_h_on_coset.eval_l_0(i, x))
         .collect();
 
-    let perm_u64 = plonky2_cuda::CudaRuntime::get()
-        .quotient_perm(
-            common_data.degree_bits(),
-            common_data.config.fri_config.rate_bits,
-            step,
-            next_step,
-            u64_slice_from_field_slice(&shifted_xs),
-            u64_slice_from_field_slice(&l0_values),
-            &cs_flat,
-            cs_leaf_len,
-            &zs_flat,
-            zs_leaf_len,
-            &wires_flat,
-            wires_leaf_len,
-            common_data.num_constants,
-            common_data.config.num_routed_wires,
-            common_data.config.num_challenges,
-            common_data.quotient_degree_factor,
-            common_data.num_partial_products,
-            u64_slice_from_field_slice(&common_data.k_is),
-            u64_slice_from_field_slice(alphas),
-            u64_slice_from_field_slice(betas),
-            u64_slice_from_field_slice(gammas),
+    let cs_leaf_len = polynomial_batch_leaf_len(&prover_data.constants_sigmas_commitment);
+    let wires_leaf_len = polynomial_batch_leaf_len(wires_commitment);
+    let zs_leaf_len = polynomial_batch_leaf_len(zs_partial_products_and_lookup_commitment);
+
+    let run_cuda_quotient_perm_upload = || -> Option<Vec<u64>> {
+        let cs_leaves = &prover_data.constants_sigmas_commitment.merkle_tree.leaves;
+        let wires_leaves = &wires_commitment.merkle_tree.leaves;
+        let zs_leaves = &zs_partial_products_and_lookup_commitment.merkle_tree.leaves;
+        if cs_leaves.is_empty() || wires_leaves.is_empty() || zs_leaves.is_empty() {
+            return None;
+        }
+
+        let cs_flat = flatten_leaves_u64(cs_leaves);
+        let wires_flat = flatten_leaves_u64(wires_leaves);
+        let zs_flat = flatten_leaves_u64(zs_leaves);
+
+        Some(
+            plonky2_cuda::CudaRuntime::get()
+                .quotient_perm(
+                    common_data.degree_bits(),
+                    common_data.config.fri_config.rate_bits,
+                    step,
+                    next_step,
+                    u64_slice_from_field_slice(&shifted_xs),
+                    u64_slice_from_field_slice(&l0_values),
+                    &cs_flat,
+                    cs_leaf_len,
+                    &zs_flat,
+                    zs_leaf_len,
+                    &wires_flat,
+                    wires_leaf_len,
+                    common_data.num_constants,
+                    common_data.config.num_routed_wires,
+                    common_data.config.num_challenges,
+                    common_data.quotient_degree_factor,
+                    common_data.num_partial_products,
+                    u64_slice_from_field_slice(&common_data.k_is),
+                    u64_slice_from_field_slice(alphas),
+                    u64_slice_from_field_slice(betas),
+                    u64_slice_from_field_slice(gammas),
+                )
+                .expect("cuda quotient_perm failed"),
         )
-        .expect("cuda quotient_perm failed");
+    };
+
+    let force_upload = std::env::var_os("CUDA_QUOTIENT_PERM_FORCE_UPLOAD").is_some();
+    let resident_handles = (
+        prover_data.constants_sigmas_commitment.cuda_leaves.as_ref(),
+        zs_partial_products_and_lookup_commitment
+            .cuda_leaves
+            .as_ref(),
+        wires_commitment.cuda_leaves.as_ref(),
+    );
+    let perm_u64 = if force_upload {
+        run_cuda_quotient_perm_upload()?
+    } else if let (Some(cs_h), Some(zs_h), Some(wires_h)) = resident_handles {
+        CUDA_QUOTIENT_PERM_RESIDENT_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let resident = plonky2_cuda::CudaRuntime::get()
+            .quotient_perm_resident(
+                common_data.degree_bits(),
+                common_data.config.fri_config.rate_bits,
+                step,
+                next_step,
+                u64_slice_from_field_slice(&shifted_xs),
+                u64_slice_from_field_slice(&l0_values),
+                cs_h,
+                cs_leaf_len,
+                zs_h,
+                zs_leaf_len,
+                wires_h,
+                wires_leaf_len,
+                common_data.num_constants,
+                common_data.config.num_routed_wires,
+                common_data.config.num_challenges,
+                common_data.quotient_degree_factor,
+                common_data.num_partial_products,
+                u64_slice_from_field_slice(&common_data.k_is),
+                u64_slice_from_field_slice(alphas),
+                u64_slice_from_field_slice(betas),
+                u64_slice_from_field_slice(gammas),
+            )
+            .expect("cuda quotient_perm_resident failed");
+
+        if std::env::var_os("CUDA_QUOTIENT_PERM_VERIFY_UPLOAD").is_some() {
+            let upload = run_cuda_quotient_perm_upload()?;
+            if resident != upload {
+                let alpha_len = alphas.len();
+                let (idx, (got, expected)) = resident
+                    .iter()
+                    .zip(&upload)
+                    .enumerate()
+                    .find(|(_, (got, expected))| got != expected)
+                    .expect("resident/upload length mismatch without differing prefix");
+                panic!(
+                    "CUDA resident quotient mismatch at point {}, challenge {}: resident={:#x}, upload={:#x}",
+                    idx / alpha_len,
+                    idx % alpha_len,
+                    got,
+                    expected
+                );
+            }
+        }
+        resident
+    } else {
+        run_cuda_quotient_perm_upload()?
+    };
 
     // SAFETY: F == GoldilocksField (checked above), #[repr(transparent)] over u64.
     Some(
