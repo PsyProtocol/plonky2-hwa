@@ -490,9 +490,8 @@ unsafe impl<const W: usize> PackedField for Portable<W> {
     }
 }
 
-/// Bit-reverse and zero-factor fill, exactly as `fft_classic` does before calling the kernel.
-fn prepare(values: &mut [F], r: usize) {
-    reverse_index_bits_in_place(values);
+/// The zero-factor fill that callers of the reference kernel do after the bit reversal.
+fn prepare_fill(values: &mut [F], r: usize) {
     if r > 0 {
         let mask = !((1 << r) - 1);
         for i in 0..values.len() {
@@ -508,8 +507,11 @@ fn check_width<const W: usize>(rng: &mut Rng, max_lg_n: usize) {
         for r in zero_factors(lg_n) {
             for pattern in [Pattern::Canonical, Pattern::EdgeMix] {
                 let mut input = gen_input(rng, pattern, lg_n, r);
-                prepare(&mut input, r);
+                // The new kernel does the zero-factor fill itself, so it gets the bit-reversed
+                // input without the fill; the reference kernel expects the caller to fill.
+                reverse_index_bits_in_place(&mut input);
                 let mut new = input.clone();
+                prepare_fill(&mut input, r);
                 let mut old = input.clone();
                 let mut scalar = input;
                 fft::fft_classic_simd::<Portable<W>>(&mut new, r, lg_n, &table);

@@ -90,8 +90,94 @@ pub fn ifft_with_options<F: Field>(
     PolynomialCoeffs { coeffs: buffer }
 }
 
-/// Generic FFT implementation that works with both scalar and packed inputs.
+// ---------------------------------------------------------------------------------------------
+// Cache-blocked kernel.
+//
+// After the bit reversal, butterfly layer `l` (half-size `2^l`) pairs index `x` with `x + 2^l`
+// for every `x` whose bit `l` is clear, using twiddle `root_table[l][x mod 2^l]`. The previous
+// kernel swept the whole array once per layer, i.e. `lg_n` read+write passes over data far
+// larger than L1/L2. This kernel performs exactly the same butterflies (same operands, same
+// packed operations, same operand order), only in a different order, so the output is
+// bit-identical in its raw `u64` representation:
+//
+// * Fused group (`fused_group`): consecutive layers `p0 .. p0 + g` (g <= MAX_FUSED_LAYERS)
+//   only touch index bits `p0 .. p0 + g`, so for a fixed low offset `j < 2^p0` the `2^g`
+//   elements `base + a * 2^p0 + j` form an independent radix-`2^g` sub-FFT. Offsets are
+//   processed in chunks of `chunk` consecutive vectors, and all `g` layers are applied to the
+//   `2^g x chunk` tile while it is resident in L1: one pass per group instead of `g`.
+// * Phase 1 walks the array in L2-sized blocks, touching main memory once. Inside each L2
+//   block, every L1-sized block gets the zero-factor fill, the sub-width layers and all packed
+//   layers local to it (1a); then the layers local to the L2 block run as fused groups (1b).
+// * Phase 2 runs the remaining large-stride layers as fused groups over the whole array.
+//
+// For lg_n = 20 with AVX2 packing that is 1 + 2 passes over memory instead of 1 (fill) + 20,
+// plus the unchanged bit-reversal permutation in `fft_classic`.
+// ---------------------------------------------------------------------------------------------
+
+/// Bytes per L1 block (phase 1a). 16 KiB of data plus up to 16 KiB of twiddles fits the 32 KiB
+/// L1D of Zen 3 (48 KiB on Zen 5).
+const LOG_L1_BLOCK_BYTES: usize = 14;
+
+/// Bytes per L2 block (phase 1). 128 KiB leaves room for twiddles and the SMT sibling in a
+/// 512 KiB (Zen 3) or 1 MiB (Zen 5) L2.
+const LOG_L2_BLOCK_BYTES: usize = 17;
+
+/// Maximum number of consecutive large-stride layers fused into one pass (radix `2^g`).
+const MAX_FUSED_LAYERS: usize = 3;
+
+/// Bytes per row of a phase-2 tile. A tile is `2^g` rows of this size.
+const LOG_CHUNK_BYTES: usize = 10;
+
+#[inline]
+fn floor_log2(x: usize) -> usize {
+    (usize::BITS - 1 - x.leading_zeros()) as usize
+}
+
+/// `(xs[i], ys[i]) := (xs[i] + ws[i] * ys[i], xs[i] - ws[i] * ys[i])`, with the exact operation
+/// sequence of the original layer loop.
+#[inline(always)]
+fn butterfly_rows<P: PackedField>(xs: &mut [P], ys: &mut [P], ws: &[P]) {
+    let len = xs.len();
+    let (ys, ws) = (&mut ys[..len], &ws[..len]);
+    for j in 0..len {
+        let omega = ws[j];
+        let t = omega * ys[j];
+        let u = xs[j];
+        xs[j] = u + t;
+        ys[j] = u - t;
+    }
+}
+
+/// The layers with half-size below the packing width, applied to one block. Identical to the
+/// first loop of the original kernel restricted to `block`.
 #[unroll_for_loops]
+#[inline]
+fn sub_width_layers<P: PackedField>(
+    block: &mut [P],
+    r: usize,
+    lg_n: usize,
+    lg_packed_width: usize,
+    omegas: &[P; 4],
+) {
+    for lg_half_m in 0..4 {
+        if (r..min(lg_n, lg_packed_width)).contains(&lg_half_m) {
+            let half_m = 1 << lg_half_m;
+            let omega = omegas[lg_half_m];
+            for k in (0..block.len()).step_by(2) {
+                let (u, v) = block[k].interleave(block[k + 1], half_m);
+                let t = omega * v;
+                (block[k], block[k + 1]) = (u + t).interleave(u - t, half_m);
+            }
+        }
+    }
+}
+
+/// Generic FFT implementation that works with both scalar and packed inputs.
+///
+/// `values` must already be in bit-reversed order. Unlike the original kernel, this one also
+/// performs the zero-factor fill (`values[i] = values[i & !(2^r - 1)]`) itself, so that it can be
+/// done block by block instead of as a separate pass. The fill is idempotent, so callers that
+/// already did it get the same result.
 pub(crate) fn fft_classic_simd<P: PackedField>(
     values: &mut [P::Scalar],
     r: usize,
@@ -99,58 +185,153 @@ pub(crate) fn fft_classic_simd<P: PackedField>(
     root_table: &FftRootTable<P::Scalar>,
 ) {
     let lg_packed_width = log2_strict(P::WIDTH); // 0 when P is a scalar.
-    let packed_values = P::pack_slice_mut(values);
-    let packed_n = packed_values.len();
-    debug_assert!(packed_n == 1 << (lg_n - lg_packed_width));
-
-    // Want the below for loop to unroll, hence the need for a literal.
-    // This loop will not run when P is a scalar.
     assert!(lg_packed_width <= 4);
-    for lg_half_m in 0..4 {
-        if (r..min(lg_n, lg_packed_width)).contains(&lg_half_m) {
-            // Intuitively, we split values into m slices: subarr[0], ..., subarr[m - 1]. Each of
-            // those slices is split into two halves: subarr[j].left, subarr[j].right. We do
-            // (subarr[j].left[k], subarr[j].right[k])
-            //   := f(subarr[j].left[k], subarr[j].right[k], omega[k]),
-            // where f(u, v, omega) = (u + omega * v, u - omega * v).
-            let half_m = 1 << lg_half_m;
+    debug_assert!(values.len() == 1 << lg_n && lg_n >= lg_packed_width);
+    let lg_packed_n = lg_n - lg_packed_width;
 
-            // Set omega to root_table[lg_half_m][0..half_m] but repeated.
-            let mut omega = P::default();
+    // First packed layer to perform. Packed layer `p` is field layer `p + lg_packed_width`.
+    let s = max(r, lg_packed_width);
+    let p_start = s - lg_packed_width;
+
+    let lg_vec_bytes = floor_log2(core::mem::size_of::<P>().max(1));
+    let bits_for = |lg_bytes: usize| lg_bytes.saturating_sub(lg_vec_bytes);
+    // Blocks hold at least two vectors (sub-width layers pair adjacent vectors).
+    let l2_bits = bits_for(LOG_L2_BLOCK_BYTES).max(1).min(lg_packed_n);
+    let l1_bits = bits_for(LOG_L1_BLOCK_BYTES).max(1).min(l2_bits);
+    let chunk = 1usize << bits_for(LOG_CHUNK_BYTES).min(l1_bits);
+
+    // The fill only copies inside aligned groups of 2^r elements, so it can be done per L1
+    // block when such a group fits in one.
+    let fill_per_block = r > 0 && r <= l1_bits + lg_packed_width;
+    if r > 0 && !fill_per_block {
+        fill_zero_factor(values, r);
+    }
+
+    // ---- Phase 1: every layer local to an L2 block, one L2 block at a time. ----
+    let has_sub_width = r < min(lg_n, lg_packed_width);
+    if fill_per_block || has_sub_width || p_start < l2_bits {
+        // Set omegas[l] to root_table[l][0..2^l] but repeated (only used for l < lg_packed_width).
+        let mut omegas = [P::default(); 4];
+        for (lg_half_m, omega) in omegas.iter_mut().enumerate().take(lg_packed_width) {
+            let half_m = 1 << lg_half_m;
             for (j, omega_j) in omega.as_slice_mut().iter_mut().enumerate() {
                 *omega_j = root_table[lg_half_m][j % half_m];
             }
-
-            for k in (0..packed_n).step_by(2) {
-                // We have two vectors and want to do math on pairs of adjacent elements (or for
-                // lg_half_m > 0, pairs of adjacent blocks of elements). .interleave does the
-                // appropriate shuffling and is its own inverse.
-                let (u, v) = packed_values[k].interleave(packed_values[k + 1], half_m);
-                let t = omega * v;
-                (packed_values[k], packed_values[k + 1]) = (u + t).interleave(u - t, half_m);
+        }
+        let l1_len = 1usize << (l1_bits + lg_packed_width); // in field elements
+        let l2_len = 1usize << (l2_bits + lg_packed_width);
+        for l2_block in values.chunks_exact_mut(l2_len) {
+            // Phase 1a: the fill, the sub-width layers and packed layers below l1_bits, per
+            // L1-sized block.
+            for l1_block in l2_block.chunks_exact_mut(l1_len) {
+                if fill_per_block {
+                    fill_zero_factor(l1_block, r);
+                }
+                let block = P::pack_slice_mut(l1_block);
+                if has_sub_width {
+                    sub_width_layers(block, r, lg_n, lg_packed_width, &omegas);
+                }
+                for p in p_start..l1_bits {
+                    let half = 1usize << p;
+                    let omega_table = &P::pack_slice(&root_table[p + lg_packed_width][..])[..half];
+                    for sub in block.chunks_exact_mut(2 * half) {
+                        let (lo, hi) = sub.split_at_mut(half);
+                        butterfly_rows(lo, hi, omega_table);
+                    }
+                }
             }
+            // Phase 1b: packed layers l1_bits..l2_bits while the L2 block is still cached.
+            fused_layers(
+                P::pack_slice_mut(l2_block),
+                max(p_start, l1_bits),
+                l2_bits,
+                chunk,
+                lg_packed_width,
+                root_table,
+            );
         }
     }
 
-    // We've already done the first lg_packed_width (if they were required) iterations.
-    let s = max(r, lg_packed_width);
+    // ---- Phase 2: the remaining large-stride layers over the whole array. ----
+    fused_layers(
+        P::pack_slice_mut(values),
+        max(p_start, l2_bits),
+        lg_packed_n,
+        chunk,
+        lg_packed_width,
+        root_table,
+    );
+}
 
-    for lg_half_m in s..lg_n {
-        let lg_m = lg_half_m + 1;
-        let m = 1 << lg_m; // Subarray size (in field elements).
-        let packed_m = m >> lg_packed_width; // Subarray size (in vectors).
-        let half_packed_m = packed_m / 2;
-        debug_assert!(half_packed_m != 0);
+/// `values[i] = values[i & !(2^r - 1)]`, with indices relative to `values` (which must start at
+/// a multiple of `2^r`). `chunks_mut` also covers `2^r > values.len()` like the original loop.
+#[inline]
+fn fill_zero_factor<F: Copy>(values: &mut [F], r: usize) {
+    for group in values.chunks_mut(1 << r) {
+        let head = group[0];
+        group.fill(head);
+    }
+}
 
-        // omega values for this iteration, as slice of vectors
-        let omega_table = P::pack_slice(&root_table[lg_half_m][..]);
-        for k in (0..packed_n).step_by(packed_m) {
-            for j in 0..half_packed_m {
-                let omega = omega_table[j];
-                let t = omega * packed_values[k + half_packed_m + j];
-                let u = packed_values[k + j];
-                packed_values[k + j] = u + t;
-                packed_values[k + half_packed_m + j] = u - t;
+/// Apply packed layers `from..to` to `packed_values`, in passes of up to `MAX_FUSED_LAYERS`
+/// layers each.
+#[inline]
+fn fused_layers<P: PackedField>(
+    packed_values: &mut [P],
+    from: usize,
+    to: usize,
+    chunk: usize,
+    lg_packed_width: usize,
+    root_table: &FftRootTable<P::Scalar>,
+) {
+    let mut p0 = from;
+    while p0 < to {
+        let remaining = to - p0;
+        let groups = remaining.div_ceil(MAX_FUSED_LAYERS);
+        let g = remaining.div_ceil(groups);
+        fused_group(packed_values, p0, g, chunk, lg_packed_width, root_table);
+        p0 += g;
+    }
+}
+
+/// Apply packed layers `p0 .. p0 + g` in one pass (see the module comment above).
+#[inline]
+fn fused_group<P: PackedField>(
+    packed_values: &mut [P],
+    p0: usize,
+    g: usize,
+    chunk: usize,
+    lg_packed_width: usize,
+    root_table: &FftRootTable<P::Scalar>,
+) {
+    let stride = 1usize << p0; // distance between the rows of a tile, in vectors
+    let rows = 1usize << g;
+    let super_len = stride << g;
+    let chunk = min(chunk, stride);
+
+    let mut omega_tables: [&[P]; MAX_FUSED_LAYERS] = [&[]; MAX_FUSED_LAYERS];
+    for (t, table) in omega_tables.iter_mut().enumerate().take(g) {
+        *table = &P::pack_slice(&root_table[p0 + t + lg_packed_width][..])[..stride << t];
+    }
+
+    for sb in packed_values.chunks_exact_mut(super_len) {
+        for j0 in (0..stride).step_by(chunk) {
+            for (t, omega_table) in omega_tables.iter().enumerate().take(g) {
+                let half = stride << t; // butterfly half-size of layer p0 + t
+                let low_mask = (1usize << t) - 1;
+                for a in 0..rows {
+                    if a & (1 << t) != 0 {
+                        continue;
+                    }
+                    let x = a * stride + j0;
+                    let tw = (a & low_mask) * stride + j0;
+                    let (lo, hi) = sb.split_at_mut(x + half);
+                    butterfly_rows(
+                        &mut lo[x..x + chunk],
+                        &mut hi[..chunk],
+                        &omega_table[tw..tw + chunk],
+                    );
+                }
             }
         }
     }
@@ -183,13 +364,8 @@ pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &Fft
     // element i*2^r with the value at i*2^r.  This corresponds to the
     // first r rounds of the FFT when there are 2^r zeros at the end
     // of the original input.
-    if r > 0 {
-        // if r == 0 then this loop is a noop.
-        let mask = !((1 << r) - 1);
-        for i in 0..n {
-            values[i] = values[i & mask];
-        }
-    }
+    //
+    // The fill is performed by `fft_classic_simd`, fused into its first pass.
 
     let lg_packed_width = log2_strict(<F as Packable>::Packing::WIDTH);
     if lg_n <= lg_packed_width {
