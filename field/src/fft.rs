@@ -92,7 +92,7 @@ pub fn ifft_with_options<F: Field>(
 
 /// Generic FFT implementation that works with both scalar and packed inputs.
 #[unroll_for_loops]
-fn fft_classic_simd<P: PackedField>(
+pub(crate) fn fft_classic_simd<P: PackedField>(
     values: &mut [P::Scalar],
     r: usize,
     lg_n: usize,

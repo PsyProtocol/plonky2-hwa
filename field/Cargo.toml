@@ -17,6 +17,8 @@ serialize_rkyv = ["dep:rkyv"]
 serialize_speedy = ["dep:speedy", "std"]
 serialize_bytemuck = ["dep:bytemuck"]
 ts-rs = ["dep:ts-rs"]
+# Exposes `fft_reference`, a verbatim copy of the original FFT kernel, for benchmarks.
+fft-reference = []
 
 [dependencies]
 anyhow = { workspace = true }

@@ -15,6 +15,9 @@ pub mod batch_util;
 pub mod cosets;
 pub mod extension;
 pub mod fft;
+#[cfg(any(test, feature = "fft-reference"))]
+#[doc(hidden)]
+pub mod fft_reference;
 pub mod goldilocks_extensions;
 pub mod goldilocks_field;
 pub mod interpolation;
@@ -27,6 +30,9 @@ pub mod secp256k1_scalar;
 pub mod types;
 pub mod zero_poly_coset;
 pub mod serialization;
+
+#[cfg(test)]
+mod fft_equivalence_tests;
 
 #[cfg(test)]
 mod field_testing;
