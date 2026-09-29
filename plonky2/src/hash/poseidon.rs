@@ -566,6 +566,7 @@ pub trait Poseidon: PrimeField64 {
     }
 
     /// Same as `mds_partial_layer_fast` for `PackedField.
+    #[inline(always)]
     fn mds_partial_layer_fast_packed_field<
         F: RichField + Extendable<D>,
         const D: usize,
@@ -652,6 +653,7 @@ pub trait Poseidon: PrimeField64 {
     }
 
     /// Same as `constant_layer` for PackedFields.
+    #[inline(always)]
     fn constant_layer_packed_field<
         F: RichField + Extendable<D>,
         const D: usize,

@@ -97,6 +97,7 @@ impl DivAssign<GoldilocksField> for Avx2GoldilocksField {
 }
 
 impl From<GoldilocksField> for Avx2GoldilocksField {
+    #[inline]
     fn from(x: GoldilocksField) -> Self {
         Self([x; 4])
     }

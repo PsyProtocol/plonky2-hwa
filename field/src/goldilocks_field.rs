@@ -189,10 +189,12 @@ impl Field for GoldilocksField {
         Self(n)
     }
 
+    #[inline]
     fn from_noncanonical_u96((n_lo, n_hi): (u64, u32)) -> Self {
         reduce96((n_lo, n_hi))
     }
 
+    #[inline]
     fn from_noncanonical_u128(n: u128) -> Self {
         reduce128(n)
     }
