@@ -87,6 +87,10 @@ name = "merkle"
 harness = false
 
 [[bench]]
+name = "merkle_poseidon_batched"
+harness = false
+
+[[bench]]
 name = "transpose"
 harness = false
 
