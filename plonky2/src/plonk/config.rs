@@ -86,6 +86,37 @@ pub trait Hasher<F: RichField>:
     }
 
     fn two_to_one(left: Self::Hash, right: Self::Hash) -> Self::Hash;
+
+    /// Number of independent inputs that [`Hasher::hash_or_noop_batch`] and
+    /// [`Hasher::two_to_one_batch`] process at once. When it is greater than 1, Merkle tree
+    /// construction routes leaf and node hashing through the batch methods; otherwise it keeps the
+    /// one-at-a-time path.
+    const BATCH_WIDTH: usize = 1;
+
+    /// Hashes every input with [`Hasher::hash_or_noop`].
+    ///
+    /// Implementations must return exactly `inputs.iter().map(|x| Self::hash_or_noop(x))`, down
+    /// to the in-memory representation of every digest.
+    fn hash_or_noop_batch(inputs: &[Vec<F>]) -> Vec<Self::Hash> {
+        inputs.iter().map(|x| Self::hash_or_noop(x)).collect()
+    }
+
+    /// Compresses consecutive pairs: output `i` is
+    /// `Self::two_to_one(inputs[2 * i], inputs[2 * i + 1])`. `inputs.len()` must be even.
+    ///
+    /// Implementations must match [`Hasher::two_to_one`] exactly, down to the in-memory
+    /// representation of every digest.
+    fn two_to_one_batch(inputs: &[Self::Hash]) -> Vec<Self::Hash> {
+        assert_eq!(
+            inputs.len() % 2,
+            0,
+            "two_to_one_batch needs an even number of inputs"
+        );
+        inputs
+            .chunks_exact(2)
+            .map(|pair| Self::two_to_one(pair[0], pair[1]))
+            .collect()
+    }
 }
 
 /// Trait for algebraic hash functions, built from a permutation using the sponge construction.
