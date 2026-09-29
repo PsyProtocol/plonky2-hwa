@@ -42,6 +42,14 @@ rkyv = { workspace = true, optional = true }
 speedy = { workspace = true, optional = true }
 bytemuck = { workspace = true, optional = true }
 
+[dev-dependencies]
+criterion = { version = "0.5.1", default-features = false }
+rayon = "1"
+
+[[bench]]
+name = "fft_fusion"
+harness = false
+required-features = ["fft-reference"]
 
 # Display math equations properly in documentation
 [package.metadata.docs.rs]
