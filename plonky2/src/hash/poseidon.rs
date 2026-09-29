@@ -5,6 +5,7 @@
 use alloc::{vec, vec::Vec};
 use core::fmt::Debug;
 
+use plonky2_field::packable::Packable;
 use plonky2_field::packed::PackedField;
 use unroll::unroll_for_loops;
 
@@ -13,7 +14,7 @@ use crate::field::types::{Field, PrimeField64};
 use crate::gates::gate::Gate;
 use crate::gates::poseidon::PoseidonGate;
 use crate::gates::poseidon_mds::PoseidonMdsGate;
-use crate::hash::hash_types::{HashOut, RichField};
+use crate::hash::hash_types::{HashOut, RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::{compress, hash_n_to_hash_no_pad, PlonkyPermutation};
 use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::target::{BoolTarget, Target};
@@ -799,6 +800,310 @@ pub trait Poseidon: PrimeField64 {
 
         state
     }
+
+    // Lane-parallel permutation over a `PackedField` whose scalar is `Self`.
+    //
+    // Unlike the `*_packed_field` helpers above (which evaluate gate constraints over packed
+    // extension-field values), these run the permutation itself: lane `i` of the output is
+    // `Self::poseidon` of lane `i` of the input, as a field value. The in-memory representation of
+    // a lane may differ from what `Self::poseidon` returns when that value has two u64
+    // representations; callers that store the result must canonicalize (see
+    // `hash_or_noop_batch_packed`).
+
+    /// `constant_layer` on every lane.
+    #[inline(always)]
+    fn constant_layer_packed<P: PackedField<Scalar = Self>>(
+        state: &mut [P; SPONGE_WIDTH],
+        round_ctr: usize,
+    ) {
+        for i in 0..SPONGE_WIDTH {
+            state[i] += Self::from_canonical_u64(ALL_ROUND_CONSTANTS[i + SPONGE_WIDTH * round_ctr]);
+        }
+    }
+
+    /// `sbox_monomial` on every lane.
+    #[inline(always)]
+    fn sbox_monomial_packed<P: PackedField<Scalar = Self>>(x: P) -> P {
+        // x |--> x^7
+        let x2 = x.square();
+        let x4 = x2.square();
+        let x3 = x * x2;
+        x3 * x4
+    }
+
+    /// `sbox_layer` on every lane.
+    #[inline(always)]
+    fn sbox_layer_packed<P: PackedField<Scalar = Self>>(state: &mut [P; SPONGE_WIDTH]) {
+        for i in 0..SPONGE_WIDTH {
+            state[i] = Self::sbox_monomial_packed(state[i]);
+        }
+    }
+
+    /// `mds_layer` on every lane. Fields may override this with a faster lane-parallel version.
+    #[inline(always)]
+    fn mds_layer_packed<P: PackedField<Scalar = Self>>(
+        state: &[P; SPONGE_WIDTH],
+    ) -> [P; SPONGE_WIDTH] {
+        mds_layer_packed_generic::<Self, P>(state)
+    }
+
+    /// `partial_first_constant_layer` followed by `mds_partial_layer_init`, on every lane.
+    #[inline(always)]
+    fn partial_layer_init_packed<P: PackedField<Scalar = Self>>(
+        state: &[P; SPONGE_WIDTH],
+    ) -> [P; SPONGE_WIDTH] {
+        let mut state = *state;
+        for i in 0..SPONGE_WIDTH {
+            state[i] += Self::from_canonical_u64(Self::FAST_PARTIAL_FIRST_ROUND_CONSTANT[i]);
+        }
+
+        // Initial matrix has first row/column = [1, 0, ..., 0].
+        let mut result = [P::ZEROS; SPONGE_WIDTH];
+        result[0] = state[0];
+        for r in 1..SPONGE_WIDTH {
+            for c in 1..SPONGE_WIDTH {
+                let t =
+                    Self::from_canonical_u64(Self::FAST_PARTIAL_ROUND_INITIAL_MATRIX[r - 1][c - 1]);
+                result[c] += state[r] * t;
+            }
+        }
+        result
+    }
+
+    /// `mds_partial_layer_fast` on every lane.
+    #[inline(always)]
+    fn mds_partial_layer_fast_packed<P: PackedField<Scalar = Self>>(
+        state: &[P; SPONGE_WIDTH],
+        r: usize,
+    ) -> [P; SPONGE_WIDTH] {
+        let s0 = state[0];
+        let mds0to0 = Self::MDS_MATRIX_CIRC[0] + Self::MDS_MATRIX_DIAG[0];
+        let mut d = s0 * Self::from_canonical_u64(mds0to0);
+        for i in 1..SPONGE_WIDTH {
+            d += state[i] * Self::from_canonical_u64(Self::FAST_PARTIAL_ROUND_W_HATS[r][i - 1]);
+        }
+
+        // result = [d] concat [state[0] * v + state[shift up by 1]]
+        let mut result = [P::ZEROS; SPONGE_WIDTH];
+        result[0] = d;
+        for i in 1..SPONGE_WIDTH {
+            result[i] =
+                state[i] + s0 * Self::from_canonical_u64(Self::FAST_PARTIAL_ROUND_VS[r][i - 1]);
+        }
+        result
+    }
+
+    /// `full_rounds` on every lane.
+    #[inline]
+    fn full_rounds_packed<P: PackedField<Scalar = Self>>(
+        state: &mut [P; SPONGE_WIDTH],
+        round_ctr: &mut usize,
+    ) {
+        for _ in 0..HALF_N_FULL_ROUNDS {
+            Self::constant_layer_packed(state, *round_ctr);
+            Self::sbox_layer_packed(state);
+            *state = Self::mds_layer_packed(state);
+            *round_ctr += 1;
+        }
+    }
+
+    /// `partial_rounds` on every lane, using the same fast-partial-round decomposition.
+    #[inline]
+    fn partial_rounds_packed<P: PackedField<Scalar = Self>>(
+        state: &mut [P; SPONGE_WIDTH],
+        round_ctr: &mut usize,
+    ) {
+        *state = Self::partial_layer_init_packed(state);
+        for i in 0..N_PARTIAL_ROUNDS {
+            state[0] = Self::sbox_monomial_packed(state[0]);
+            state[0] += Self::from_canonical_u64(Self::FAST_PARTIAL_ROUND_CONSTANTS[i]);
+            *state = Self::mds_partial_layer_fast_packed(state, i);
+        }
+        *round_ctr += N_PARTIAL_ROUNDS;
+    }
+
+    /// Runs `P::WIDTH` independent permutations, one per lane. Lane `i` of the result has the
+    /// same field value as `Self::poseidon` applied to lane `i` of `input`, for any (possibly
+    /// non-canonical) input representation.
+    #[inline]
+    fn poseidon_packed<P: PackedField<Scalar = Self>>(
+        input: [P; SPONGE_WIDTH],
+    ) -> [P; SPONGE_WIDTH] {
+        poseidon_packed_generic::<Self, P>(input)
+    }
+}
+
+/// Field-generic body of `Poseidon::poseidon_packed`, built from the `*_packed` round helpers.
+#[inline]
+pub(crate) fn poseidon_packed_generic<F: Poseidon, P: PackedField<Scalar = F>>(
+    input: [P; SPONGE_WIDTH],
+) -> [P; SPONGE_WIDTH] {
+    let mut state = input;
+    let mut round_ctr = 0;
+
+    F::full_rounds_packed(&mut state, &mut round_ctr);
+    F::partial_rounds_packed(&mut state, &mut round_ctr);
+    F::full_rounds_packed(&mut state, &mut round_ctr);
+    debug_assert_eq!(round_ctr, N_ROUNDS);
+
+    state
+}
+
+/// Field-generic `mds_layer` on every lane of a packed state, using packed multiplications by
+/// the (small) MDS coefficients.
+#[inline(always)]
+pub(crate) fn mds_layer_packed_generic<F: Poseidon, P: PackedField<Scalar = F>>(
+    state: &[P; SPONGE_WIDTH],
+) -> [P; SPONGE_WIDTH] {
+    let mut result = [P::ZEROS; SPONGE_WIDTH];
+    for r in 0..SPONGE_WIDTH {
+        let mut res = state[r] * F::from_canonical_u64(F::MDS_MATRIX_DIAG[r]);
+        for i in 0..SPONGE_WIDTH {
+            res += state[(i + r) % SPONGE_WIDTH] * F::from_canonical_u64(F::MDS_MATRIX_CIRC[i]);
+        }
+        result[r] = res;
+    }
+    result
+}
+
+/// Converts the first `NUM_HASH_OUT_ELTS` elements of a permutation output (known only by value)
+/// into the digest that the scalar code would have produced, or `None` when that cannot be decided
+/// from the value alone.
+///
+/// A field element is stored as a `u64` congruent to its value, not necessarily reduced. A value
+/// `v` has a second `u64` representation `v + p` only when `v < 2^64 - p` (for Goldilocks,
+/// `v < 2^32 - 1`). Any other value has exactly one representation, so the scalar
+/// permutation's output is bit-for-bit `v`. For the rare ambiguous values the caller recomputes
+/// the digest with the scalar code. `ambiguous_below` is `2^64 - p` in production; tests raise it
+/// to exercise that fallback.
+#[inline(always)]
+pub(crate) fn digest_from_values<F: RichField>(
+    elements: [F; NUM_HASH_OUT_ELTS],
+    ambiguous_below: u64,
+) -> Option<HashOut<F>> {
+    let mut out = [F::ZERO; NUM_HASH_OUT_ELTS];
+    for i in 0..NUM_HASH_OUT_ELTS {
+        let c = elements[i].to_canonical_u64();
+        if c < ambiguous_below {
+            return None;
+        }
+        out[i] = F::from_canonical_u64(c);
+    }
+    Some(HashOut { elements: out })
+}
+
+/// Lower bound (exclusive of ambiguity) used by `digest_from_values` in production: values below
+/// `2^64 - p` have two `u64` representations.
+#[inline(always)]
+fn ambiguous_below<F: RichField>() -> u64 {
+    F::ORDER.wrapping_neg()
+}
+
+/// `PoseidonHash::hash_or_noop` for many inputs, `P::WIDTH` at a time. Bit-for-bit identical to
+/// the scalar function for every input.
+pub fn hash_or_noop_batch_packed<F: RichField, P: PackedField<Scalar = F>>(
+    inputs: &[Vec<F>],
+) -> Vec<HashOut<F>> {
+    hash_or_noop_batch_packed_with::<F, P>(inputs, ambiguous_below::<F>())
+}
+
+pub(crate) fn hash_or_noop_batch_packed_with<F: RichField, P: PackedField<Scalar = F>>(
+    inputs: &[Vec<F>],
+    ambiguous_below: u64,
+) -> Vec<HashOut<F>> {
+    let width = P::WIDTH;
+    let mut out = Vec::with_capacity(inputs.len());
+    for group in inputs.chunks(width) {
+        let len = group[0].len();
+        // `hash_or_noop` leaves inputs of at most NUM_HASH_OUT_ELTS elements unhashed, and a
+        // group can only share one sponge schedule if every input has the same length.
+        let batchable = group.len() == width
+            && len > NUM_HASH_OUT_ELTS
+            && group.iter().all(|input| input.len() == len);
+        if !batchable {
+            out.extend(
+                group
+                    .iter()
+                    .map(|input| <PoseidonHash as Hasher<F>>::hash_or_noop(input)),
+            );
+            continue;
+        }
+
+        // Mirrors `hash_n_to_m_no_pad` with `num_outputs = NUM_HASH_OUT_ELTS <= SPONGE_RATE`:
+        // zero state, overwrite-mode absorption of RATE-sized chunks, one permutation per chunk,
+        // and no extra permutation when squeezing.
+        let mut state = [P::ZEROS; SPONGE_WIDTH];
+        let mut start = 0;
+        while start < len {
+            let end = core::cmp::min(start + SPONGE_RATE, len);
+            for (lane, input) in group.iter().enumerate() {
+                for (k, &x) in input[start..end].iter().enumerate() {
+                    state[k].as_slice_mut()[lane] = x;
+                }
+            }
+            state = F::poseidon_packed(state);
+            start = end;
+        }
+
+        for (lane, input) in group.iter().enumerate() {
+            let elements = core::array::from_fn(|i| state[i].as_slice()[lane]);
+            out.push(
+                digest_from_values(elements, ambiguous_below)
+                    .unwrap_or_else(|| <PoseidonHash as Hasher<F>>::hash_or_noop(input)),
+            );
+        }
+    }
+    out
+}
+
+/// `PoseidonHash::two_to_one` for consecutive pairs of `inputs`, `P::WIDTH` pairs at a time.
+/// Bit-for-bit identical to the scalar function for every input.
+pub fn two_to_one_batch_packed<F: RichField, P: PackedField<Scalar = F>>(
+    inputs: &[HashOut<F>],
+) -> Vec<HashOut<F>> {
+    two_to_one_batch_packed_with::<F, P>(inputs, ambiguous_below::<F>())
+}
+
+pub(crate) fn two_to_one_batch_packed_with<F: RichField, P: PackedField<Scalar = F>>(
+    inputs: &[HashOut<F>],
+    ambiguous_below: u64,
+) -> Vec<HashOut<F>> {
+    assert_eq!(
+        inputs.len() % 2,
+        0,
+        "two_to_one_batch needs an even number of inputs"
+    );
+    let width = P::WIDTH;
+    let mut out = Vec::with_capacity(inputs.len() / 2);
+    for group in inputs.chunks(2 * width) {
+        if group.len() != 2 * width {
+            out.extend(
+                group
+                    .chunks_exact(2)
+                    .map(|pair| <PoseidonHash as Hasher<F>>::two_to_one(pair[0], pair[1])),
+            );
+            continue;
+        }
+
+        // Mirrors `compress`: [left || right || 0] -> permute -> first NUM_HASH_OUT_ELTS.
+        let mut state = [P::ZEROS; SPONGE_WIDTH];
+        for (lane, pair) in group.chunks_exact(2).enumerate() {
+            for k in 0..NUM_HASH_OUT_ELTS {
+                state[k].as_slice_mut()[lane] = pair[0].elements[k];
+                state[NUM_HASH_OUT_ELTS + k].as_slice_mut()[lane] = pair[1].elements[k];
+            }
+        }
+        state = F::poseidon_packed(state);
+
+        for (lane, pair) in group.chunks_exact(2).enumerate() {
+            let elements = core::array::from_fn(|i| state[i].as_slice()[lane]);
+            out.push(
+                digest_from_values(elements, ambiguous_below)
+                    .unwrap_or_else(|| <PoseidonHash as Hasher<F>>::two_to_one(pair[0], pair[1])),
+            );
+        }
+    }
+    out
 }
 
 #[derive(Copy, Clone, Default, Debug, PartialEq)]
@@ -883,6 +1188,32 @@ impl<F: RichField> Hasher<F> for PoseidonHash {
 
     fn two_to_one(left: Self::Hash, right: Self::Hash) -> Self::Hash {
         compress::<F, Self::Permutation>(left, right)
+    }
+
+    const BATCH_WIDTH: usize = <<F as Packable>::Packing as PackedField>::WIDTH;
+
+    fn hash_or_noop_batch(inputs: &[Vec<F>]) -> Vec<Self::Hash> {
+        if <Self as Hasher<F>>::BATCH_WIDTH > 1 {
+            hash_or_noop_batch_packed::<F, <F as Packable>::Packing>(inputs)
+        } else {
+            inputs.iter().map(|x| Self::hash_or_noop(x)).collect()
+        }
+    }
+
+    fn two_to_one_batch(inputs: &[Self::Hash]) -> Vec<Self::Hash> {
+        if <Self as Hasher<F>>::BATCH_WIDTH > 1 {
+            two_to_one_batch_packed::<F, <F as Packable>::Packing>(inputs)
+        } else {
+            assert_eq!(
+                inputs.len() % 2,
+                0,
+                "two_to_one_batch needs an even number of inputs"
+            );
+            inputs
+                .chunks_exact(2)
+                .map(|pair| Self::two_to_one(pair[0], pair[1]))
+                .collect()
+        }
     }
 }
 

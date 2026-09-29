@@ -4,11 +4,16 @@
 //! `poseidon_constants.sage` script in the `0xPolygonZero/hash-constants`
 //! repository.
 
+use core::simd::Simd;
+
+use plonky2_field::packed::PackedField;
 #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
 use plonky2_field::types::Field;
 
 use crate::field::goldilocks_field::GoldilocksField;
-use crate::hash::poseidon::{Poseidon, N_PARTIAL_ROUNDS};
+use crate::hash::poseidon::{
+    mds_layer_packed_generic, poseidon_packed_generic, Poseidon, N_PARTIAL_ROUNDS,
+};
 
 #[rustfmt::skip]
 impl Poseidon for GoldilocksField {
@@ -302,6 +307,384 @@ impl Poseidon for GoldilocksField {
             crate::hash::arch::aarch64::poseidon_goldilocks_neon::mds_layer(state)
         }
     }
+
+    #[inline]
+    fn poseidon_packed<P: PackedField<Scalar = Self>>(input: [P; 12]) -> [P; 12] {
+        match P::WIDTH {
+            1 => poseidon12_mds_lanes::poseidon::<P, Simd<u64, 1>, 1>(input),
+            2 => poseidon12_mds_lanes::poseidon::<P, Simd<u64, 2>, 2>(input),
+            4 => poseidon12_mds_lanes::poseidon::<P, Simd<u64, 4>, 4>(input),
+            8 => poseidon12_mds_lanes::poseidon::<P, Simd<u64, 8>, 8>(input),
+            16 => poseidon12_mds_lanes::poseidon::<P, Simd<u64, 16>, 16>(input),
+            _ => poseidon_packed_generic::<Self, P>(input),
+        }
+    }
+
+    #[inline(always)]
+    fn mds_layer_packed<P: PackedField<Scalar = Self>>(state: &[P; 12]) -> [P; 12] {
+        match P::WIDTH {
+            1 => poseidon12_mds_lanes::mds_layer::<P, Simd<u64, 1>, 1>(state),
+            2 => poseidon12_mds_lanes::mds_layer::<P, Simd<u64, 2>, 2>(state),
+            4 => poseidon12_mds_lanes::mds_layer::<P, Simd<u64, 4>, 4>(state),
+            8 => poseidon12_mds_lanes::mds_layer::<P, Simd<u64, 8>, 8>(state),
+            16 => poseidon12_mds_lanes::mds_layer::<P, Simd<u64, 16>, 16>(state),
+            _ => mds_layer_packed_generic::<Self, P>(state),
+        }
+    }
+}
+
+/// Lane-parallel Poseidon permutation for `W` states held in the lanes of a `PackedField`.
+///
+/// The S-boxes use the packed field multiplication. The MDS layer is the frequency-domain
+/// algorithm of `poseidon12_mds` (adapted from winterfell), run on each lane's 32-bit halves with
+/// plain 64-bit integer vector operations (`core::simd`), so it maps to vector instructions of
+/// width `W` whatever the target features.
+///
+/// Every lane has the same field value as the scalar code: the MDS layer computes the same exact
+/// integer row sums as `mds_layer` and reduces them modulo p. Integer arithmetic wraps modulo
+/// 2^64 (the frequency-domain algorithm's signed intermediates are handled in two's complement);
+/// since each exact row sum is a non-negative integer below 2^64, wrapping cannot change it.
+pub(crate) mod poseidon12_mds_lanes {
+    use core::ops::{Add, Sub};
+    use core::simd::cmp::SimdPartialOrd;
+    use core::simd::Simd;
+
+    use plonky2_field::packed::PackedField;
+
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::Field;
+    use crate::hash::poseidon::{
+        Poseidon, ALL_ROUND_CONSTANTS, HALF_N_FULL_ROUNDS, N_PARTIAL_ROUNDS, N_ROUNDS,
+    };
+
+    const EPSILON: u64 = 0xffff_ffff;
+
+    const MDS_FREQ_BLOCK_ONE: [i64; 3] = [16, 32, 16];
+    const MDS_FREQ_BLOCK_TWO: [(i64, i64); 3] = [(2, -1), (-4, 1), (16, 1)];
+    const MDS_FREQ_BLOCK_THREE: [i64; 3] = [-1, -8, 2];
+
+    /// `W` lanes of 64-bit integers with wrapping arithmetic.
+    pub(crate) trait Lanes<const W: usize>:
+        Copy + Add<Output = Self> + Sub<Output = Self>
+    {
+        fn splat(x: u64) -> Self;
+        fn load(x: &[u64; W]) -> Self;
+        fn store(self) -> [u64; W];
+        fn negate(self) -> Self;
+        /// Multiplication by a (small, compile-time) constant.
+        fn mul_const(self, c: i64) -> Self;
+        fn low_32(self) -> Self;
+        fn high_32(self) -> Self;
+        fn shl_32(self) -> Self;
+        /// `EPSILON` in the lanes where `self + rhs` wraps around 2^64, else 0, and the wrapped
+        /// sum.
+        fn add_carry_epsilon(self, rhs: Self) -> (Self, Self);
+    }
+
+    macro_rules! impl_lanes {
+        ($($w:literal),*) => {$(
+            impl Lanes<$w> for Simd<u64, $w> {
+                #[inline(always)]
+                fn splat(x: u64) -> Self {
+                    Simd::splat(x)
+                }
+                #[inline(always)]
+                fn load(x: &[u64; $w]) -> Self {
+                    Simd::from_array(*x)
+                }
+                #[inline(always)]
+                fn store(self) -> [u64; $w] {
+                    self.to_array()
+                }
+                #[inline(always)]
+                fn negate(self) -> Self {
+                    Simd::splat(0) - self
+                }
+                #[inline(always)]
+                fn mul_const(self, c: i64) -> Self {
+                    self * Simd::splat(c as u64)
+                }
+                #[inline(always)]
+                fn low_32(self) -> Self {
+                    self & Simd::splat(EPSILON)
+                }
+                #[inline(always)]
+                fn high_32(self) -> Self {
+                    self >> 32
+                }
+                #[inline(always)]
+                fn shl_32(self) -> Self {
+                    self << 32
+                }
+                #[inline(always)]
+                fn add_carry_epsilon(self, rhs: Self) -> (Self, Self) {
+                    let sum = self + rhs;
+                    let carry = sum.simd_lt(self).select(Simd::splat(EPSILON), Simd::splat(0));
+                    (sum, carry)
+                }
+            }
+        )*};
+    }
+    impl_lanes!(1, 2, 4, 8, 16);
+
+    /// Views a packed state as `W` lanes of raw `u64` values.
+    #[inline(always)]
+    fn as_lanes<P: PackedField<Scalar = GoldilocksField>, const W: usize>(
+        state: &[P; 12],
+    ) -> &[[u64; W]; 12] {
+        assert_eq!(P::WIDTH, W);
+        assert_eq!(
+            core::mem::size_of::<[P; 12]>(),
+            core::mem::size_of::<[[u64; W]; 12]>()
+        );
+        // SAFETY: `PackedField` guarantees that `P` can be cast to `[P::Scalar; P::WIDTH]`,
+        // `GoldilocksField` is `repr(transparent)` over `u64`, and the sizes match (checked
+        // above). `P` holds `u64` lanes, so its alignment is at least that of `u64`.
+        unsafe { &*(state as *const [P; 12]).cast::<[[u64; W]; 12]>() }
+    }
+
+    /// Inverse of `as_lanes`.
+    #[inline(always)]
+    fn from_lanes<P: PackedField<Scalar = GoldilocksField>, const W: usize>(
+        lanes: [[u64; W]; 12],
+    ) -> [P; 12] {
+        assert_eq!(P::WIDTH, W);
+        assert_eq!(
+            core::mem::size_of::<[P; 12]>(),
+            core::mem::size_of::<[[u64; W]; 12]>()
+        );
+        // SAFETY: as in `as_lanes`; `read_unaligned` does not rely on the alignment of `lanes`.
+        unsafe { core::ptr::read_unaligned(lanes.as_ptr().cast::<[P; 12]>()) }
+    }
+
+    /// `mds_layer` on every lane.
+    #[inline(always)]
+    pub(crate) fn mds_layer<P, L, const W: usize>(state: &[P; 12]) -> [P; 12]
+    where
+        P: PackedField<Scalar = GoldilocksField>,
+        L: Lanes<W>,
+    {
+        let x: [L; 12] = core::array::from_fn(|r| L::load(&as_lanes::<P, W>(state)[r]));
+        from_lanes::<P, W>(mds_layer_lanes(x, &[0; 12]).map(L::store))
+    }
+
+    /// Computes, for every lane, `mds_layer(x)` plus `constants` added to the row sums before
+    /// reduction, as raw (possibly non-canonical) values. Adding the next round's constants here
+    /// saves a separate field addition.
+    #[inline(always)]
+    pub(crate) fn mds_layer_lanes<L: Lanes<W>, const W: usize>(
+        x: [L; 12],
+        constants: &[u64; 12],
+    ) -> [L; 12] {
+        let lo_in = x.map(L::low_32);
+        let hi_in = x.map(L::high_32);
+
+        let lo = mds_multiply_freq(lo_in);
+        let hi = mds_multiply_freq(hi_in);
+
+        core::array::from_fn(|r| {
+            // Diagonal part (only `MDS_MATRIX_DIAG[0]` is non-zero) and the constants, split
+            // into halves like the inputs.
+            let d = <GoldilocksField as Poseidon>::MDS_MATRIX_DIAG[r] as i64;
+            let mut l_sum = lo[r] + L::splat(constants[r] & EPSILON);
+            let mut h_sum = hi[r] + L::splat(constants[r] >> 32);
+            if d != 0 {
+                l_sum = l_sum + lo_in[r].mul_const(d);
+                h_sum = h_sum + hi_in[r].mul_const(d);
+            }
+
+            // The row is l_sum + h_sum * 2^32 with 0 <= l_sum, h_sum < 2^41 (sums of at most
+            // 256 + 8 + 1 terms below 2^32). With h_sum = h1 * 2^32 + h0 and
+            // 2^64 = EPSILON (mod p):
+            //   l_sum + h_sum * 2^32 = (l_sum + h1 * EPSILON) + h0 * 2^32   (mod p),
+            // where the first term is below 2^42. The sum can wrap around 2^64 at most once; a
+            // wrap is folded back in by adding EPSILON, which cannot wrap again since the wrapped
+            // sum is below 2^42.
+            let h0 = h_sum.low_32();
+            let h1 = h_sum.high_32();
+            let a = l_sum + (h1.shl_32() - h1);
+            let (res, carry) = a.add_carry_epsilon(h0.shl_32());
+            res + carry
+        })
+    }
+
+    #[inline(always)]
+    fn sbox<P: PackedField<Scalar = GoldilocksField>>(x: P) -> P {
+        // x |--> x^7
+        let x2 = x.square();
+        let x4 = x2.square();
+        let x3 = x * x2;
+        x3 * x4
+    }
+
+    /// One round: S-boxes (all of them, or only the first for a partial round), then the MDS
+    /// layer with the next round's constants folded in.
+    #[inline(always)]
+    fn round<P, L, const W: usize>(state: &mut [P; 12], round: usize, full: bool)
+    where
+        P: PackedField<Scalar = GoldilocksField>,
+        L: Lanes<W>,
+    {
+        if full {
+            for i in 0..12 {
+                state[i] = sbox(state[i]);
+            }
+        } else {
+            state[0] = sbox(state[0]);
+        }
+        let x: [L; 12] = core::array::from_fn(|r| L::load(&as_lanes::<P, W>(state)[r]));
+        let y = mds_layer_lanes(x, &NEXT_ROUND_CONSTANTS[round]);
+        *state = from_lanes::<P, W>(y.map(L::store));
+    }
+
+    /// The Poseidon permutation on every lane, with the partial rounds in their original
+    /// (naive) form: with an MDS layer made of cheap integer operations, one S-box and one MDS
+    /// layer per partial round cost less than the 22 full multiplications per round of the
+    /// sparse "fast partial rounds" form. Round constants are folded into the preceding MDS
+    /// layer.
+    #[inline(always)]
+    pub(crate) fn poseidon<P, L, const W: usize>(input: [P; 12]) -> [P; 12]
+    where
+        P: PackedField<Scalar = GoldilocksField>,
+        L: Lanes<W>,
+    {
+        let mut state = input;
+        for i in 0..12 {
+            state[i] += GoldilocksField::from_canonical_u64(ALL_ROUND_CONSTANTS[i]);
+        }
+        for r in 0..HALF_N_FULL_ROUNDS {
+            round::<P, L, W>(&mut state, r, true);
+        }
+        for r in HALF_N_FULL_ROUNDS..HALF_N_FULL_ROUNDS + N_PARTIAL_ROUNDS {
+            round::<P, L, W>(&mut state, r, false);
+        }
+        for r in HALF_N_FULL_ROUNDS + N_PARTIAL_ROUNDS..N_ROUNDS {
+            round::<P, L, W>(&mut state, r, true);
+        }
+        state
+    }
+
+    /// Entry `r` holds the round constants of round `r + 1` (zero after the last round), which
+    /// the MDS layer of round `r` adds.
+    const NEXT_ROUND_CONSTANTS: [[u64; 12]; N_ROUNDS] = {
+        let mut table = [[0u64; 12]; N_ROUNDS];
+        let mut round = 0;
+        while round + 1 < N_ROUNDS {
+            let mut i = 0;
+            while i < 12 {
+                table[round][i] = ALL_ROUND_CONSTANTS[12 * (round + 1) + i];
+                i += 1;
+            }
+            round += 1;
+        }
+        table
+    };
+
+    #[inline(always)]
+    fn mds_multiply_freq<L: Lanes<W>, const W: usize>(state: [L; 12]) -> [L; 12] {
+        let [s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11] = state;
+
+        let (u0, u1, u2) = fft4_real([s0, s3, s6, s9]);
+        let (u4, u5, u6) = fft4_real([s1, s4, s7, s10]);
+        let (u8, u9, u10) = fft4_real([s2, s5, s8, s11]);
+
+        let [v0, v4, v8] = block1([u0, u4, u8], MDS_FREQ_BLOCK_ONE);
+        let [v1, v5, v9] = block2([u1, u5, u9], MDS_FREQ_BLOCK_TWO);
+        let [v2, v6, v10] = block3([u2, u6, u10], MDS_FREQ_BLOCK_THREE);
+
+        let [s0, s3, s6, s9] = ifft4_real_unreduced((v0, v1, v2));
+        let [s1, s4, s7, s10] = ifft4_real_unreduced((v4, v5, v6));
+        let [s2, s5, s8, s11] = ifft4_real_unreduced((v8, v9, v10));
+
+        [s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11]
+    }
+
+    #[inline(always)]
+    fn block1<L: Lanes<W>, const W: usize>(x: [L; 3], y: [i64; 3]) -> [L; 3] {
+        let [x0, x1, x2] = x;
+        let [y0, y1, y2] = y;
+        let z0 = x0.mul_const(y0) + x1.mul_const(y2) + x2.mul_const(y1);
+        let z1 = x0.mul_const(y1) + x1.mul_const(y0) + x2.mul_const(y2);
+        let z2 = x0.mul_const(y2) + x1.mul_const(y1) + x2.mul_const(y0);
+        [z0, z1, z2]
+    }
+
+    #[inline(always)]
+    fn block2<L: Lanes<W>, const W: usize>(x: [(L, L); 3], y: [(i64, i64); 3]) -> [(L, L); 3] {
+        let [(x0r, x0i), (x1r, x1i), (x2r, x2i)] = x;
+        let [(y0r, y0i), (y1r, y1i), (y2r, y2i)] = y;
+        let x0s = x0r + x0i;
+        let x1s = x1r + x1i;
+        let x2s = x2r + x2i;
+        let y0s = y0r + y0i;
+        let y1s = y1r + y1i;
+        let y2s = y2r + y2i;
+
+        // Compute x0 y0 - i x1 y2 - i x2 y1 using Karatsuba for complex numbers multiplication
+        let m0 = (x0r.mul_const(y0r), x0i.mul_const(y0i));
+        let m1 = (x1r.mul_const(y2r), x1i.mul_const(y2i));
+        let m2 = (x2r.mul_const(y1r), x2i.mul_const(y1i));
+        let z0r =
+            (m0.0 - m0.1) + (x1s.mul_const(y2s) - m1.0 - m1.1) + (x2s.mul_const(y1s) - m2.0 - m2.1);
+        let z0i = (x0s.mul_const(y0s) - m0.0 - m0.1) + (m1.1 - m1.0) + (m2.1 - m2.0);
+        let z0 = (z0r, z0i);
+
+        // Compute x0 y1 + x1 y0 - i x2 y2 using Karatsuba for complex numbers multiplication
+        let m0 = (x0r.mul_const(y1r), x0i.mul_const(y1i));
+        let m1 = (x1r.mul_const(y0r), x1i.mul_const(y0i));
+        let m2 = (x2r.mul_const(y2r), x2i.mul_const(y2i));
+        let z1r = (m0.0 - m0.1) + (m1.0 - m1.1) + (x2s.mul_const(y2s) - m2.0 - m2.1);
+        let z1i =
+            (x0s.mul_const(y1s) - m0.0 - m0.1) + (x1s.mul_const(y0s) - m1.0 - m1.1) + (m2.1 - m2.0);
+        let z1 = (z1r, z1i);
+
+        // Compute x0 y2 + x1 y1 + x2 y0 using Karatsuba for complex numbers multiplication
+        let m0 = (x0r.mul_const(y2r), x0i.mul_const(y2i));
+        let m1 = (x1r.mul_const(y1r), x1i.mul_const(y1i));
+        let m2 = (x2r.mul_const(y0r), x2i.mul_const(y0i));
+        let z2r = (m0.0 - m0.1) + (m1.0 - m1.1) + (m2.0 - m2.1);
+        let z2i = (x0s.mul_const(y2s) - m0.0 - m0.1)
+            + (x1s.mul_const(y1s) - m1.0 - m1.1)
+            + (x2s.mul_const(y0s) - m2.0 - m2.1);
+        let z2 = (z2r, z2i);
+
+        [z0, z1, z2]
+    }
+
+    #[inline(always)]
+    fn block3<L: Lanes<W>, const W: usize>(x: [L; 3], y: [i64; 3]) -> [L; 3] {
+        let [x0, x1, x2] = x;
+        let [y0, y1, y2] = y;
+        let z0 = x0.mul_const(y0) - x1.mul_const(y2) - x2.mul_const(y1);
+        let z1 = x0.mul_const(y1) + x1.mul_const(y0) - x2.mul_const(y2);
+        let z2 = x0.mul_const(y2) + x1.mul_const(y1) + x2.mul_const(y0);
+        [z0, z1, z2]
+    }
+
+    /// Real 4-FFT.
+    #[inline(always)]
+    fn fft4_real<L: Lanes<W>, const W: usize>(x: [L; 4]) -> (L, (L, L), L) {
+        let (z0, z2) = (x[0] + x[2], x[0] - x[2]);
+        let (z1, z3) = (x[1] + x[3], x[1] - x[3]);
+        let y0 = z0 + z1;
+        let y1 = (z2, z3.negate());
+        let y2 = z0 - z1;
+        (y0, y1, y2)
+    }
+
+    /// Real 4-iFFT. Division by four to complete the inverse FFT is not performed here.
+    #[inline(always)]
+    fn ifft4_real_unreduced<L: Lanes<W>, const W: usize>(y: (L, (L, L), L)) -> [L; 4] {
+        let z0 = y.0 + y.2;
+        let z1 = y.0 - y.2;
+        let z2 = y.1 .0;
+        let z3 = y.1 .1.negate();
+
+        let (x0, x2) = (z0 + z2, z0 - z2);
+        let (x1, x3) = (z1 + z3, z1 - z3);
+
+        [x0, x1, x2, x3]
+    }
 }
 
 // MDS layer helper methods
@@ -492,5 +875,494 @@ mod tests {
     #[test]
     fn consistency() {
         check_consistency::<F>();
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod packed_tests {
+    #[cfg(not(feature = "std"))]
+    use alloc::{vec, vec::Vec};
+
+    use plonky2_field::packable::Packable;
+    use plonky2_field::packed::PackedField;
+    use rand::{Rng, SeedableRng};
+    use rand_chacha::ChaCha8Rng;
+
+    use super::poseidon12_mds_lanes;
+    use crate::field::goldilocks_field::GoldilocksField as F;
+    use crate::field::types::{Field, Field64, Sample};
+    use crate::hash::hash_types::HashOut;
+    use crate::hash::poseidon::{
+        digest_from_values, hash_or_noop_batch_packed, hash_or_noop_batch_packed_with,
+        mds_layer_packed_generic, poseidon_packed_generic, two_to_one_batch_packed,
+        two_to_one_batch_packed_with, Poseidon, PoseidonHash, SPONGE_WIDTH,
+    };
+    use crate::plonk::config::Hasher;
+
+    type Packed = <F as Packable>::Packing;
+
+    /// A portable `PackedField` of any width, with lane-wise scalar arithmetic. It lets the
+    /// width-generic batch code run at widths this machine has no SIMD type for (the AVX-512
+    /// width 8 in particular).
+    #[derive(Copy, Clone, Debug)]
+    #[repr(transparent)]
+    pub(crate) struct ArrayPacked<const W: usize>(pub(crate) [F; W]);
+
+    impl<const W: usize> Default for ArrayPacked<W> {
+        fn default() -> Self {
+            Self([F::ZERO; W])
+        }
+    }
+
+    impl<const W: usize> From<F> for ArrayPacked<W> {
+        fn from(x: F) -> Self {
+            Self([x; W])
+        }
+    }
+
+    macro_rules! array_packed_binop {
+        ($tr:ident, $f:ident, $tra:ident, $fa:ident, $op:tt) => {
+            impl<const W: usize> core::ops::$tr<Self> for ArrayPacked<W> {
+                type Output = Self;
+                fn $f(self, rhs: Self) -> Self {
+                    Self(core::array::from_fn(|l| self.0[l] $op rhs.0[l]))
+                }
+            }
+            impl<const W: usize> core::ops::$tr<F> for ArrayPacked<W> {
+                type Output = Self;
+                fn $f(self, rhs: F) -> Self {
+                    Self(core::array::from_fn(|l| self.0[l] $op rhs))
+                }
+            }
+            impl<const W: usize> core::ops::$tr<ArrayPacked<W>> for F {
+                type Output = ArrayPacked<W>;
+                fn $f(self, rhs: ArrayPacked<W>) -> ArrayPacked<W> {
+                    ArrayPacked(core::array::from_fn(|l| self $op rhs.0[l]))
+                }
+            }
+            impl<const W: usize> core::ops::$tra<Self> for ArrayPacked<W> {
+                fn $fa(&mut self, rhs: Self) {
+                    *self = *self $op rhs;
+                }
+            }
+            impl<const W: usize> core::ops::$tra<F> for ArrayPacked<W> {
+                fn $fa(&mut self, rhs: F) {
+                    *self = *self $op rhs;
+                }
+            }
+        };
+    }
+    array_packed_binop!(Add, add, AddAssign, add_assign, +);
+    array_packed_binop!(Sub, sub, SubAssign, sub_assign, -);
+    array_packed_binop!(Mul, mul, MulAssign, mul_assign, *);
+
+    impl<const W: usize> core::ops::Div<F> for ArrayPacked<W> {
+        type Output = Self;
+        fn div(self, rhs: F) -> Self {
+            Self(core::array::from_fn(|l| self.0[l] / rhs))
+        }
+    }
+
+    impl<const W: usize> core::ops::Neg for ArrayPacked<W> {
+        type Output = Self;
+        fn neg(self) -> Self {
+            Self(core::array::from_fn(|l| -self.0[l]))
+        }
+    }
+
+    impl<const W: usize> core::iter::Sum for ArrayPacked<W> {
+        fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+            iter.fold(Self::default(), |a, b| a + b)
+        }
+    }
+
+    impl<const W: usize> core::iter::Product for ArrayPacked<W> {
+        fn product<I: Iterator<Item = Self>>(iter: I) -> Self {
+            iter.fold(Self::from(F::ONE), |a, b| a * b)
+        }
+    }
+
+    // SAFETY: `repr(transparent)` over `[F; W]`; W is a power of two wherever it is used.
+    unsafe impl<const W: usize> PackedField for ArrayPacked<W> {
+        type Scalar = F;
+        const WIDTH: usize = W;
+        const ZEROS: Self = Self([F::ZERO; W]);
+        const ONES: Self = Self([F::ONE; W]);
+
+        fn from_slice(slice: &[F]) -> &Self {
+            assert_eq!(slice.len(), W);
+            unsafe { &*slice.as_ptr().cast::<Self>() }
+        }
+        fn from_slice_mut(slice: &mut [F]) -> &mut Self {
+            assert_eq!(slice.len(), W);
+            unsafe { &mut *slice.as_mut_ptr().cast::<Self>() }
+        }
+        fn as_slice(&self) -> &[F] {
+            &self.0
+        }
+        fn as_slice_mut(&mut self) -> &mut [F] {
+            &mut self.0
+        }
+        fn interleave(&self, _other: Self, _block_len: usize) -> (Self, Self) {
+            unimplemented!("not used by the permutation tests")
+        }
+    }
+
+    const P: u64 = F::ORDER;
+    const EPSILON: u64 = 0xffff_ffff;
+
+    /// Raw `u64` values that stress reductions: small values, values around the field order,
+    /// non-canonical values in `[p, 2^64)`, and values around 2^32 and 2^63.
+    const EDGE_VALUES: [u64; 20] = [
+        0,
+        1,
+        2,
+        P - 1,
+        P - 2,
+        P,
+        P + 1,
+        P + 2,
+        u64::MAX,
+        u64::MAX - 1,
+        EPSILON - 1,
+        EPSILON,
+        EPSILON + 1,
+        1 << 32,
+        P - EPSILON,
+        1 << 63,
+        (1 << 63) - 1,
+        (1 << 63) + 1,
+        0xffff_fffe_0000_0000,
+        0x8000_0000_ffff_ffff,
+    ];
+
+    /// A field element with a raw (possibly non-canonical) representation.
+    pub(crate) fn random_raw(rng: &mut ChaCha8Rng) -> F {
+        match rng.gen_range(0..10) {
+            0..=3 => F::sample(rng),
+            4..=5 => F(EDGE_VALUES[rng.gen_range(0..EDGE_VALUES.len())]),
+            // Non-canonical: p + r with r < 2^32 - 1.
+            6..=7 => F(P + rng.gen_range(0..EPSILON)),
+            _ => F(rng.gen::<u64>()),
+        }
+    }
+
+    pub(crate) fn random_raw_vec(rng: &mut ChaCha8Rng, n: usize) -> Vec<F> {
+        (0..n).map(|_| random_raw(rng)).collect()
+    }
+
+    fn raw(h: &HashOut<F>) -> [u64; 4] {
+        h.elements.map(|x| x.0)
+    }
+
+    fn assert_same_digests(actual: &[HashOut<F>], expected: &[HashOut<F>], what: &str) {
+        assert_eq!(actual.len(), expected.len(), "{what}: length");
+        for (i, (a, e)) in actual.iter().zip(expected).enumerate() {
+            assert_eq!(raw(a), raw(e), "{what}: digest {i} differs");
+        }
+    }
+
+    fn pack<Pk: PackedField<Scalar = F>>(lanes: &[[F; SPONGE_WIDTH]]) -> [Pk; SPONGE_WIDTH] {
+        assert_eq!(lanes.len(), Pk::WIDTH);
+        let mut state = [Pk::ZEROS; SPONGE_WIDTH];
+        for (l, lane) in lanes.iter().enumerate() {
+            for i in 0..SPONGE_WIDTH {
+                state[i].as_slice_mut()[l] = lane[i];
+            }
+        }
+        state
+    }
+
+    fn lane<Pk: PackedField<Scalar = F>>(
+        state: &[Pk; SPONGE_WIDTH],
+        l: usize,
+    ) -> [F; SPONGE_WIDTH] {
+        core::array::from_fn(|i| state[i].as_slice()[l])
+    }
+
+    fn random_states(rng: &mut ChaCha8Rng, n: usize) -> Vec<[F; SPONGE_WIDTH]> {
+        let mut states = vec![
+            [F::ZERO; SPONGE_WIDTH],
+            [F(u64::MAX); SPONGE_WIDTH],
+            [F(P); SPONGE_WIDTH],
+            [F::NEG_ONE; SPONGE_WIDTH],
+            [F(P - 2); SPONGE_WIDTH],
+            [F::ONE; SPONGE_WIDTH],
+            core::array::from_fn(|i| F(i as u64)),
+        ];
+        for &v in EDGE_VALUES.iter() {
+            states.push([F(v); SPONGE_WIDTH]);
+        }
+        while states.len() < n {
+            states.push(core::array::from_fn(|_| random_raw(rng)));
+        }
+        states
+    }
+
+    fn check_packed_permutation<Pk: PackedField<Scalar = F>>(num_states: usize) {
+        let mut rng = ChaCha8Rng::seed_from_u64(0x5eed_0001);
+        let mut states = random_states(&mut rng, num_states);
+        while !states.len().is_multiple_of(Pk::WIDTH) {
+            states.push(core::array::from_fn(|_| random_raw(&mut rng)));
+        }
+        for group in states.chunks(Pk::WIDTH) {
+            let packed = pack::<Pk>(group);
+
+            let out = F::poseidon_packed(packed);
+            let out_generic = poseidon_packed_generic::<F, Pk>(packed);
+            let mds = F::mds_layer_packed(&packed);
+            let mds_generic = mds_layer_packed_generic::<F, Pk>(&packed);
+            for (l, input) in group.iter().enumerate() {
+                // Field equality is on canonical values.
+                assert_eq!(
+                    lane(&out, l),
+                    F::poseidon(*input),
+                    "poseidon_packed, input {input:?}"
+                );
+                assert_eq!(
+                    lane(&out_generic, l),
+                    F::poseidon(*input),
+                    "generic poseidon_packed, input {input:?}"
+                );
+                assert_eq!(
+                    lane(&mds, l),
+                    F::mds_layer(input),
+                    "mds_layer_packed, input {input:?}"
+                );
+                assert_eq!(
+                    lane(&mds_generic, l),
+                    F::mds_layer(input),
+                    "generic mds, input {input:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn packed_permutation_matches_scalar_width_1() {
+        check_packed_permutation::<F>(5000);
+    }
+
+    #[test]
+    fn packed_permutation_matches_scalar_native_width() {
+        check_packed_permutation::<Packed>(5000 * Packed::WIDTH);
+    }
+
+    #[test]
+    fn packed_permutation_matches_scalar_portable_widths() {
+        check_packed_permutation::<ArrayPacked<2>>(2000);
+        check_packed_permutation::<ArrayPacked<8>>(8000);
+        check_packed_permutation::<ArrayPacked<16>>(4000);
+    }
+
+    /// The integer MDS kernel at every supported width, including values that maximise the
+    /// row sums, with and without folded round constants.
+    #[test]
+    fn lane_mds_matches_scalar_all_widths() {
+        fn check<L: poseidon12_mds_lanes::Lanes<W>, const W: usize>(rng: &mut ChaCha8Rng) {
+            let mut states = random_states(rng, 400 * W);
+            while !states.len().is_multiple_of(W) {
+                states.push(core::array::from_fn(|_| random_raw(rng)));
+            }
+            let constant_sets: [[u64; 12]; 3] = [
+                [0; 12],
+                core::array::from_fn(|i| crate::hash::poseidon::ALL_ROUND_CONSTANTS[12 * 7 + i]),
+                [P - 1; 12],
+            ];
+            for group in states.chunks(W) {
+                let x: [L; 12] =
+                    core::array::from_fn(|r| L::load(&core::array::from_fn(|l| group[l][r].0)));
+                for constants in &constant_sets {
+                    let y = poseidon12_mds_lanes::mds_layer_lanes::<L, W>(x, constants);
+                    for (l, input) in group.iter().enumerate() {
+                        let expected = F::mds_layer(input);
+                        for r in 0..12 {
+                            let got = F(y[r].store()[l]);
+                            assert_eq!(
+                                got,
+                                expected[r] + F::from_canonical_u64(constants[r]),
+                                "width {W}, row {r}, input {input:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        use core::simd::Simd;
+        let mut rng = ChaCha8Rng::seed_from_u64(0x5eed_0005);
+        check::<Simd<u64, 1>, 1>(&mut rng);
+        check::<Simd<u64, 2>, 2>(&mut rng);
+        check::<Simd<u64, 4>, 4>(&mut rng);
+        check::<Simd<u64, 8>, 8>(&mut rng);
+        check::<Simd<u64, 16>, 16>(&mut rng);
+    }
+
+    fn batch_sizes(width: usize) -> Vec<usize> {
+        let mut sizes = vec![1, 2, 3, width, width + 1, 2 * width, 2 * width + 3, 17, 64];
+        if width > 1 {
+            sizes.push(width - 1);
+        }
+        sizes.sort_unstable();
+        sizes.dedup();
+        sizes
+    }
+
+    fn check_hash_or_noop_batch<Pk: PackedField<Scalar = F>>() {
+        let mut rng = ChaCha8Rng::seed_from_u64(0x5eed_0002);
+        let lengths: Vec<usize> = (0..=40).chain([135, 400]).collect();
+        for &len in &lengths {
+            for &n in &batch_sizes(Pk::WIDTH) {
+                let inputs: Vec<Vec<F>> = (0..n).map(|_| random_raw_vec(&mut rng, len)).collect();
+                let expected: Vec<HashOut<F>> = inputs
+                    .iter()
+                    .map(|x| PoseidonHash::hash_or_noop(x))
+                    .collect();
+
+                let what = format!("len {len}, batch {n}, width {}", Pk::WIDTH);
+                assert_same_digests(
+                    &hash_or_noop_batch_packed::<F, Pk>(&inputs),
+                    &expected,
+                    &what,
+                );
+                // Force the scalar fallback for about half / all of the lanes.
+                for bound in [1 << 63, u64::MAX] {
+                    assert_same_digests(
+                        &hash_or_noop_batch_packed_with::<F, Pk>(&inputs, bound),
+                        &expected,
+                        &format!("{what}, fallback bound {bound:#x}"),
+                    );
+                }
+            }
+        }
+
+        // Inputs of different lengths in one batch take the scalar path for that group.
+        let inputs: Vec<Vec<F>> = (0..(3 * Pk::WIDTH + 5))
+            .map(|i| random_raw_vec(&mut rng, 3 + (i * 7) % 20))
+            .collect();
+        let expected: Vec<HashOut<F>> = inputs
+            .iter()
+            .map(|x| PoseidonHash::hash_or_noop(x))
+            .collect();
+        assert_same_digests(
+            &hash_or_noop_batch_packed::<F, Pk>(&inputs),
+            &expected,
+            "mixed lengths",
+        );
+    }
+
+    #[test]
+    fn hash_or_noop_batch_matches_scalar_width_1() {
+        check_hash_or_noop_batch::<F>();
+    }
+
+    #[test]
+    fn hash_or_noop_batch_matches_scalar_native_width() {
+        check_hash_or_noop_batch::<Packed>();
+    }
+
+    #[test]
+    fn hash_or_noop_batch_matches_scalar_width_8() {
+        check_hash_or_noop_batch::<ArrayPacked<8>>();
+    }
+
+    #[test]
+    fn hasher_batch_methods_match_scalar() {
+        let mut rng = ChaCha8Rng::seed_from_u64(0x5eed_0003);
+        for len in [0, 3, 4, 5, 8, 9, 12, 135] {
+            for n in [0, 1, 7, 8, 9, 33] {
+                let inputs: Vec<Vec<F>> = (0..n).map(|_| random_raw_vec(&mut rng, len)).collect();
+                let expected: Vec<HashOut<F>> = inputs
+                    .iter()
+                    .map(|x| PoseidonHash::hash_or_noop(x))
+                    .collect();
+                assert_same_digests(
+                    &<PoseidonHash as Hasher<F>>::hash_or_noop_batch(&inputs),
+                    &expected,
+                    "Hasher::hash_or_noop_batch",
+                );
+                let pairs = if n % 2 == 0 {
+                    expected
+                } else {
+                    expected[1..].to_vec()
+                };
+                let expected_nodes: Vec<HashOut<F>> = pairs
+                    .chunks_exact(2)
+                    .map(|p| PoseidonHash::two_to_one(p[0], p[1]))
+                    .collect();
+                assert_same_digests(
+                    &<PoseidonHash as Hasher<F>>::two_to_one_batch(&pairs),
+                    &expected_nodes,
+                    "Hasher::two_to_one_batch",
+                );
+            }
+        }
+    }
+
+    fn random_raw_hash(rng: &mut ChaCha8Rng) -> HashOut<F> {
+        HashOut {
+            elements: core::array::from_fn(|_| random_raw(rng)),
+        }
+    }
+
+    fn check_two_to_one_batch<Pk: PackedField<Scalar = F>>() {
+        let mut rng = ChaCha8Rng::seed_from_u64(0x5eed_0004);
+        for &n in &batch_sizes(Pk::WIDTH) {
+            for _ in 0..50 {
+                let inputs: Vec<HashOut<F>> =
+                    (0..2 * n).map(|_| random_raw_hash(&mut rng)).collect();
+                let expected: Vec<HashOut<F>> = inputs
+                    .chunks_exact(2)
+                    .map(|p| PoseidonHash::two_to_one(p[0], p[1]))
+                    .collect();
+                let what = format!("pairs {n}, width {}", Pk::WIDTH);
+                assert_same_digests(&two_to_one_batch_packed::<F, Pk>(&inputs), &expected, &what);
+                for bound in [1 << 63, u64::MAX] {
+                    assert_same_digests(
+                        &two_to_one_batch_packed_with::<F, Pk>(&inputs, bound),
+                        &expected,
+                        &format!("{what}, fallback bound {bound:#x}"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn two_to_one_batch_matches_scalar_width_1() {
+        check_two_to_one_batch::<F>();
+    }
+
+    #[test]
+    fn two_to_one_batch_matches_scalar_native_width() {
+        check_two_to_one_batch::<Packed>();
+    }
+
+    #[test]
+    fn two_to_one_batch_matches_scalar_width_8() {
+        check_two_to_one_batch::<ArrayPacked<8>>();
+    }
+
+    /// Values below 2^32 - 1 (= 2^64 - p) have a second u64 representation and must send the
+    /// digest to the scalar fallback; every other value has exactly one.
+    #[test]
+    fn ambiguous_values_are_detected() {
+        let bound = F::ORDER.wrapping_neg();
+        assert_eq!(bound, EPSILON);
+        let digest =
+            |x: u64| digest_from_values::<F>([F(x), F(EPSILON), F(P - 1), F(1 << 40)], bound);
+
+        for ambiguous in [0, 1, EPSILON - 1, P, P + 1, u64::MAX] {
+            assert!(
+                digest(ambiguous).is_none(),
+                "{ambiguous:#x} must be ambiguous"
+            );
+        }
+        for unique in [EPSILON, EPSILON + 1, 1 << 63, P - 1] {
+            let d = digest(unique).expect("unique representation");
+            assert_eq!(d.elements[0].0, unique);
+            assert_eq!(d.elements[1].0, EPSILON);
+        }
+        // Every non-canonical raw value r in [p, 2^64) has value r - p < 2^32 - 1, so it is
+        // always ambiguous (covered by P, P + 1 and u64::MAX above).
     }
 }
