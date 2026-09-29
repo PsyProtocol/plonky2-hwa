@@ -17,6 +17,9 @@ serialize_rkyv = ["dep:rkyv"]
 serialize_speedy = ["dep:speedy", "std"]
 serialize_bytemuck = ["dep:bytemuck"]
 ts-rs = ["dep:ts-rs"]
+# Software prefetch in the fused large-stride FFT layers (x86_64 only). Off by default so its
+# effect can be measured separately.
+fft-prefetch = []
 # Exposes `fft_reference`, a verbatim copy of the original FFT kernel, for benchmarks.
 fft-reference = []
 

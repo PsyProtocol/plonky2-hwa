@@ -172,6 +172,22 @@ fn sub_width_layers<P: PackedField>(
     }
 }
 
+#[cfg(all(feature = "fft-prefetch", target_arch = "x86_64"))]
+#[inline(always)]
+fn prefetch_rows<P>(ptr: *const P, rows: usize, row_stride: usize, row_len: usize) {
+    use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+    let row_bytes = row_len * core::mem::size_of::<P>();
+    for a in 0..rows {
+        // `wrapping_add` keeps this sound even though prefetch addresses are never dereferenced.
+        let row = ptr.wrapping_add(a * row_stride).cast::<i8>();
+        let mut off = 0;
+        while off < row_bytes {
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(row.wrapping_add(off)) };
+            off += 64;
+        }
+    }
+}
+
 /// Generic FFT implementation that works with both scalar and packed inputs.
 ///
 /// `values` must already be in bit-reversed order. Unlike the original kernel, this one also
@@ -314,8 +330,34 @@ fn fused_group<P: PackedField>(
         *table = &P::pack_slice(&root_table[p0 + t + lg_packed_width][..])[..stride << t];
     }
 
-    for sb in packed_values.chunks_exact_mut(super_len) {
+    #[cfg(all(feature = "fft-prefetch", target_arch = "x86_64"))]
+    let base_ptr = packed_values.as_ptr();
+    #[cfg(all(feature = "fft-prefetch", target_arch = "x86_64"))]
+    let total_len = packed_values.len();
+
+    for (sb_idx, sb) in packed_values.chunks_exact_mut(super_len).enumerate() {
         for j0 in (0..stride).step_by(chunk) {
+            #[cfg(all(feature = "fft-prefetch", target_arch = "x86_64"))]
+            {
+                // Prefetch the next tile: the next chunk of this super-block, or the first chunk
+                // of the next super-block.
+                let next = if j0 + chunk < stride {
+                    sb_idx * super_len + j0 + chunk
+                } else {
+                    (sb_idx + 1) * super_len
+                };
+                if next < total_len {
+                    prefetch_rows(base_ptr.wrapping_add(next), rows, stride, chunk);
+                    // Twiddles of the next tile: 2^t rows of the table of layer p0 + t.
+                    let tw_next = next % super_len;
+                    for (t, table) in omega_tables.iter().enumerate().take(g) {
+                        prefetch_rows(table.as_ptr().wrapping_add(tw_next), 1 << t, stride, chunk);
+                    }
+                }
+            }
+            #[cfg(not(all(feature = "fft-prefetch", target_arch = "x86_64")))]
+            let _ = sb_idx;
+
             for (t, omega_table) in omega_tables.iter().enumerate().take(g) {
                 let half = stride << t; // butterfly half-size of layer p0 + t
                 let low_mask = (1usize << t) - 1;

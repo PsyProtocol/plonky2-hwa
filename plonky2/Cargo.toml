@@ -21,6 +21,7 @@ serialize_rkyv = ["dep:rkyv", "plonky2_field/serialize_rkyv"]
 serialize_speedy = ["dep:speedy", "std", "plonky2_field/serialize_speedy"]
 serialize_bytemuck = ["dep:bytemuck", "plonky2_field/serialize_bytemuck"]
 ts-rs = ["dep:ts-rs", "plonky2_field/ts-rs"]
+fft-prefetch = ["plonky2_field/fft-prefetch"]
 
 [dependencies]
 ahash = { workspace = true }
