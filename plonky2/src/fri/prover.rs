@@ -40,26 +40,30 @@ pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const
     let (trees, final_coeffs) = timed!(
         timing,
         "fold codewords in the commitment phase",
-        fri_committed_trees::<F, C, D>(
+        crate::util::stage_log::acc("fri_commit_phase", || fri_committed_trees::<F, C, D>(
             lde_polynomial_coeffs,
             lde_polynomial_values,
             challenger,
             fri_params,
             final_poly_coeff_len,
             max_num_query_steps,
-        )
+        ))
     );
 
     // PoW phase
     let pow_witness = timed!(
         timing,
         "find proof-of-work witness",
-        fri_proof_of_work::<F, C, D>(challenger, &fri_params.config)
+        crate::util::stage_log::acc("fri_pow", || fri_proof_of_work::<F, C, D>(
+            challenger,
+            &fri_params.config
+        ))
     );
 
     // Query phase
-    let query_round_proofs =
-        fri_prover_query_rounds::<F, C, D>(initial_merkle_trees, &trees, challenger, n, fri_params);
+    let query_round_proofs = crate::util::stage_log::acc("fri_queries", || {
+        fri_prover_query_rounds::<F, C, D>(initial_merkle_trees, &trees, challenger, n, fri_params)
+    });
 
     FriProof {
         commit_phase_merkle_caps: trees.iter().map(|t| t.cap.clone()).collect(),
@@ -101,7 +105,9 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
             .par_chunks(arity)
             .map(|chunk: &[F::Extension]| flatten(chunk))
             .collect();
-        let tree = MerkleTree::<F, C::Hasher>::new(chunked_values, fri_params.config.cap_height);
+        let tree = crate::util::stage_log::acc("fri_commit_merkle", || {
+            MerkleTree::<F, C::Hasher>::new(chunked_values, fri_params.config.cap_height)
+        });
 
         challenger.observe_cap(&tree.cap);
         trees.push(tree);
@@ -116,7 +122,7 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
                 .collect::<Vec<_>>(),
         );
         shift = shift.exp_u64(arity as u64);
-        values = coeffs.coset_fft(shift.into())
+        values = crate::util::stage_log::acc("fri_commit_fft", || coeffs.coset_fft(shift.into()))
     }
 
     // When verifying this proof in a circuit with a different number of query steps,

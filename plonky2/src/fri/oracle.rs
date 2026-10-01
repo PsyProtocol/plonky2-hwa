@@ -16,12 +16,11 @@ use crate::fri::FriParams;
 use crate::hash::hash_types::RichField;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::GenericConfig;
+use crate::plonk::config::{GenericConfig, ProverCompute};
 use crate::timed;
 use crate::util::reducing::ReducingFactor;
-use crate::util::timing::TimingTree;
 use crate::util::reverse_bits;
-use crate::plonk::config::ProverCompute;
+use crate::util::timing::TimingTree;
 /// Four (~64 bit) field elements gives ~128 bit security.
 pub const SALT_SIZE: usize = 4;
 
@@ -152,28 +151,31 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let alpha = challenger.get_extension_challenge::<D>();
         let mut alpha = ReducingFactor::new(alpha);
 
-        let mut final_poly = PolynomialCoeffs::empty();
-
-        for FriBatchInfo { point, polynomials } in &instance.batches {
-            let polys_coeff = polynomials.iter().map(|fri_poly| {
-                &oracles[fri_poly.oracle_index].polynomials[fri_poly.polynomial_index]
-            });
-            let composition_poly = timed!(
-                timing,
-                &format!("reduce batch of {} polynomials", polynomials.len()),
-                alpha.reduce_polys_base(polys_coeff)
-            );
-            let mut quotient = composition_poly.divide_by_linear(*point);
-            quotient.coeffs.push(F::Extension::ZERO); // pad back to power of two
-            alpha.shift_poly(&mut final_poly);
-            final_poly += quotient;
-        }
+        let final_poly = crate::util::stage_log::acc("fri_reduce_polys", || {
+            let mut final_poly = PolynomialCoeffs::empty();
+            for FriBatchInfo { point, polynomials } in &instance.batches {
+                let polys_coeff = polynomials.iter().map(|fri_poly| {
+                    &oracles[fri_poly.oracle_index].polynomials[fri_poly.polynomial_index]
+                });
+                let composition_poly = timed!(
+                    timing,
+                    &format!("reduce batch of {} polynomials", polynomials.len()),
+                    alpha.reduce_polys_base(polys_coeff)
+                );
+                let mut quotient = composition_poly.divide_by_linear(*point);
+                quotient.coeffs.push(F::Extension::ZERO); // pad back to power of two
+                alpha.shift_poly(&mut final_poly);
+                final_poly += quotient;
+            }
+            final_poly
+        });
 
         let lde_final_poly = final_poly.lde(fri_params.config.rate_bits);
         let lde_final_values = timed!(
             timing,
             &format!("perform final FFT {}", lde_final_poly.len()),
-            lde_final_poly.coset_fft(F::coset_shift().into())
+            crate::util::stage_log::acc("fri_final_fft", || lde_final_poly
+                .coset_fft(F::coset_shift().into()))
         );
 
         let fri_proof = fri_proof::<F, C, D>(
