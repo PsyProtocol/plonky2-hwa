@@ -24,6 +24,8 @@ ts-rs = ["dep:ts-rs", "plonky2_field/ts-rs"]
 fft-prefetch = ["plonky2_field/fft-prefetch"]
 # CUDA commitments via zeknox (needs ZEKNOX_LIB_DIR at build time; runtime switch PLONKY2_GPU=1).
 cuda = ["std"]
+# Lab only: PLONKY2_GPU_FAULT=run_error|rebuild_panic for error-path tests of the CUDA backend.
+gpu-fault-injection = ["cuda"]
 
 [dependencies]
 ahash = { workspace = true }

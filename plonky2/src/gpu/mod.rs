@@ -170,6 +170,21 @@ extern "C" {
     fn libc_free(p: *mut c_void);
 }
 
+/// Lab-only fault injection (feature `gpu-fault-injection`): `PLONKY2_GPU_FAULT=run_error` makes
+/// the device phase fail after an output set was claimed; `rebuild_panic` panics during the
+/// rebuild outside the GPU lock. `PLONKY2_GPU_FAULT_COUNT` (default 1) limits how many times.
+#[cfg(feature = "gpu-fault-injection")]
+fn inject(kind: &str) -> bool {
+    static LEFT: OnceLock<std::sync::atomic::AtomicI64> = OnceLock::new();
+    if std::env::var("PLONKY2_GPU_FAULT").ok().as_deref() != Some(kind) {
+        return false;
+    }
+    let left = LEFT.get_or_init(|| {
+        std::sync::atomic::AtomicI64::new(std::env::var("PLONKY2_GPU_FAULT_COUNT").ok().and_then(|v| v.parse().ok()).unwrap_or(1))
+    });
+    left.fetch_sub(1, Ordering::SeqCst) > 0
+}
+
 fn sync(what: &str) -> GpuResult<()> {
     cuda(unsafe { ffi::cudaDeviceSynchronize() }, what)?;
     cuda(unsafe { ffi::cudaGetLastError() }, what)
@@ -214,12 +229,16 @@ impl Pinned {
             cuda(unsafe { ffi::cudaMallocHost(&mut p, len * 8) }, "cudaMallocHost")?;
             self.ptr = p as *mut u64;
             self.len = len;
+            let now = PINNED_BYTES.fetch_add(len as u64 * 8, Ordering::Relaxed) + len as u64 * 8;
+            PINNED_PEAK.fetch_max(now, Ordering::Relaxed);
+            log::info!("plonky2 GPU pinned host buffers now {now} bytes (grew one buffer to {} bytes)", len * 8);
         }
         Ok(unsafe { core::slice::from_raw_parts_mut(self.ptr, len) })
     }
 
     fn release(&mut self) {
         if !self.ptr.is_null() {
+            PINNED_BYTES.fetch_sub(self.len as u64 * 8, Ordering::Relaxed);
             unsafe { ffi::cudaFreeHost(self.ptr as *mut c_void) };
             self.ptr = core::ptr::null_mut();
             self.len = 0;
@@ -240,6 +259,7 @@ struct OutputSet {
 
 /// Bounded pool of output sets; a claimed set is owned by one commitment until it is rebuilt.
 struct Pool {
+    size: usize,
     free: Mutex<Vec<OutputSet>>,
     returned: Condvar,
 }
@@ -285,6 +305,8 @@ static CPU_COMMITS: AtomicU64 = AtomicU64::new(0);
 static GPU_ERRORS: AtomicU64 = AtomicU64::new(0);
 static LOCK_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static BUF_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+static PINNED_BYTES: AtomicU64 = AtomicU64::new(0);
+static PINNED_PEAK: AtomicU64 = AtomicU64::new(0);
 static EXEC_NS: AtomicU64 = AtomicU64::new(0);
 static REBUILD_NS: AtomicU64 = AtomicU64::new(0);
 
@@ -298,6 +320,12 @@ pub struct GpuStats {
     pub lock_wait_ns: u64,
     pub exec_ns: u64,
     pub rebuild_ns: u64,
+    /// Page-locked host memory currently held by the backend, and its peak.
+    pub pinned_bytes: u64,
+    pub pinned_peak_bytes: u64,
+    /// Output buffer sets: pool size and how many are free right now.
+    pub pool_size: u64,
+    pub pool_free: u64,
 }
 
 pub fn stats() -> GpuStats {
@@ -309,6 +337,10 @@ pub fn stats() -> GpuStats {
         lock_wait_ns: LOCK_WAIT_NS.load(Ordering::Relaxed),
         exec_ns: EXEC_NS.load(Ordering::Relaxed),
         rebuild_ns: REBUILD_NS.load(Ordering::Relaxed),
+        pinned_bytes: PINNED_BYTES.load(Ordering::Relaxed),
+        pinned_peak_bytes: PINNED_PEAK.load(Ordering::Relaxed),
+        pool_size: BACKEND.get().and_then(|b| b.as_ref()).map_or(0, |b| b.pool.size as u64),
+        pool_free: BACKEND.get().and_then(|b| b.as_ref()).map_or(0, |b| b.pool.free.lock().map_or(0, |f| f.len() as u64)),
     }
 }
 
@@ -342,6 +374,7 @@ fn backend() -> Option<&'static Backend> {
                         min_lde_rows,
                         state: Mutex::new(State { input: Pinned::empty() }),
                         pool: Pool {
+                            size: buffers,
                             free: Mutex::new(
                                 (0..buffers).map(|_| OutputSet { leaves: Pinned::empty(), digests: Pinned::empty() }).collect(),
                             ),
@@ -472,6 +505,11 @@ fn run<F: RichField>(
     let caps = 1usize << cap_height;
     let num_digests = 2 * (rows - caps);
 
+    #[cfg(feature = "gpu-fault-injection")]
+    if inject("run_error") {
+        return Err("injected run_error".into());
+    }
+
     // Canonicalise into the pinned input buffer (CPU, see module docs).
     let input = input_staging.ensure(cols * n)?;
     input.par_chunks_mut(n).zip(polynomials.par_iter()).for_each(|(dst, p)| {
@@ -550,6 +588,10 @@ fn rebuild_tree<F: RichField, H: Hasher<F>>(
 ) -> MerkleTree<F, H> {
     debug_assert_eq!(TypeId::of::<F>(), TypeId::of::<GoldilocksField>());
     debug_assert_eq!(TypeId::of::<H>(), TypeId::of::<PoseidonHash>());
+    #[cfg(feature = "gpu-fault-injection")]
+    if inject("rebuild_panic") {
+        panic!("injected rebuild_panic");
+    }
     let leaves_flat = unsafe { core::slice::from_raw_parts(state.leaves.ptr, leaves_len) };
     let digest_flat = unsafe { core::slice::from_raw_parts(state.digests.ptr, digests_len + cap_len) };
     let (lin_flat, cap_flat) = digest_flat.split_at(digests_len);
@@ -611,4 +653,76 @@ unsafe fn cast_vec<A: 'static, B: 'static>(v: Vec<A>) -> Vec<B> {
     assert_eq!(TypeId::of::<A>(), TypeId::of::<B>());
     let mut v = core::mem::ManuallyDrop::new(v);
     Vec::from_raw_parts(v.as_mut_ptr() as *mut B, v.len(), v.capacity())
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::*;
+
+    fn pool(n: usize) -> &'static Pool {
+        Box::leak(Box::new(Pool {
+            size: n,
+            free: Mutex::new((0..n).map(|_| OutputSet { leaves: Pinned::empty(), digests: Pinned::empty() }).collect()),
+            returned: Condvar::new(),
+        }))
+    }
+
+    fn free(p: &Pool) -> usize {
+        p.free.lock().unwrap().len()
+    }
+
+    #[test]
+    fn capacity_is_bounded_and_waiter_is_woken_on_return() {
+        let p = pool(2);
+        let a = p.acquire();
+        let b = p.acquire();
+        assert_eq!(free(p), 0);
+        let (tx, rx) = mpsc::channel();
+        let t = std::thread::spawn(move || {
+            let _c = p.acquire();
+            tx.send(()).unwrap();
+        });
+        // The third claimer must wait while both sets are out.
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+        drop(a);
+        rx.recv_timeout(Duration::from_secs(5)).expect("waiter woken after a return");
+        t.join().unwrap();
+        drop(b);
+        assert_eq!(free(p), 2);
+    }
+
+    #[test]
+    fn panic_while_holding_a_set_returns_it_and_wakes_waiter() {
+        let p = pool(1);
+        let (tx, rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _g = p.acquire();
+            tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            panic!("simulated rebuild panic");
+        });
+        rx.recv().unwrap();
+        let waiter = std::thread::spawn(move || {
+            let _g = p.acquire();
+        });
+        assert!(holder.join().is_err(), "holder panicked");
+        waiter.join().expect("waiter got the set after the panic");
+        assert_eq!(free(p), 1);
+    }
+
+    #[test]
+    fn returning_a_set_does_not_need_the_gpu_lock() {
+        let p = pool(1);
+        let gpu_lock: &'static Mutex<()> = Box::leak(Box::new(Mutex::new(())));
+        let g = p.acquire();
+        let held = gpu_lock.lock().unwrap();
+        // Return the set from another thread while the "GPU lock" is held here.
+        let t = std::thread::spawn(move || drop(g));
+        t.join().unwrap();
+        drop(held);
+        assert_eq!(free(p), 1);
+    }
 }
