@@ -311,6 +311,13 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D> for Cop
     }
 }
 
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
 /// A generator for including a random value
 #[derive(Debug, Default)]
 pub struct RandomValueGenerator {
@@ -331,7 +338,16 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D> for Ran
         _witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
-        let random_value = F::rand();
+        let random_value = if crate::util::stage_log::deterministic_random() {
+            // Correctness runs only: a fixed function of the target, so proofs are reproducible.
+            let key = match self.target {
+                Target::Wire(w) => ((w.row as u64) << 32) | w.column as u64,
+                Target::VirtualTarget { index } => (1u64 << 63) | index as u64,
+            };
+            F::from_noncanonical_u64(splitmix64(key))
+        } else {
+            F::rand()
+        };
         out_buffer.set_target(self.target, random_value)
     }
 

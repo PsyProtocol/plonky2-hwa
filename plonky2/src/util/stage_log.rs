@@ -105,6 +105,14 @@ mod imp {
         *ON.get_or_init(|| std::env::var("PLONKY2_POW_DETERMINISTIC").ok().as_deref() == Some("1"))
     }
 
+    /// `PLONKY2_DETERMINISTIC_RANDOM=1`: `RandomValueGenerator` (unused public-input-gate wires,
+    /// ZK blinding rows) uses a fixed function of the target instead of fresh randomness.
+    /// Correctness comparisons only; never for production (it removes the blinding).
+    pub fn deterministic_random() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLONKY2_DETERMINISTIC_RANDOM").ok().as_deref() == Some("1"))
+    }
+
     static VERIFY_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static VERIFY_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -262,6 +270,9 @@ mod imp {
         false
     }
     pub fn pow_deterministic() -> bool {
+        false
+    }
+    pub fn deterministic_random() -> bool {
         false
     }
     pub fn verify_event(_circuit_digest: u64, _error: Option<std::string::String>, _seconds: f64) {}
