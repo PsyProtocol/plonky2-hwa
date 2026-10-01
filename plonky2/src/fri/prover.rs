@@ -186,16 +186,20 @@ pub(crate) fn fri_proof_of_work<
     let witness_input_pos = challenger.input_buffer.len();
     duplex_intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
 
-    let pow_witness = (0..=F::NEG_ONE.to_canonical_u64())
-        .into_par_iter()
-        .find_any(|&candidate| {
-            let mut duplex_state = duplex_intermediate_state;
-            duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
-            duplex_state.permute();
-            let pow_response = duplex_state.squeeze().iter().last().unwrap();
-            let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
-            leading_zeros >= min_leading_zeros
-        })
+    let accept = |&candidate: &u64| {
+        let mut duplex_state = duplex_intermediate_state;
+        duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
+        duplex_state.permute();
+        let pow_response = duplex_state.squeeze().iter().last().unwrap();
+        let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
+        leading_zeros >= min_leading_zeros
+    };
+    let candidates = (0..=F::NEG_ONE.to_canonical_u64()).into_par_iter();
+    let pow_witness = if crate::util::stage_log::pow_deterministic() {
+        candidates.find_first(accept)
+    } else {
+        candidates.find_any(accept)
+    }
         .map(F::from_canonical_u64)
         .expect("Proof of work failed. This is highly unlikely!");
 

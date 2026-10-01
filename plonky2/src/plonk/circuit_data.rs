@@ -187,12 +187,21 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     }
 
     pub fn prove(&self, inputs: PartialWitness<F>) -> Result<ProofWithPublicInputs<F, C, D>> {
-        prove::<F, C, D>(
+        let proof = prove::<F, C, D>(
             &self.prover_only,
             &self.common,
             inputs,
             &mut TimingTree::default(),
-        )
+        )?;
+        if crate::util::stage_log::verify_after_prove() {
+            let (ok, seconds) = crate::util::stage_log::timed(|| self.verify(proof.clone()));
+            crate::util::stage_log::verify_event(
+                crate::plonk::config::GenericHashOut::to_vec(&self.prover_only.circuit_digest)[0].to_canonical_u64(),
+                ok.as_ref().err().map(|e| e.to_string()),
+                seconds,
+            );
+        }
+        Ok(proof)
     }
 
     pub fn verify(&self, proof_with_pis: ProofWithPublicInputs<F, C, D>) -> Result<()> {

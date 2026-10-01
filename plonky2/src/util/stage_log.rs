@@ -85,6 +85,55 @@ mod imp {
         path().is_some()
     }
 
+    pub fn timed<R>(f: impl FnOnce() -> R) -> (R, f64) {
+        let t = Instant::now();
+        let r = f();
+        (r, t.elapsed().as_secs_f64())
+    }
+
+    /// `PLONKY2_VERIFY_AFTER_PROVE=1`: `CircuitData::prove` verifies every proof it returns.
+    pub fn verify_after_prove() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLONKY2_VERIFY_AFTER_PROVE").ok().as_deref() == Some("1"))
+    }
+
+    /// `PLONKY2_POW_DETERMINISTIC=1`: the FRI proof-of-work search returns the smallest valid
+    /// witness instead of any, so proofs are reproducible run to run.
+    pub fn pow_deterministic() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLONKY2_POW_DETERMINISTIC").ok().as_deref() == Some("1"))
+    }
+
+    static VERIFY_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static VERIFY_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// (verified ok, verification failed) since process start.
+    pub fn verify_counts() -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (VERIFY_OK.load(Relaxed), VERIFY_FAILED.load(Relaxed))
+    }
+
+    /// Records the result of verifying a just-produced proof: a counter, an error log on failure,
+    /// and (with the stage log on) one `{"verify":...}` line.
+    pub fn verify_event(circuit_digest: u64, error: Option<String>, seconds: f64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        match &error {
+            None => VERIFY_OK.fetch_add(1, Relaxed),
+            Some(e) => {
+                log::error!("proof verification failed right after proving (circuit {circuit_digest:016x}): {e}");
+                VERIFY_FAILED.fetch_add(1, Relaxed)
+            }
+        };
+        let Some(path) = path() else { return };
+        let line = format!(
+            "{{\"verify\":{},\"circuit\":\"{circuit_digest:016x}\",\"verify_s\":{seconds:.6}}}\n",
+            error.is_none()
+        );
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+
     pub fn generators_start() -> Option<Instant> {
         enabled().then(Instant::now)
     }
@@ -205,6 +254,16 @@ mod imp {
         None
     }
     pub fn generators_end(_start: Option<()>) {}
+    pub fn timed<R>(f: impl FnOnce() -> R) -> (R, f64) {
+        (f(), 0.0)
+    }
+    pub fn verify_after_prove() -> bool {
+        false
+    }
+    pub fn pow_deterministic() -> bool {
+        false
+    }
+    pub fn verify_event(_circuit_digest: u64, _error: Option<std::string::String>, _seconds: f64) {}
     #[inline]
     pub fn acc<R>(_name: &'static str, f: impl FnOnce() -> R) -> R {
         f()
