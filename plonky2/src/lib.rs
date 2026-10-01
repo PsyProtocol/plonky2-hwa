@@ -16,6 +16,8 @@ pub mod batch_fri;
 pub mod fri;
 pub mod gadgets;
 pub mod gates;
+#[cfg(feature = "cuda")]
+pub mod gpu;
 pub mod hash;
 pub mod iop;
 pub mod plonk;

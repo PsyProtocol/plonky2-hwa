@@ -193,6 +193,24 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> anyhow::Result<PolynomialBatch<F, C, D>> {
         //println!("CPU ProverCompute::compute_from_coeffs called");
+        let commit_start = crate::util::stage_log::generators_start();
+        let lg_n = polynomials.first().map_or(0, |p| log2_strict(p.len()));
+        let cols = polynomials.len();
+        #[cfg(feature = "cuda")]
+        let cpu_reason = match crate::gpu::try_commit::<F, C::Hasher>(&polynomials, rate_bits, blinding, cap_height) {
+            Ok(merkle_tree) => {
+                return Ok(PolynomialBatch {
+                    polynomials,
+                    merkle_tree,
+                    degree_log: lg_n,
+                    rate_bits,
+                    blinding,
+                });
+            }
+            Err(reason) => reason,
+        };
+        #[cfg(not(feature = "cuda"))]
+        let cpu_reason = "gpu_not_built";
         const SALT_SIZE: usize = 4;
         let salt_size = if blinding { SALT_SIZE } else { 0 };
 
@@ -230,6 +248,12 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 <Self as ProverCompute<F, C, D>>::build_merkle_tree(timing, leaves, cap_height)
             })?
         );
+        #[cfg(feature = "cuda")]
+        crate::gpu::count_cpu_commit();
+        if let Some(t) = commit_start {
+            let s = t.elapsed().as_secs_f64();
+            crate::util::stage_log::commit_event("cpu", cpu_reason, lg_n, rate_bits, cols, 0.0, s, 0.0, s);
+        }
         Ok(PolynomialBatch {
             polynomials,
             merkle_tree,

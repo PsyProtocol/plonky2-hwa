@@ -22,6 +22,8 @@ serialize_speedy = ["dep:speedy", "std", "plonky2_field/serialize_speedy"]
 serialize_bytemuck = ["dep:bytemuck", "plonky2_field/serialize_bytemuck"]
 ts-rs = ["dep:ts-rs", "plonky2_field/ts-rs"]
 fft-prefetch = ["plonky2_field/fft-prefetch"]
+# CUDA commitments via zeknox (needs ZEKNOX_LIB_DIR at build time; runtime switch PLONKY2_GPU=1).
+cuda = ["std"]
 
 [dependencies]
 ahash = { workspace = true }

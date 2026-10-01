@@ -33,6 +33,33 @@ mod imp {
         static GENERATORS_SECONDS: Cell<Option<f64>> = const { Cell::new(None) };
         /// Sub-stage seconds accumulated on this thread since the current stage log started.
         static DETAIL: core::cell::RefCell<Vec<(&'static str, f64)>> = const { core::cell::RefCell::new(Vec::new()) };
+        /// One JSON object per polynomial commitment made on this thread during the current proof.
+        static COMMITS: core::cell::RefCell<Vec<String>> = const { core::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Records one polynomial commitment: which backend ran it and why, its shape, and (GPU) the
+    /// time spent waiting for the device lock, executing, and rebuilding the host-side tree.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_event(
+        backend: &'static str,
+        reason: &'static str,
+        lg_n: usize,
+        rate_bits: usize,
+        cols: usize,
+        lock_wait_s: f64,
+        exec_s: f64,
+        rebuild_s: f64,
+        total_s: f64,
+    ) {
+        if !enabled() {
+            return;
+        }
+        let e = format!(
+            "{{\"backend\":\"{backend}\",\"reason\":\"{reason}\",\"rows\":{},\"lde_rows\":{},\"cols\":{cols},\"lock_wait_s\":{lock_wait_s:.6},\"exec_s\":{exec_s:.6},\"rebuild_s\":{rebuild_s:.6},\"total_s\":{total_s:.6}}}",
+            1usize << lg_n,
+            1usize << (lg_n + rate_bits),
+        );
+        COMMITS.with(|c| c.borrow_mut().push(e));
     }
 
     /// Runs `f`, adding its wall time to sub-stage `name` of the current proof's stage log.
@@ -111,6 +138,7 @@ mod imp {
                 config.fri_config.proof_of_work_bits,
             );
             DETAIL.with(|d| d.borrow_mut().clear());
+            COMMITS.with(|c| c.borrow_mut().clear());
             let now = Instant::now();
             Some(Self {
                 start: now,
@@ -140,9 +168,10 @@ mod imp {
                     .map(|(name, s)| format!("\"{name}\":{s:.6}"))
                     .collect()
             });
+            let commits: Vec<String> = COMMITS.with(|c| c.borrow_mut().drain(..).collect());
             let thread = std::thread::current();
             let line = format!(
-                "{{\"t\":{:.3},{},\"generators_s\":{},\"prove_s\":{:.6},\"stages\":{{{}}},\"detail\":{{{}}},\"thread\":\"{}\"}}\n",
+                "{{\"t\":{:.3},{},\"generators_s\":{},\"prove_s\":{:.6},\"stages\":{{{}}},\"detail\":{{{}}},\"commits\":[{}],\"thread\":\"{}\"}}\n",
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs_f64())
@@ -152,6 +181,7 @@ mod imp {
                 (self.last - self.start).as_secs_f64(),
                 stages.join(","),
                 detail.join(","),
+                commits.join(","),
                 thread.name().unwrap_or("?").replace('"', "'"),
             );
             // One write call per line keeps concurrent appends from interleaving.
@@ -178,6 +208,19 @@ mod imp {
     #[inline]
     pub fn acc<R>(_name: &'static str, f: impl FnOnce() -> R) -> R {
         f()
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_event(
+        _backend: &'static str,
+        _reason: &'static str,
+        _lg_n: usize,
+        _rate_bits: usize,
+        _cols: usize,
+        _lock_wait_s: f64,
+        _exec_s: f64,
+        _rebuild_s: f64,
+        _total_s: f64,
+    ) {
     }
     #[derive(Debug)]
     pub struct StageLog;
