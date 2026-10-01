@@ -7,6 +7,7 @@ use plonky2_maybe_rayon::*;
 use serde::{Deserialize, Serialize};
 
 use crate::hash::hash_types::RichField;
+use crate::hash::leaf_matrix::LeafMatrix;
 use crate::hash::merkle_proofs::MerkleProof;
 use crate::plonk::config::{GenericHashOut, Hasher};
 use crate::util::log2_strict;
@@ -49,8 +50,8 @@ impl<F: RichField, H: Hasher<F>> MerkleCap<F, H> {
 #[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
 #[repr(C)]
 pub struct MerkleTree<F: RichField, H: Hasher<F>> {
-    /// The data in the leaves of the Merkle tree.
-    pub leaves: Vec<Vec<F>>,
+    /// The data in the leaves of the Merkle tree (row `i` is `leaves[i]`).
+    pub leaves: LeafMatrix<F>,
 
     /// The digests in the tree. Consists of `cap.len()` sub-trees, each corresponding to one
     /// element in `cap`. Each subtree is contiguous and located at
@@ -69,7 +70,7 @@ pub struct MerkleTree<F: RichField, H: Hasher<F>> {
 impl<F: RichField, H: Hasher<F>> Default for MerkleTree<F, H> {
     fn default() -> Self {
         Self {
-            leaves: Vec::new(),
+            leaves: LeafMatrix::default(),
             digests: Vec::new(),
             cap: MerkleCap::default(),
         }
@@ -280,7 +281,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         }
 
         Self {
-            leaves,
+            leaves: LeafMatrix::from(leaves),
             digests,
             cap: MerkleCap(cap),
         }

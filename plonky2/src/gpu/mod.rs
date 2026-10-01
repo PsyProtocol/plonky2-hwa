@@ -663,8 +663,18 @@ fn rebuild_tree<F: RichField, H: Hasher<F>>(
         HashOut { elements: [GoldilocksField(c[0]), GoldilocksField(c[1]), GoldilocksField(c[2]), GoldilocksField(c[3])] }
     };
 
-    let leaves: Vec<Vec<GoldilocksField>> =
-        leaves_flat.par_chunks(cols).map(|r| r.iter().map(|&x| GoldilocksField(x)).collect()).collect();
+    // One contiguous row-major copy out of the pinned buffer (no per-row allocation).
+    let mut leaves: Vec<GoldilocksField> = Vec::with_capacity(leaves_flat.len());
+    {
+        let spare = &mut leaves.spare_capacity_mut()[..leaves_flat.len()];
+        spare.par_chunks_mut(1 << 16).zip(leaves_flat.par_chunks(1 << 16)).for_each(|(dst, src)| {
+            for (d, &x) in dst.iter_mut().zip(src) {
+                d.write(GoldilocksField(x));
+            }
+        });
+    }
+    // SAFETY: every element up to `leaves_flat.len()` was written above.
+    unsafe { leaves.set_len(leaves_flat.len()) };
 
     let caps = 1usize << cap_height;
     let subtree_leaves = 1usize << (lg_rows - cap_height);
@@ -682,7 +692,7 @@ fn rebuild_tree<F: RichField, H: Hasher<F>>(
     // H::Hash == HashOut<GoldilocksField>; the casts are identities.
     unsafe {
         MerkleTree {
-            leaves: cast_vec::<Vec<GoldilocksField>, Vec<F>>(leaves),
+            leaves: crate::hash::leaf_matrix::LeafMatrix::from_flat(cast_vec::<GoldilocksField, F>(leaves), cols),
             digests: cast_vec::<HashOut<GoldilocksField>, H::Hash>(digests),
             cap: MerkleCap(cast_vec::<HashOut<GoldilocksField>, H::Hash>(cap)),
         }
