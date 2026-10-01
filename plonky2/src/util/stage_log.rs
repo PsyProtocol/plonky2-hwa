@@ -64,13 +64,27 @@ mod imp {
     }
 
     /// Runs `f`, adding its wall time to sub-stage `name` of the current proof's stage log.
+    /// NVTX range only (no stage-log accounting); a no-op without the `cuda` feature.
+    #[inline]
+    pub fn range<R>(name: &'static str, f: impl FnOnce() -> R) -> R {
+        #[cfg(feature = "cuda")]
+        {
+            crate::gpu::range(name, f)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = name;
+            f()
+        }
+    }
+
     #[inline]
     pub fn acc<R>(name: &'static str, f: impl FnOnce() -> R) -> R {
         if !enabled() {
-            return f();
+            return range(name, f);
         }
         let t = Instant::now();
-        let r = f();
+        let r = range(name, f);
         let s = t.elapsed().as_secs_f64();
         DETAIL.with(|d| {
             let mut d = d.borrow_mut();
@@ -278,6 +292,10 @@ mod imp {
     pub fn verify_event(_circuit_digest: u64, _error: Option<std::string::String>, _seconds: f64) {}
     #[inline]
     pub fn acc<R>(_name: &'static str, f: impl FnOnce() -> R) -> R {
+        f()
+    }
+    #[inline]
+    pub fn range<R>(_name: &'static str, f: impl FnOnce() -> R) -> R {
         f()
     }
     #[allow(clippy::too_many_arguments)]

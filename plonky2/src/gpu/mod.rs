@@ -143,6 +143,36 @@ mod ffi {
 
 type GpuResult<T> = Result<T, String>;
 
+extern "C" {
+    fn plonky2_nvtx_push(name: *const c_char);
+    fn plonky2_nvtx_pop();
+}
+
+/// `PLONKY2_NVTX=1`: emit NVTX ranges (for Nsight Systems) around prover stages and GPU steps.
+pub fn nvtx_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLONKY2_NVTX").ok().as_deref() == Some("1"))
+}
+
+/// Runs `f` inside an NVTX range named `name` when NVTX is enabled.
+pub fn range<R>(name: &'static str, f: impl FnOnce() -> R) -> R {
+    if !nvtx_enabled() {
+        return f();
+    }
+    std::thread_local! {
+        static NAMES: core::cell::RefCell<std::collections::HashMap<&'static str, std::ffi::CString>> =
+            core::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    NAMES.with(|n| {
+        let mut n = n.borrow_mut();
+        let c = n.entry(name).or_insert_with(|| std::ffi::CString::new(name).unwrap());
+        unsafe { plonky2_nvtx_push(c.as_ptr()) };
+    });
+    let r = f();
+    unsafe { plonky2_nvtx_pop() };
+    r
+}
+
 fn cuda(code: i32, what: &str) -> GpuResult<()> {
     if code == 0 {
         return Ok(());
@@ -451,14 +481,14 @@ pub(crate) fn try_commit<F: RichField, H: Hasher<F>>(
 
     // 1. Claim an exclusive output set (bounded pool).
     let buf_wait_start = Instant::now();
-    let mut out = b.pool.acquire();
+    let mut out = range("gpu:buffer_wait", || b.pool.acquire());
     let buf_wait = buf_wait_start.elapsed().as_secs_f64();
 
     // 2. GPU lock: upload, kernels, synchronous download into the claimed set.
     let wait = Instant::now();
-    let mut state = b.state.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = range("gpu:lock_wait", || b.state.lock().unwrap_or_else(|e| e.into_inner()));
     let lock_wait = wait.elapsed().as_secs_f64();
-    let result = run(&mut state.input, out.set.as_mut().expect("claimed"), polynomials, lg_n, rate_bits, cap_height);
+    let result = range("gpu:device", || run(&mut state.input, out.set.as_mut().expect("claimed"), polynomials, lg_n, rate_bits, cap_height));
     // 3. Device work is complete (synchronous copies + device sync); the set is ours alone.
     drop(state);
 
@@ -466,7 +496,9 @@ pub(crate) fn try_commit<F: RichField, H: Hasher<F>>(
         Ok((leaves_flat_len, digests_len, cap_len, exec_s)) => {
             // 4. Rebuild outside the GPU lock; the set returns to the pool when `out` drops.
             let rebuild = Instant::now();
-            let tree = rebuild_tree::<F, H>(out.set.as_ref().expect("claimed"), cols, lg_n + rate_bits, cap_height, leaves_flat_len, digests_len, cap_len);
+            let tree = range("gpu:rebuild", || {
+                rebuild_tree::<F, H>(out.set.as_ref().expect("claimed"), cols, lg_n + rate_bits, cap_height, leaves_flat_len, digests_len, cap_len)
+            });
             drop(out);
             let rebuild_s = rebuild.elapsed().as_secs_f64();
             stage_log::commit_event("gpu", "", lg_n, rate_bits, cols, buf_wait, lock_wait, exec_s, rebuild_s, total.elapsed().as_secs_f64());
@@ -512,16 +544,18 @@ fn run<F: RichField>(
 
     // Canonicalise into the pinned input buffer (CPU, see module docs).
     let input = input_staging.ensure(cols * n)?;
-    input.par_chunks_mut(n).zip(polynomials.par_iter()).for_each(|(dst, p)| {
-        for (d, c) in dst.iter_mut().zip(&p.coeffs) {
-            let x = plonky2_field::types::PrimeField64::to_noncanonical_u64(c);
-            *d = if x >= P { x - P } else { x };
-        }
+    range("gpu:canonicalize", || {
+        input.par_chunks_mut(n).zip(polynomials.par_iter()).for_each(|(dst, p)| {
+            for (d, c) in dst.iter_mut().zip(&p.coeffs) {
+                let x = plonky2_field::types::PrimeField64::to_noncanonical_u64(c);
+                *d = if x >= P { x - P } else { x };
+            }
+        })
     });
 
     let d_in = DeviceBuffer::alloc(cols * n)?;
     let d_lde = DeviceBuffer::alloc(cols * rows)?;
-    cuda(unsafe { ffi::cudaMemcpy(d_in.ptr, input.as_ptr() as *const c_void, cols * n * 8, ffi::H2D) }, "H2D")?;
+    range("gpu:h2d", || cuda(unsafe { ffi::cudaMemcpy(d_in.ptr, input.as_ptr() as *const c_void, cols * n * 8, ffi::H2D) }, "H2D"))?;
 
     let cfg = ffi::NttConfig {
         batches: cols as u32,
@@ -534,34 +568,41 @@ fn run<F: RichField>(
         is_multi_gpu: false,
         salt_size: 0,
     };
-    zeknox(unsafe { ffi::compute_batched_lde(0, d_lde.ptr, d_in.ptr, lg_n as u32, ffi::Direction::Forward, cfg) }, "lde")?;
-    sync("lde")?;
+    range("gpu:lde", || {
+        zeknox(unsafe { ffi::compute_batched_lde(0, d_lde.ptr, d_in.ptr, lg_n as u32, ffi::Direction::Forward, cfg) }, "lde")?;
+        sync("lde")
+    })?;
     drop(d_in);
 
     let d_leaves = DeviceBuffer::alloc(cols * rows)?;
     let tcfg = ffi::TransposeConfig { batches: cols as u32, are_inputs_on_device: true, are_outputs_on_device: true };
-    zeknox(unsafe { ffi::compute_transpose_rev(0, d_leaves.ptr, d_lde.ptr, lg_rows as u32, tcfg) }, "transpose")?;
-    sync("transpose")?;
+    range("gpu:transpose", || {
+        zeknox(unsafe { ffi::compute_transpose_rev(0, d_leaves.ptr, d_lde.ptr, lg_rows as u32, tcfg) }, "transpose")?;
+        sync("transpose")
+    })?;
     drop(d_lde);
 
     let d_digests = DeviceBuffer::alloc(num_digests * HASH_U64)?;
     let d_cap = DeviceBuffer::alloc(caps * HASH_U64)?;
-    unsafe {
-        ffi::fill_digests_buf_linear_gpu_with_gpu_ptr(
-            d_digests.ptr,
-            d_cap.ptr,
-            d_leaves.ptr,
-            num_digests as u64,
-            caps as u64,
-            rows as u64,
-            cols as u64,
-            cap_height as u64,
-            0,
-            0,
-        );
-    }
-    sync("merkle")?;
+    range("gpu:merkle", || {
+        unsafe {
+            ffi::fill_digests_buf_linear_gpu_with_gpu_ptr(
+                d_digests.ptr,
+                d_cap.ptr,
+                d_leaves.ptr,
+                num_digests as u64,
+                caps as u64,
+                rows as u64,
+                cols as u64,
+                cap_height as u64,
+                0,
+                0,
+            );
+        }
+        sync("merkle")
+    })?;
 
+    let _d2h = NvtxScope::new("gpu:d2h");
     let leaves = out.leaves.ensure(cols * rows)?;
     cuda(unsafe { ffi::cudaMemcpy(leaves.as_mut_ptr() as *mut c_void, d_leaves.ptr, cols * rows * 8, ffi::D2H) }, "D2H leaves")?;
     let digests = out.digests.ensure((num_digests + caps) * HASH_U64)?;
@@ -572,6 +613,28 @@ fn run<F: RichField>(
     cuda(unsafe { ffi::cudaMemcpy(cp.as_mut_ptr() as *mut c_void, d_cap.ptr, caps * HASH_U64 * 8, ffi::D2H) }, "D2H cap")?;
     sync("download")?;
     Ok((cols * rows, num_digests * HASH_U64, caps * HASH_U64, t.elapsed().as_secs_f64()))
+}
+
+/// NVTX range for the rest of the enclosing scope.
+struct NvtxScope(bool);
+
+impl NvtxScope {
+    fn new(name: &'static str) -> Self {
+        if !nvtx_enabled() {
+            return Self(false);
+        }
+        let c = std::ffi::CString::new(name).unwrap();
+        unsafe { plonky2_nvtx_push(c.as_ptr()) };
+        Self(true)
+    }
+}
+
+impl Drop for NvtxScope {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe { plonky2_nvtx_pop() };
+        }
+    }
 }
 
 /// Builds the plonky2 `MerkleTree` from the pinned buffers: row-major leaves, zeknox's linear

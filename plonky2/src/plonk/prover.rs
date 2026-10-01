@@ -124,7 +124,7 @@ where
     let partition_witness = timed!(
         timing,
         &format!("run {} generators", prover_data.generators.len()),
-        generate_partial_witness(inputs, prover_data, common_data)?
+        crate::util::stage_log::range("prove:generators", || generate_partial_witness(inputs, prover_data, common_data))?
     );
     crate::util::stage_log::generators_end(generators_start);
 
@@ -180,14 +180,14 @@ where
     let wires_commitment = timed!(
         timing,
         "compute wires commitment",
-        PolynomialBatch::<F, C, D>::from_values(
+        crate::util::stage_log::range("commit:wires", || PolynomialBatch::<F, C, D>::from_values(
             wires_values,
             config.fri_config.rate_bits,
             config.zero_knowledge && PlonkOracle::WIRES.blinding,
             config.fri_config.cap_height,
             timing,
             prover_data.fft_root_table.as_ref(),
-        )?
+        ))?
     );
 
     if let Some(l) = stage_log.as_mut() {
@@ -230,7 +230,7 @@ where
     let mut partial_products_and_zs = timed!(
         timing,
         "compute partial products",
-        all_wires_permutation_partial_products(&witness, &betas, &gammas, prover_data, common_data)
+        crate::util::stage_log::range("prove:partial_products", || all_wires_permutation_partial_products(&witness, &betas, &gammas, prover_data, common_data))
     );
 
     if let Some(l) = stage_log.as_mut() {
@@ -256,14 +256,14 @@ where
     let partial_products_zs_and_lookup_commitment = timed!(
         timing,
         "commit to partial products, Z's and, if any, lookup polynomials",
-        PolynomialBatch::from_values(
+        crate::util::stage_log::range("commit:zs", || PolynomialBatch::from_values(
             zs_partial_products_lookups,
             config.fri_config.rate_bits,
             config.zero_knowledge && PlonkOracle::ZS_PARTIAL_PRODUCTS.blinding,
             config.fri_config.cap_height,
             timing,
             prover_data.fft_root_table.as_ref(),
-        )?
+        ))?
     );
 
     if let Some(l) = stage_log.as_mut() {
@@ -276,7 +276,7 @@ where
     let pre_transposed_quotient_polys = timed!(
         timing,
         "compute quotient polys",
-        compute_quotient_polys_pre_transpose::<F, C, D>(
+        crate::util::stage_log::range("prove:quotient_polys", || compute_quotient_polys_pre_transpose::<F, C, D>(
             common_data,
             prover_data,
             &public_inputs_hash,
@@ -286,7 +286,7 @@ where
             &gammas,
             &deltas,
             &alphas,
-        )
+        ))
     );
 
     if let Some(l) = stage_log.as_mut() {
@@ -295,7 +295,7 @@ where
     let quotient_polys_commitment = timed!(
         timing,
         "commit to quotient polys",
-        C::Compute::transpose_and_compute_from_coeffs(
+        crate::util::stage_log::range("commit:quotient", || C::Compute::transpose_and_compute_from_coeffs(
             timing,
             pre_transposed_quotient_polys,
             quotient_degree,
@@ -304,7 +304,7 @@ where
             config.zero_knowledge && PlonkOracle::QUOTIENT.blinding,
             config.fri_config.cap_height,
             prover_data.fft_root_table.as_ref(),
-        )?
+        ))?
     );
 
     if let Some(l) = stage_log.as_mut() {
@@ -325,7 +325,7 @@ where
     let openings = timed!(
         timing,
         "construct the opening set, including lookups",
-        OpeningSet::new(
+        crate::util::stage_log::range("prove:openings", || OpeningSet::new(
             zeta,
             g,
             &prover_data.constants_sigmas_commitment,
@@ -333,7 +333,7 @@ where
             &partial_products_zs_and_lookup_commitment,
             &quotient_polys_commitment,
             common_data
-        )
+        ))
     );
     if let Some(l) = stage_log.as_mut() {
         l.mark("openings");
@@ -344,7 +344,7 @@ where
     let opening_proof = timed!(
         timing,
         "compute opening proofs",
-        PolynomialBatch::<F, C, D>::prove_openings(
+        crate::util::stage_log::range("prove:fri", || PolynomialBatch::<F, C, D>::prove_openings(
             &instance,
             &[
                 &prover_data.constants_sigmas_commitment,
@@ -357,7 +357,7 @@ where
             None,
             None,
             timing,
-        )
+        ))
     );
 
     if let Some(l) = stage_log.as_mut() {
