@@ -11,17 +11,21 @@
 //! Correctness contract (tests in the GPU lab): outputs are bit-identical to the CPU path. Inputs
 //! are canonicalised on the CPU before upload because zeknox's NTT mis-reduces values >= p.
 //!
-//! Concurrency: one process-wide lock covers upload, kernels, download and the copy out of the
-//! shared pinned buffers into the returned tree, so the pinned buffers are never reused before the
-//! result is owned by the caller. The lock does not coordinate with other processes (another
-//! proxy, or the Go Groth16 backend) sharing the same GPU.
+//! Concurrency: a commitment first claims an exclusive output buffer set (pinned leaves + digests)
+//! from a bounded pool (`PLONKY2_GPU_OUTPUT_BUFFERS`, default 2), then takes the process-wide GPU
+//! lock for upload, kernels and the synchronous download into its own set. The lock is released
+//! once the device work is complete; the plonky2 `MerkleTree` is rebuilt outside the lock from the
+//! claimed set, which returns to the pool only after the rebuild (a guard also returns it on
+//! panic). Later commitments therefore never overwrite data still being rebuilt, and pinned host
+//! memory is bounded by pool size x the largest commitment seen. The lock does not coordinate with
+//! other processes (another proxy, or the Go Groth16 backend) sharing the same GPU.
 
 use std::string::String;
 use std::vec::Vec;
 use core::any::TypeId;
 use core::ffi::{c_char, c_void, CStr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
 use plonky2_field::goldilocks_field::GoldilocksField;
@@ -223,15 +227,53 @@ impl Pinned {
     }
 }
 
+/// Pinned input staging, used only under the GPU lock.
 struct State {
     input: Pinned,
+}
+
+/// One commitment's pinned output: row-major leaves and (digests || cap).
+struct OutputSet {
     leaves: Pinned,
     digests: Pinned,
+}
+
+/// Bounded pool of output sets; a claimed set is owned by one commitment until it is rebuilt.
+struct Pool {
+    free: Mutex<Vec<OutputSet>>,
+    returned: Condvar,
+}
+
+struct OutputGuard {
+    set: Option<OutputSet>,
+    pool: &'static Pool,
+}
+
+impl Pool {
+    fn acquire(&'static self) -> OutputGuard {
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(set) = free.pop() {
+                return OutputGuard { set: Some(set), pool: self };
+            }
+            free = self.returned.wait(free).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+impl Drop for OutputGuard {
+    fn drop(&mut self) {
+        if let Some(set) = self.set.take() {
+            self.pool.free.lock().unwrap_or_else(|e| e.into_inner()).push(set);
+            self.pool.returned.notify_one();
+        }
+    }
 }
 
 struct Backend {
     min_lde_rows: usize,
     state: Mutex<State>,
+    pool: Pool,
 }
 
 static BACKEND: OnceLock<Option<Backend>> = OnceLock::new();
@@ -242,6 +284,7 @@ static GPU_COMMITS: AtomicU64 = AtomicU64::new(0);
 static CPU_COMMITS: AtomicU64 = AtomicU64::new(0);
 static GPU_ERRORS: AtomicU64 = AtomicU64::new(0);
 static LOCK_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+static BUF_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static EXEC_NS: AtomicU64 = AtomicU64::new(0);
 static REBUILD_NS: AtomicU64 = AtomicU64::new(0);
 
@@ -251,6 +294,7 @@ pub struct GpuStats {
     pub gpu_commits: u64,
     pub cpu_commits: u64,
     pub gpu_errors: u64,
+    pub buffer_wait_ns: u64,
     pub lock_wait_ns: u64,
     pub exec_ns: u64,
     pub rebuild_ns: u64,
@@ -261,6 +305,7 @@ pub fn stats() -> GpuStats {
         gpu_commits: GPU_COMMITS.load(Ordering::Relaxed),
         cpu_commits: CPU_COMMITS.load(Ordering::Relaxed),
         gpu_errors: GPU_ERRORS.load(Ordering::Relaxed),
+        buffer_wait_ns: BUF_WAIT_NS.load(Ordering::Relaxed),
         lock_wait_ns: LOCK_WAIT_NS.load(Ordering::Relaxed),
         exec_ns: EXEC_NS.load(Ordering::Relaxed),
         rebuild_ns: REBUILD_NS.load(Ordering::Relaxed),
@@ -281,15 +326,27 @@ fn backend() -> Option<&'static Backend> {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1usize << 20);
+            let buffers = std::env::var("PLONKY2_GPU_OUTPUT_BUFFERS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&n: &usize| n >= 1)
+                .unwrap_or(2);
             match init_device() {
                 Ok(()) => {
                     log::info!(
-                        "plonky2 GPU backend enabled: device 0 of CUDA_VISIBLE_DEVICES={:?}, min LDE rows {min_lde_rows}, twiddles up to 2^{MAX_LG}",
+                        "plonky2 GPU backend enabled: device 0 of CUDA_VISIBLE_DEVICES={:?}, min LDE rows {min_lde_rows}, \
+                         {buffers} output buffer sets, twiddles up to 2^{MAX_LG}",
                         std::env::var("CUDA_VISIBLE_DEVICES").ok()
                     );
                     Some(Backend {
                         min_lde_rows,
-                        state: Mutex::new(State { input: Pinned::empty(), leaves: Pinned::empty(), digests: Pinned::empty() }),
+                        state: Mutex::new(State { input: Pinned::empty() }),
+                        pool: Pool {
+                            free: Mutex::new(
+                                (0..buffers).map(|_| OutputSet { leaves: Pinned::empty(), digests: Pinned::empty() }).collect(),
+                            ),
+                            returned: Condvar::new(),
+                        },
                     })
                 }
                 Err(e) => {
@@ -357,21 +414,30 @@ pub(crate) fn try_commit<F: RichField, H: Hasher<F>>(
     if cap_height > lg_n + rate_bits {
         return Err("cap_too_high");
     }
-    let b = backend().expect("checked by cpu_reason");
+    let b: &'static Backend = backend().expect("checked by cpu_reason");
 
+    // 1. Claim an exclusive output set (bounded pool).
+    let buf_wait_start = Instant::now();
+    let mut out = b.pool.acquire();
+    let buf_wait = buf_wait_start.elapsed().as_secs_f64();
+
+    // 2. GPU lock: upload, kernels, synchronous download into the claimed set.
     let wait = Instant::now();
     let mut state = b.state.lock().unwrap_or_else(|e| e.into_inner());
     let lock_wait = wait.elapsed().as_secs_f64();
+    let result = run(&mut state.input, out.set.as_mut().expect("claimed"), polynomials, lg_n, rate_bits, cap_height);
+    // 3. Device work is complete (synchronous copies + device sync); the set is ours alone.
+    drop(state);
 
-    let result = run(&mut state, polynomials, lg_n, rate_bits, cap_height);
     match result {
         Ok((leaves_flat_len, digests_len, cap_len, exec_s)) => {
-            // Rebuild the plonky2 tree from the pinned buffers while still holding the lock.
+            // 4. Rebuild outside the GPU lock; the set returns to the pool when `out` drops.
             let rebuild = Instant::now();
-            let tree = rebuild_tree::<F, H>(&state, cols, lg_n + rate_bits, cap_height, leaves_flat_len, digests_len, cap_len);
-            drop(state);
+            let tree = rebuild_tree::<F, H>(out.set.as_ref().expect("claimed"), cols, lg_n + rate_bits, cap_height, leaves_flat_len, digests_len, cap_len);
+            drop(out);
             let rebuild_s = rebuild.elapsed().as_secs_f64();
-            stage_log::commit_event("gpu", "", lg_n, rate_bits, cols, lock_wait, exec_s, rebuild_s, total.elapsed().as_secs_f64());
+            stage_log::commit_event("gpu", "", lg_n, rate_bits, cols, buf_wait, lock_wait, exec_s, rebuild_s, total.elapsed().as_secs_f64());
+            BUF_WAIT_NS.fetch_add((buf_wait * 1e9) as u64, Ordering::Relaxed);
             GPU_COMMITS.fetch_add(1, Ordering::Relaxed);
             LOCK_WAIT_NS.fetch_add((lock_wait * 1e9) as u64, Ordering::Relaxed);
             EXEC_NS.fetch_add((exec_s * 1e9) as u64, Ordering::Relaxed);
@@ -379,7 +445,7 @@ pub(crate) fn try_commit<F: RichField, H: Hasher<F>>(
             Ok(tree)
         }
         Err(e) => {
-            drop(state);
+            drop(out);
             FAILED.store(true, Ordering::Relaxed);
             GPU_ERRORS.fetch_add(1, Ordering::Relaxed);
             log::error!("plonky2 GPU commitment failed, falling back to CPU for the rest of the process: {e}");
@@ -391,7 +457,8 @@ pub(crate) fn try_commit<F: RichField, H: Hasher<F>>(
 /// Upload, LDE, transpose, Merkle, download into the pinned buffers. Returns the element counts
 /// written (leaves, digests, cap, in u64) and the execution time.
 fn run<F: RichField>(
-    state: &mut State,
+    input_staging: &mut Pinned,
+    out: &mut OutputSet,
     polynomials: &[PolynomialCoeffs<F>],
     lg_n: usize,
     rate_bits: usize,
@@ -406,7 +473,7 @@ fn run<F: RichField>(
     let num_digests = 2 * (rows - caps);
 
     // Canonicalise into the pinned input buffer (CPU, see module docs).
-    let input = state.input.ensure(cols * n)?;
+    let input = input_staging.ensure(cols * n)?;
     input.par_chunks_mut(n).zip(polynomials.par_iter()).for_each(|(dst, p)| {
         for (d, c) in dst.iter_mut().zip(&p.coeffs) {
             let x = plonky2_field::types::PrimeField64::to_noncanonical_u64(c);
@@ -457,14 +524,15 @@ fn run<F: RichField>(
     }
     sync("merkle")?;
 
-    let leaves = state.leaves.ensure(cols * rows)?;
+    let leaves = out.leaves.ensure(cols * rows)?;
     cuda(unsafe { ffi::cudaMemcpy(leaves.as_mut_ptr() as *mut c_void, d_leaves.ptr, cols * rows * 8, ffi::D2H) }, "D2H leaves")?;
-    let digests = state.digests.ensure((num_digests + caps) * HASH_U64)?;
+    let digests = out.digests.ensure((num_digests + caps) * HASH_U64)?;
     let (dg, cp) = digests.split_at_mut(num_digests * HASH_U64);
     if num_digests > 0 {
         cuda(unsafe { ffi::cudaMemcpy(dg.as_mut_ptr() as *mut c_void, d_digests.ptr, num_digests * HASH_U64 * 8, ffi::D2H) }, "D2H digests")?;
     }
     cuda(unsafe { ffi::cudaMemcpy(cp.as_mut_ptr() as *mut c_void, d_cap.ptr, caps * HASH_U64 * 8, ffi::D2H) }, "D2H cap")?;
+    sync("download")?;
     Ok((cols * rows, num_digests * HASH_U64, caps * HASH_U64, t.elapsed().as_secs_f64()))
 }
 
@@ -472,7 +540,7 @@ fn run<F: RichField>(
 /// digest layout (per cap subtree, node k has children 2k+2 and 2k+3) converted to plonky2's
 /// recursive layout, and the cap.
 fn rebuild_tree<F: RichField, H: Hasher<F>>(
-    state: &State,
+    state: &OutputSet,
     cols: usize,
     lg_rows: usize,
     cap_height: usize,

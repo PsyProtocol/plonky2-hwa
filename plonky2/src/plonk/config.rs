@@ -252,7 +252,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         crate::gpu::count_cpu_commit();
         if let Some(t) = commit_start {
             let s = t.elapsed().as_secs_f64();
-            crate::util::stage_log::commit_event("cpu", cpu_reason, lg_n, rate_bits, cols, 0.0, s, 0.0, s);
+            crate::util::stage_log::commit_event("cpu", cpu_reason, lg_n, rate_bits, cols, 0.0, 0.0, s, 0.0, s);
         }
         Ok(PolynomialBatch {
             polynomials,

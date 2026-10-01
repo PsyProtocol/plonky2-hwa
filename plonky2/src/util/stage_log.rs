@@ -46,6 +46,7 @@ mod imp {
         lg_n: usize,
         rate_bits: usize,
         cols: usize,
+        buffer_wait_s: f64,
         lock_wait_s: f64,
         exec_s: f64,
         rebuild_s: f64,
@@ -55,7 +56,7 @@ mod imp {
             return;
         }
         let e = format!(
-            "{{\"backend\":\"{backend}\",\"reason\":\"{reason}\",\"rows\":{},\"lde_rows\":{},\"cols\":{cols},\"lock_wait_s\":{lock_wait_s:.6},\"exec_s\":{exec_s:.6},\"rebuild_s\":{rebuild_s:.6},\"total_s\":{total_s:.6}}}",
+            "{{\"backend\":\"{backend}\",\"reason\":\"{reason}\",\"rows\":{},\"lde_rows\":{},\"cols\":{cols},\"buffer_wait_s\":{buffer_wait_s:.6},\"lock_wait_s\":{lock_wait_s:.6},\"exec_s\":{exec_s:.6},\"rebuild_s\":{rebuild_s:.6},\"total_s\":{total_s:.6}}}",
             1usize << lg_n,
             1usize << (lg_n + rate_bits),
         );
@@ -275,6 +276,7 @@ mod imp {
         _lg_n: usize,
         _rate_bits: usize,
         _cols: usize,
+        _buffer_wait_s: f64,
         _lock_wait_s: f64,
         _exec_s: f64,
         _rebuild_s: f64,
