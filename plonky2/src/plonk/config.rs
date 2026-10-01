@@ -202,7 +202,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let lde_values: Vec<Vec<F>> = timed!(
             timing,
             "generate LDE values",
-            polynomials
+            crate::util::stage_log::acc("lde", || polynomials
                 .par_iter()
                 .map(|p| {
                     p.lde(rate_bits)
@@ -214,16 +214,21 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         .into_par_iter()
                         .map(|_| F::rand_vec(degree << rate_bits)),
                 )
-                .collect()
+                .collect())
         );
 
-        let mut leaves = transpose(&lde_values);
-        reverse_index_bits_in_place(&mut leaves);
+        let leaves = crate::util::stage_log::acc("transpose_bitrev", || {
+            let mut leaves = transpose(&lde_values);
+            reverse_index_bits_in_place(&mut leaves);
+            leaves
+        });
 
         let merkle_tree = timed!(
             timing,
             "Merkle tree",
-            <Self as ProverCompute<F, C, D>>::build_merkle_tree(timing, leaves, cap_height)?
+            crate::util::stage_log::acc("merkle", || {
+                <Self as ProverCompute<F, C, D>>::build_merkle_tree(timing, leaves, cap_height)
+            })?
         );
         Ok(PolynomialBatch {
             polynomials,
@@ -246,7 +251,10 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let coeffs = timed!(
             timing,
             "IFFT",
-            values.into_par_iter().map(|v| v.ifft()).collect::<Vec<_>>()
+            crate::util::stage_log::acc("ifft", || values
+                .into_par_iter()
+                .map(|v| v.ifft())
+                .collect::<Vec<_>>())
         );
         Self::compute_from_coeffs(
             timing,
@@ -272,11 +280,13 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let quotient_polys: Vec<PolynomialCoeffs<F>> = timed!(
             timing,
             "coset IFFT quotient polys",
-            transpose(&pre_transposed_quotient_polys)
-                .into_par_iter()
-                .map(PolynomialValues::new)
-                .map(|values| values.coset_ifft(F::coset_shift()))
-                .collect::<Vec<_>>()
+            crate::util::stage_log::acc("quotient_coset_ifft", || transpose(
+                &pre_transposed_quotient_polys
+            )
+            .into_par_iter()
+            .map(PolynomialValues::new)
+            .map(|values| values.coset_ifft(F::coset_shift()))
+            .collect::<Vec<_>>())
         );
 
         let all_quotient_poly_chunks: Vec<PolynomialCoeffs<F>> = timed!(
