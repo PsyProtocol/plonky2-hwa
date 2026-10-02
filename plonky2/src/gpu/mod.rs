@@ -140,6 +140,7 @@ mod ffi {
         pub fn cudaStreamCreateWithFlags(stream: *mut *mut c_void, flags: u32) -> i32;
         pub fn cudaMemcpyAsync(dst: *mut c_void, src: *const c_void, count: usize, kind: i32, stream: *mut c_void) -> i32;
         pub fn cudaFreeHost(ptr: *mut c_void) -> i32;
+        pub fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
     }
 
     pub const H2D: i32 = 1;
@@ -318,6 +319,16 @@ impl DevBuf {
         Self { ptr: core::ptr::null_mut(), cap_u64: 0 }
     }
 
+    /// Frees the buffer (call under the GPU lock).
+    fn release(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { ffi::cudaFree(self.ptr) };
+            DEVICE_WS_BYTES.fetch_sub(self.cap_u64 as u64 * 8, Ordering::Relaxed);
+            self.ptr = core::ptr::null_mut();
+            self.cap_u64 = 0;
+        }
+    }
+
     fn ensure(&mut self, len_u64: usize) -> GpuResult<*mut c_void> {
         if self.cap_u64 < len_u64.max(1) {
             if !self.ptr.is_null() {
@@ -476,6 +487,21 @@ fn resident_budget() -> u64 {
     })
 }
 
+/// Device memory left free for the commitments' workspace when caching LDEs for the quotient
+/// (`PLONKY2_GPU_RESERVE_BYTES`, default 2 GiB).
+fn device_reserve() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("PLONKY2_GPU_RESERVE_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(2 << 30)
+    })
+}
+
+/// Whether `bytes` more device memory can be allocated while keeping the reserve free.
+pub(crate) fn device_room(bytes: usize) -> bool {
+    let (mut free, mut total) = (0usize, 0usize);
+    unsafe { ffi::cudaMemGetInfo(&mut free, &mut total) == 0 && free >= bytes + device_reserve() }
+}
+
 impl DevPool {
     fn take(&self, bytes: usize) -> Option<*mut c_void> {
         let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
@@ -488,7 +514,7 @@ impl DevPool {
             unsafe { ffi::cudaFree(ptr as *mut c_void) };
             self.held.fetch_sub(b as u64, Ordering::Relaxed);
         }
-        if self.held.load(Ordering::Relaxed) + bytes as u64 > resident_budget() {
+        if self.held.load(Ordering::Relaxed) + bytes as u64 > resident_budget() || !device_room(bytes) {
             self.refused.fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -506,6 +532,20 @@ impl DevPool {
     fn give(&self, ptr: usize, bytes: usize) {
         self.free.lock().unwrap_or_else(|e| e.into_inner()).push((bytes, ptr));
     }
+
+    /// Frees the idle buffers (call under the GPU lock).
+    fn trim(&self) {
+        let idle: Vec<(usize, usize)> = self.free.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
+        for (b, ptr) in idle {
+            unsafe { ffi::cudaFree(ptr as *mut c_void) };
+            self.held.fetch_sub(b as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Frees idle kept-LDE buffers (call under the GPU lock).
+pub(crate) fn trim_resident_pool() {
+    RESIDENT_POOL.trim();
 }
 
 /// (kept-LDE buffers handed out, refused for the budget, bytes allocated).

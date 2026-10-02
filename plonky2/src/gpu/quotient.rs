@@ -166,6 +166,7 @@ static Q_MISMATCH: AtomicU64 = AtomicU64::new(0);
 static Q_EXEC_NS: AtomicU64 = AtomicU64::new(0);
 static Q_LOCK_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static Q_FAILED: AtomicBool = AtomicBool::new(false);
+static Q_OOM: AtomicU64 = AtomicU64::new(0);
 
 /// (GPU evaluations, CPU fallbacks, check mismatches, device ns, lock wait ns).
 pub fn quotient_stats() -> (u64, u64, u64, u64, u64) {
@@ -652,7 +653,7 @@ fn run<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     if matches!((&wires_lde, &zs_lde), (Lde::Device(_), Lde::Device(_))) && debug_point.is_none() {
         Q_RESIDENT_USED.fetch_add(1, Ordering::Relaxed);
     }
-    let result = range("gpu:quotient", || {
+    let mut result = range("gpu:quotient", || {
         device_run(
             &mut state.q,
             &mut args,
@@ -668,6 +669,14 @@ fn run<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             &plan.gates,
         )
     });
+    // Running out of device memory is not a device fault: drop the caches and use the CPU for
+    // this quotient.
+    let oom = matches!(&result, Err(e) if e.contains("out of memory"));
+    if oom {
+        release_device_caches(&mut state.q);
+        Q_OOM.fetch_add(1, Ordering::Relaxed);
+        result = Err("oom".into());
+    }
     drop(state);
     if debug_point.is_none() {
         // The commitments' LDEs are not needed after the quotient.
@@ -681,6 +690,10 @@ fn run<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 stage_log::quotient_event("gpu", "", exec.elapsed().as_secs_f64(), total.elapsed().as_secs_f64());
             }
             Ok((out, big_n, plan_ref.clone()))
+        }
+        Err(e) if e == "oom" => {
+            log::warn!("plonky2 GPU quotient: out of device memory, caches dropped, this quotient on the CPU");
+            Err("gpu_oom".into())
         }
         Err(e) => {
             Q_FAILED.store(true, Ordering::Relaxed);
@@ -787,16 +800,16 @@ fn constants_lde<F: RichField>(
         return Ok(e.0 as *const u64);
     }
     let bytes = polys.len() * big_n * 8;
-    if bytes > const_budget() {
+    while !c.entries.is_empty() && c.bytes + bytes <= const_budget() && !super::device_room(bytes) {
+        evict_lru(&mut c);
+    }
+    if bytes > const_budget() || !super::device_room(bytes) {
         let dst = q.d_cs.ensure(polys.len() * big_n)?;
         upload_lde(&mut q.input, &mut q.d_in, polys, n, lg_n, rate_bits, dst, lap)?;
         return Ok(dst as *const u64);
     }
     while c.bytes + bytes > const_budget() {
-        let (&old, &(ptr, b, _)) = c.entries.iter().min_by_key(|(_, e)| e.2).expect("over budget implies entries");
-        unsafe { ffi::cudaFree(ptr as *mut c_void) };
-        c.entries.remove(&old);
-        c.bytes -= b;
+        evict_lru(&mut c);
     }
     let mut p = core::ptr::null_mut();
     cuda(unsafe { ffi::cudaMalloc(&mut p, bytes) }, "cudaMalloc (constants cache)")?;
@@ -807,6 +820,30 @@ fn constants_lde<F: RichField>(
     c.entries.insert(digest, (p as usize, bytes, tick));
     c.bytes += bytes;
     Ok(p as *const u64)
+}
+
+fn evict_lru(c: &mut ConstCache) {
+    if let Some((&old, &(ptr, b, _))) = c.entries.iter().min_by_key(|(_, e)| e.2) {
+        unsafe { ffi::cudaFree(ptr as *mut c_void) };
+        c.entries.remove(&old);
+        c.bytes -= b;
+    }
+}
+
+/// After running out of device memory: frees every cache the quotient keeps (call under the GPU
+/// lock) and clears the error.
+fn release_device_caches(q: &mut QuotientBufs) {
+    if let Some(cache) = CONST_CACHE.get() {
+        let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
+        while !c.entries.is_empty() {
+            evict_lru(&mut c);
+        }
+    }
+    for b in [&mut q.d_in, &mut q.d_cs, &mut q.d_wires, &mut q.d_zs] {
+        b.release();
+    }
+    super::trim_resident_pool();
+    unsafe { ffi::cudaGetLastError() };
 }
 
 #[allow(clippy::too_many_arguments)]
