@@ -145,6 +145,7 @@ enum GateKind : u32 {
     G_U32_INTERLEAVE = 18,    // p0 = num_ops
     G_UNINTERLEAVE_B32 = 19,  // p0 = num_ops
     G_UNINTERLEAVE_U32 = 20,  // p0 = num_ops
+    G_U32_RANGE_CHECK = 21,   // p0 = num_input_limbs (2-bit aux limbs, 16 per input)
 };
 
 struct GateDesc {
@@ -532,6 +533,17 @@ __device__ void g_u32_interleave(const Point& p, const GateDesc& g, Sink& s) {
     }
 }
 
+__device__ void g_u32_range_check(const Point& p, const GateDesc& g, Sink& s) {
+    const u32 n = g.p0;
+    for (u32 k = 0; k < n; k++) {
+        const u32 aux = n + 16 * k;
+        u64 computed = 0;
+        for (int j = 15; j >= 0; j--) computed = gadd(gmul(computed, 4), p.wire(aux + j));
+        s.one(gsub(computed, p.wire(k)));
+        for (u32 j = 0; j < 16; j++) s.one(limb2_check(p.wire(aux + j)));
+    }
+}
+
 // UninterleaveToB32 (`to_u32` false) and UninterleaveToU32 (`to_u32` true).
 __device__ void g_uninterleave(const Point& p, const GateDesc& g, Sink& s, bool to_u32) {
     const u32 num_ops = g.p0;
@@ -659,6 +671,9 @@ __device__ void eval_gate(const Point& p, const GateDesc& g, const u64* gate_dat
         break;
     case G_UNINTERLEAVE_U32:
         g_uninterleave(p, g, s, true);
+        break;
+    case G_U32_RANGE_CHECK:
+        g_u32_range_check(p, g, s);
         break;
     }
 }

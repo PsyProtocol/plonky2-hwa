@@ -63,6 +63,7 @@ mod kind {
     pub const U32_INTERLEAVE: u32 = 18;
     pub const UNINTERLEAVE_B32: u32 = 19;
     pub const UNINTERLEAVE_U32: u32 = 20;
+    pub const U32_RANGE_CHECK: u32 = 21;
 }
 
 /// Number of challenges the kernel is compiled for (`NC` in the kernel).
@@ -275,10 +276,10 @@ fn plan<F: RichField + Extendable<D>, const D: usize>(common: &CommonCircuitData
         } else if let Some(x) = any.downcast_ref::<ArithmeticGate>() {
             d.kind = kind::ARITHMETIC;
             d.p0 = x.num_ops as u32;
-        } else if let Some(x) = any.downcast_ref::<BaseSumGate<2>>() {
+        } else if let Some((limbs, base)) = base_sum_gate(any) {
             d.kind = kind::BASE_SUM;
-            d.p0 = x.num_limbs as u32;
-            d.p1 = 2;
+            d.p0 = limbs as u32;
+            d.p1 = base as u32;
         } else if let Some(x) = any.downcast_ref::<ArithmeticExtensionGate<D>>() {
             d.kind = kind::ARITH_EXT;
             d.p0 = x.num_ops as u32;
@@ -332,6 +333,19 @@ fn plan<F: RichField + Extendable<D>, const D: usize>(common: &CommonCircuitData
     Ok(Plan { gates, data, max_constraints, by_id, probation: AtomicU32::new(probation()), disabled: AtomicBool::new(false) })
 }
 
+/// `BaseSumGate<B>` for the bases plonky2 circuits use: (number of limbs, base).
+fn base_sum_gate(any: &dyn core::any::Any) -> Option<(usize, usize)> {
+    macro_rules! try_base {
+        ($($b:literal),*) => {
+            $(if let Some(x) = any.downcast_ref::<BaseSumGate<$b>>() {
+                return Some((x.num_limbs, $b));
+            })*
+        };
+    }
+    try_base!(2, 3, 4, 8, 16);
+    None
+}
+
 /// Parses `name { key: value, ... }` gate ids of the psy u32 gates (both crates define the same
 /// constraints). The constraint count must match the layout the kernel assumes.
 fn psy_u32_gate(id: &str, num_constraints: usize) -> Option<(u32, u32, u32, u32)> {
@@ -371,6 +385,10 @@ fn psy_u32_gate(id: &str, num_constraints: usize) -> Option<(u32, u32, u32, u32)
         "UninterleaveToU32Gate" => {
             let ops = param("num_ops")?;
             (n == 67 * ops).then_some((kind::UNINTERLEAVE_U32, ops, 0, 0))
+        }
+        "U32RangeCheckGate" => {
+            let limbs = param("num_input_limbs")?;
+            (n == 17 * limbs).then_some((kind::U32_RANGE_CHECK, limbs, 0, 0))
         }
         _ => None,
     }
@@ -836,6 +854,8 @@ mod tests {
         assert_eq!(psy_u32_gate(add, 105), Some((kind::U32_ADD_MANY, 3, 5, 18)));
         assert_eq!(psy_u32_gate("U32InterleaveGate { num_ops: 4 }", 136), Some((kind::U32_INTERLEAVE, 4, 0, 0)));
         assert_eq!(psy_u32_gate("UninterleaveToU32Gate { num_ops: 2 }", 134), Some((kind::UNINTERLEAVE_U32, 2, 0, 0)));
-        assert_eq!(psy_u32_gate("U32RangeCheckGate { num_input_limbs: 1 }", 17), None);
+        assert_eq!(psy_u32_gate("U32RangeCheckGate { num_input_limbs: 8, _phantom: PhantomData<F> }", 136), Some((kind::U32_RANGE_CHECK, 8, 0, 0)));
+        assert_eq!(psy_u32_gate("U32RangeCheckGate { num_input_limbs: 8 }", 135), None);
+        assert_eq!(psy_u32_gate("SomeOtherGate { num_ops: 4 }", 136), None);
     }
 }
