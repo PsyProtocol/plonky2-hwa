@@ -632,6 +632,11 @@ fn device_run<F: RichField>(
     gates: &[GateDesc],
 ) -> GpuResult<Vec<u64>> {
     init_once()?;
+    let mut t = Instant::now();
+    let mut lap = |name: &'static str| {
+        stage_log::detail(name, t.elapsed().as_secs_f64());
+        t = Instant::now();
+    };
     // Canonical coefficients, column after column, then one upload.
     let input = q.input.ensure(total_cols * n)?;
     range("gpu:quotient_pack", || {
@@ -641,8 +646,10 @@ fn device_run<F: RichField>(
             }
         })
     });
+    lap("q_pack");
     let d_in = q.d_in.ensure(total_cols * n)?;
     cuda(unsafe { ffi::cudaMemcpy(d_in, input.as_ptr() as *const c_void, total_cols * n * 8, ffi::H2D) }, "quotient H2D")?;
+    lap("q_h2d");
     let d_lde = q.d_lde.ensure(total_cols * big_n)?;
     let cfg = ffi::NttConfig {
         batches: total_cols as u32,
@@ -659,6 +666,7 @@ fn device_run<F: RichField>(
         zeknox(unsafe { ffi::compute_batched_lde(0, d_lde, d_in, lg_n as u32, ffi::Direction::Forward, cfg) }, "quotient lde")
     })?;
     sync("quotient lde")?;
+    lap("q_lde");
 
     let d_aux = q.d_aux.ensure(aux.len())?;
     cuda(unsafe { ffi::cudaMemcpy(d_aux, aux.as_ptr() as *const c_void, aux.len() * 8, ffi::H2D) }, "quotient aux")?;
@@ -682,10 +690,13 @@ fn device_run<F: RichField>(
         cuda(unsafe { plonky2_quotient_launch(args) }, "quotient kernel launch")?;
         sync("quotient kernel")
     })?;
+    lap("q_kernel");
     let (src, len) = if args.debug_point >= 0 { (d_debug, debug_len) } else { (d_out, NC * big_n) };
     let out = q.out.ensure(len)?;
     cuda(unsafe { ffi::cudaMemcpy(out.as_mut_ptr() as *mut c_void, src, len * 8, ffi::D2H) }, "quotient D2H")?;
-    Ok(out.to_vec())
+    let out = out.to_vec();
+    lap("q_d2h");
+    Ok(out)
 }
 
 /// At LDE point `k`, compares every gate's unfiltered constraints computed by the kernel with the

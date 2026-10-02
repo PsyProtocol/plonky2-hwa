@@ -100,6 +100,14 @@ mod imp {
         path().is_some()
     }
 
+    /// Adds `seconds` to the current proof's detail entry `name`.
+    pub fn detail(name: &'static str, seconds: f64) {
+        if !enabled() {
+            return;
+        }
+        DETAIL.with(|d| d.borrow_mut().push((name, seconds)));
+    }
+
     /// Records a quotient evaluation on `backend` (device seconds and total seconds) in the
     /// current proof's detail.
     pub fn quotient_event(backend: &'static str, _reason: &str, exec_s: f64, total_s: f64) {
@@ -357,6 +365,7 @@ mod imp {
         (f(), 0.0)
     }
     pub fn quotient_event(_backend: &'static str, _reason: &str, _exec_s: f64, _total_s: f64) {}
+    pub fn detail(_name: &'static str, _seconds: f64) {}
     pub fn verify_after_prove() -> bool {
         false
     }
