@@ -100,6 +100,19 @@ mod imp {
         path().is_some()
     }
 
+    /// Records a quotient evaluation on `backend` (device seconds and total seconds) in the
+    /// current proof's detail.
+    pub fn quotient_event(backend: &'static str, _reason: &str, exec_s: f64, total_s: f64) {
+        if !enabled() {
+            return;
+        }
+        DETAIL.with(|d| {
+            let mut d = d.borrow_mut();
+            d.push(if backend == "gpu" { ("quotient_gpu_exec", exec_s) } else { ("quotient_cpu", exec_s) });
+            d.push(("quotient_total", total_s));
+        });
+    }
+
     pub fn timed<R>(f: impl FnOnce() -> R) -> (R, f64) {
         let t = Instant::now();
         let r = f();
@@ -343,6 +356,7 @@ mod imp {
     pub fn timed<R>(f: impl FnOnce() -> R) -> (R, f64) {
         (f(), 0.0)
     }
+    pub fn quotient_event(_backend: &'static str, _reason: &str, _exec_s: f64, _total_s: f64) {}
     pub fn verify_after_prove() -> bool {
         false
     }

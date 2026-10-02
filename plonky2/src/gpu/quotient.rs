@@ -1,0 +1,671 @@
+//! Quotient polynomial evaluation on the GPU (lab, `PLONKY2_GPU_QUOTIENT=1`).
+//!
+//! The kernel (`cuda/quotient.cu`) evaluates, at every point of the quotient domain, the same
+//! terms as `eval_vanishing_poly_base_batch` and returns the same field values: the inputs are
+//! the coset LDEs of the constants/sigmas, wires and Z/partial-product polynomials, computed on
+//! the device from the prover's coefficients. Circuits are eligible when every gate has a device
+//! implementation (looked up by downcasting), there are no lookups, no zero knowledge, two
+//! challenges, and the quotient domain equals the LDE domain (`rate_bits` = quotient degree bits).
+//! Anything else stays on the CPU.
+//!
+//! `PLONKY2_GPU_QUOTIENT_CHECK=1` (and every test build) also computes the CPU result and compares
+//! them; on a mismatch the CPU result is used and the first mismatching point is diagnosed gate by
+//! gate.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use super::*;
+use crate::field::extension::Extendable;
+use crate::field::zero_poly_coset::ZeroPolyOnCoset;
+use crate::fri::oracle::PolynomialBatch;
+use crate::gates::arithmetic_base::ArithmeticGate;
+use crate::gates::arithmetic_extension::ArithmeticExtensionGate;
+use crate::gates::base_sum::BaseSumGate;
+use crate::gates::constant::ConstantGate;
+use crate::gates::coset_interpolation::CosetInterpolationGate;
+use crate::gates::multiplication_extension::MulExtensionGate;
+use crate::gates::noop::NoopGate;
+use crate::gates::poseidon::PoseidonGate;
+use crate::gates::poseidon_mds::PoseidonMdsGate;
+use crate::gates::public_input::PublicInputGate;
+use crate::gates::random_access::RandomAccessGate;
+use crate::gates::reducing::ReducingGate;
+use crate::gates::reducing_extension::ReducingExtensionGate;
+use crate::hash::poseidon::{Poseidon, ALL_ROUND_CONSTANTS, N_ROUNDS, SPONGE_WIDTH};
+use crate::plonk::circuit_data::{CommonCircuitData, ProverOnlyCircuitData};
+use crate::plonk::config::GenericConfig;
+use crate::plonk::vars::EvaluationVarsBaseBatch;
+use crate::util::log2_ceil;
+
+/// Gate kinds; must match `GateKind` in `cuda/quotient.cu`.
+mod kind {
+    pub const NOOP: u32 = 0;
+    pub const CONSTANT: u32 = 1;
+    pub const PUBLIC_INPUT: u32 = 2;
+    pub const ARITHMETIC: u32 = 3;
+    pub const BASE_SUM: u32 = 4;
+    pub const ARITH_EXT: u32 = 5;
+    pub const MUL_EXT: u32 = 6;
+    pub const REDUCING: u32 = 7;
+    pub const REDUCING_EXT: u32 = 8;
+    pub const RANDOM_ACCESS: u32 = 9;
+    pub const POSEIDON_MDS: u32 = 10;
+    pub const POSEIDON: u32 = 11;
+    pub const COSET_INTERP: u32 = 12;
+}
+
+/// Number of challenges the kernel is compiled for (`NC` in the kernel).
+const NC: usize = 2;
+const MAX_RA_BITS: usize = 5;
+const MAX_CI_BITS: usize = 4;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct GateDesc {
+    kind: u32,
+    row: u32,
+    selector: u32,
+    group_lo: u32,
+    group_hi: u32,
+    p0: u32,
+    p1: u32,
+    p2: u32,
+    data_off: u32,
+    num_constraints: u32,
+}
+
+/// Mirrors `QuotientArgs` in `cuda/quotient.cu`.
+#[repr(C)]
+struct QuotientArgs {
+    cs: *const u64,
+    wires: *const u64,
+    zs: *const u64,
+    aux: *const u64,
+    gates: *const GateDesc,
+    out: *mut u64,
+    debug: *mut u64,
+    coset_shift: u64,
+    omega: u64,
+    n_field: u64,
+    zh_evals: [u64; 8],
+    zh_invs: [u64; 8],
+    pih: [u64; 4],
+    lg_lde: u32,
+    rate_mask: u32,
+    next_step: u32,
+    num_constants: u32,
+    const_prefix: u32,
+    many_selectors: u32,
+    num_routed: u32,
+    num_wires: u32,
+    num_prods: u32,
+    max_degree: u32,
+    off_kis: u32,
+    off_betas: u32,
+    off_gammas: u32,
+    off_alpha: u32,
+    num_terms: u32,
+    off_gate_data: u32,
+    num_gates: u32,
+    debug_stride: u32,
+    debug_point: i32,
+}
+
+extern "C" {
+    fn plonky2_quotient_init(poseidon_constants: *const u64, len: u32) -> i32;
+    fn plonky2_quotient_poseidon_constants_len() -> u32;
+    fn plonky2_quotient_launch(args: *const QuotientArgs) -> i32;
+}
+
+/// Device buffers of the quotient evaluation (only touched under the GPU lock).
+pub(super) struct QuotientBufs {
+    input: Pinned,
+    out: Pinned,
+    d_in: DevBuf,
+    d_lde: DevBuf,
+    d_aux: DevBuf,
+    d_gates: DevBuf,
+    d_out: DevBuf,
+    d_debug: DevBuf,
+}
+
+impl QuotientBufs {
+    pub(super) const fn new() -> Self {
+        Self {
+            input: Pinned::empty(),
+            out: Pinned::empty(),
+            d_in: DevBuf::empty(),
+            d_lde: DevBuf::empty(),
+            d_aux: DevBuf::empty(),
+            d_gates: DevBuf::empty(),
+            d_out: DevBuf::empty(),
+            d_debug: DevBuf::empty(),
+        }
+    }
+}
+
+static Q_GPU: AtomicU64 = AtomicU64::new(0);
+static Q_CPU: AtomicU64 = AtomicU64::new(0);
+static Q_MISMATCH: AtomicU64 = AtomicU64::new(0);
+static Q_EXEC_NS: AtomicU64 = AtomicU64::new(0);
+static Q_LOCK_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+static Q_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// (GPU evaluations, CPU fallbacks, check mismatches, device ns, lock wait ns).
+pub fn quotient_stats() -> (u64, u64, u64, u64, u64) {
+    (
+        Q_GPU.load(Ordering::Relaxed),
+        Q_CPU.load(Ordering::Relaxed),
+        Q_MISMATCH.load(Ordering::Relaxed),
+        Q_EXEC_NS.load(Ordering::Relaxed),
+        Q_LOCK_WAIT_NS.load(Ordering::Relaxed),
+    )
+}
+
+pub(crate) fn enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLONKY2_GPU_QUOTIENT").ok().as_deref() == Some("1"))
+}
+
+/// `PLONKY2_GPU_QUOTIENT_CHECK=1`: compare every GPU quotient with the CPU one (lab).
+pub(crate) fn check_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    cfg!(test) || *ON.get_or_init(|| std::env::var("PLONKY2_GPU_QUOTIENT_CHECK").ok().as_deref() == Some("1"))
+}
+
+/// Largest LDE (all columns) evaluated on the device; larger circuits stay on the CPU.
+fn max_lde_bytes() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("PLONKY2_GPU_QUOTIENT_MAX_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(1 << 30)
+    })
+}
+
+pub(crate) fn record_cpu() {
+    Q_CPU.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_mismatch() {
+    Q_MISMATCH.fetch_add(1, Ordering::Relaxed);
+}
+
+fn poseidon_constants() -> Vec<u64> {
+    type G = GoldilocksField;
+    let mut v = Vec::new();
+    v.extend_from_slice(&ALL_ROUND_CONSTANTS[..SPONGE_WIDTH * N_ROUNDS]);
+    v.extend_from_slice(&<G as Poseidon>::MDS_MATRIX_CIRC);
+    v.extend_from_slice(&<G as Poseidon>::MDS_MATRIX_DIAG);
+    v.extend_from_slice(&<G as Poseidon>::FAST_PARTIAL_FIRST_ROUND_CONSTANT);
+    v.extend_from_slice(&<G as Poseidon>::FAST_PARTIAL_ROUND_CONSTANTS);
+    for row in <G as Poseidon>::FAST_PARTIAL_ROUND_VS {
+        v.extend_from_slice(&row);
+    }
+    for row in <G as Poseidon>::FAST_PARTIAL_ROUND_W_HATS {
+        v.extend_from_slice(&row);
+    }
+    for row in <G as Poseidon>::FAST_PARTIAL_ROUND_INITIAL_MATRIX {
+        v.extend_from_slice(&row);
+    }
+    v
+}
+
+/// Uploads the Poseidon constants once (call under the GPU lock).
+fn init_once() -> GpuResult<()> {
+    static INIT: OnceLock<Result<(), String>> = OnceLock::new();
+    INIT.get_or_init(|| {
+        let c = poseidon_constants();
+        let expected = unsafe { plonky2_quotient_poseidon_constants_len() } as usize;
+        if c.len() != expected {
+            return Err(format!("Poseidon constants: {} values, kernel expects {expected}", c.len()));
+        }
+        cuda(unsafe { plonky2_quotient_init(c.as_ptr(), c.len() as u32) }, "quotient constants")
+    })
+    .clone()
+}
+
+/// A circuit's gates as kernel descriptors, plus per-gate constant data.
+struct Plan {
+    gates: Vec<GateDesc>,
+    data: Vec<u64>,
+    max_constraints: usize,
+}
+
+fn plan<F: RichField + Extendable<D>, const D: usize>(common: &CommonCircuitData<F, D>) -> Result<Plan, String> {
+    let mut gates = Vec::with_capacity(common.gates.len());
+    let mut data: Vec<u64> = Vec::new();
+    let mut max_constraints = 0;
+    for (i, g) in common.gates.iter().enumerate() {
+        let any = g.0.as_any();
+        let selector = common.selectors_info.selector_indices[i];
+        let group = common.selectors_info.groups[selector].clone();
+        let mut d = GateDesc {
+            row: i as u32,
+            selector: selector as u32,
+            group_lo: group.start as u32,
+            group_hi: group.end as u32,
+            num_constraints: g.0.num_constraints() as u32,
+            ..GateDesc::default()
+        };
+        max_constraints = max_constraints.max(g.0.num_constraints());
+        if any.is::<NoopGate>() {
+            d.kind = kind::NOOP;
+        } else if let Some(x) = any.downcast_ref::<ConstantGate>() {
+            d.kind = kind::CONSTANT;
+            d.p0 = x.num_consts as u32;
+        } else if any.is::<PublicInputGate>() {
+            d.kind = kind::PUBLIC_INPUT;
+        } else if let Some(x) = any.downcast_ref::<ArithmeticGate>() {
+            d.kind = kind::ARITHMETIC;
+            d.p0 = x.num_ops as u32;
+        } else if let Some(x) = any.downcast_ref::<BaseSumGate<2>>() {
+            d.kind = kind::BASE_SUM;
+            d.p0 = x.num_limbs as u32;
+            d.p1 = 2;
+        } else if let Some(x) = any.downcast_ref::<ArithmeticExtensionGate<D>>() {
+            d.kind = kind::ARITH_EXT;
+            d.p0 = x.num_ops as u32;
+        } else if let Some(x) = any.downcast_ref::<MulExtensionGate<D>>() {
+            d.kind = kind::MUL_EXT;
+            d.p0 = x.num_ops as u32;
+        } else if let Some(x) = any.downcast_ref::<ReducingGate<D>>() {
+            d.kind = kind::REDUCING;
+            d.p0 = x.num_coeffs as u32;
+        } else if let Some(x) = any.downcast_ref::<ReducingExtensionGate<D>>() {
+            d.kind = kind::REDUCING_EXT;
+            d.p0 = x.num_coeffs as u32;
+        } else if let Some(x) = any.downcast_ref::<RandomAccessGate<F, D>>() {
+            if x.bits > MAX_RA_BITS {
+                return Err(format!("RandomAccessGate with {} bits", x.bits));
+            }
+            d.kind = kind::RANDOM_ACCESS;
+            d.p0 = x.bits as u32;
+            d.p1 = x.num_copies as u32;
+            d.p2 = x.num_extra_constants as u32;
+        } else if any.is::<PoseidonMdsGate<F, D>>() {
+            d.kind = kind::POSEIDON_MDS;
+        } else if any.is::<PoseidonGate<F, D>>() {
+            d.kind = kind::POSEIDON;
+        } else if let Some(x) = any.downcast_ref::<CosetInterpolationGate<F, D>>() {
+            if x.subgroup_bits > MAX_CI_BITS || x.degree < 2 {
+                return Err(format!("CosetInterpolationGate with {} subgroup bits", x.subgroup_bits));
+            }
+            d.kind = kind::COSET_INTERP;
+            d.p0 = x.subgroup_bits as u32;
+            d.p1 = x.degree as u32;
+            d.data_off = data.len() as u32;
+            data.extend(F::two_adic_subgroup(x.subgroup_bits).iter().map(|v| v.to_canonical_u64()));
+            data.extend(x.barycentric_weights.iter().map(|v| v.to_canonical_u64()));
+        } else {
+            return Err(format!("no device implementation for {}", g.0.id()));
+        }
+        gates.push(d);
+    }
+    Ok(Plan { gates, data, max_constraints })
+}
+
+fn cached_plan<F: RichField + Extendable<D>, const D: usize>(
+    common: &CommonCircuitData<F, D>,
+    circuit_digest: u64,
+) -> Arc<Result<Plan, String>> {
+    static PLANS: OnceLock<Mutex<HashMap<u64, Arc<Result<Plan, String>>>>> = OnceLock::new();
+    let plans = PLANS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(p) = plans.lock().unwrap_or_else(|e| e.into_inner()).get(&circuit_digest) {
+        return p.clone();
+    }
+    let p = Arc::new(plan(common));
+    if let Err(e) = p.as_ref() {
+        log::info!("plonky2 GPU quotient: circuit {circuit_digest:016x} stays on the CPU: {e}");
+    }
+    plans.lock().unwrap_or_else(|e| e.into_inner()).insert(circuit_digest, p.clone());
+    p
+}
+
+/// Evaluates the quotient on the GPU. `Err` gives the reason it stayed on the CPU.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_compute<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
+    common: &CommonCircuitData<F, D>,
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    public_inputs_hash: &[F],
+    wires: &PolynomialBatch<F, C, D>,
+    zs: &PolynomialBatch<F, C, D>,
+    betas: &[F],
+    gammas: &[F],
+    alphas: &[F],
+) -> Result<Vec<Vec<F>>, String> {
+    let (out, n_points) = run(common, prover_data, public_inputs_hash, wires, zs, betas, gammas, alphas, None)?;
+    Ok((0..n_points).map(|i| (0..NC).map(|c| F::from_canonical_u64(out[c * n_points + i])).collect()).collect())
+}
+
+/// Runs the evaluation; with `debug_point`, returns instead every gate's unfiltered constraints
+/// at that point (`[gate][max constraints]`).
+#[allow(clippy::too_many_arguments)]
+fn run<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
+    common: &CommonCircuitData<F, D>,
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    public_inputs_hash: &[F],
+    wires: &PolynomialBatch<F, C, D>,
+    zs: &PolynomialBatch<F, C, D>,
+    betas: &[F],
+    gammas: &[F],
+    alphas: &[F],
+    debug_point: Option<usize>,
+) -> Result<(Vec<u64>, usize), String> {
+    if !enabled() {
+        return Err("disabled".into());
+    }
+    if Q_FAILED.load(Ordering::Relaxed) || FAILED.load(Ordering::Relaxed) {
+        return Err("gpu_failed_earlier".into());
+    }
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() || D != 2 {
+        return Err("unsupported field".into());
+    }
+    let b = backend().ok_or("gpu_disabled")?;
+    let config = &common.config;
+    let nc = config.num_challenges;
+    let quotient_degree_bits = log2_ceil(common.quotient_degree_factor);
+    let rate_bits = config.fri_config.rate_bits;
+    if nc != NC {
+        return Err(format!("{nc} challenges"));
+    }
+    if common.num_lookup_polys != 0 || config.zero_knowledge {
+        return Err("lookups or zero knowledge".into());
+    }
+    if quotient_degree_bits != rate_bits || quotient_degree_bits > 3 {
+        return Err(format!("quotient degree bits {quotient_degree_bits}, rate bits {rate_bits}"));
+    }
+    let lg_n = common.degree_bits();
+    let lg_lde = lg_n + rate_bits;
+    if lg_lde < 7 || lg_lde > MAX_LG {
+        return Err(format!("LDE size 2^{lg_lde}"));
+    }
+    let n = 1usize << lg_n;
+    let big_n = 1usize << lg_lde;
+    let num_routed = config.num_routed_wires;
+    let num_prods = common.num_partial_products;
+    let max_degree = common.quotient_degree_factor;
+    if num_routed.div_ceil(max_degree) != num_prods + 1 {
+        return Err("partial product layout".into());
+    }
+    let cs_polys = &prover_data.constants_sigmas_commitment.polynomials;
+    let cols = [cs_polys.len(), wires.polynomials.len(), zs.polynomials.len()];
+    if cols[0] != common.num_constants + num_routed || cols[1] != config.num_wires || cols[2] != nc * (1 + num_prods) {
+        return Err(format!("column counts {cols:?}"));
+    }
+    let total_cols: usize = cols.iter().sum();
+    if total_cols * big_n * 8 > max_lde_bytes() {
+        return Err(format!("LDE of {} bytes", total_cols * big_n * 8));
+    }
+    let all_polys: Vec<&PolynomialCoeffs<F>> =
+        cs_polys.iter().chain(&wires.polynomials).chain(&zs.polynomials).collect();
+    if all_polys.iter().any(|p| p.len() != n) {
+        return Err("polynomial lengths".into());
+    }
+    let digest = crate::plonk::config::GenericHashOut::to_vec(&prover_data.circuit_digest)[0].to_canonical_u64();
+    let plan_ref = cached_plan(common, digest);
+    let plan = plan_ref.as_ref().as_ref().map_err(|e| e.clone())?;
+
+    // Auxiliary data: k_is | betas | gammas | alpha powers [NC][num_terms] | gate data.
+    let num_chunks = num_prods + 1;
+    let num_terms = nc + nc * num_chunks + common.num_gate_constraints;
+    let canon = |v: &F| v.to_canonical_u64();
+    let mut aux: Vec<u64> = Vec::new();
+    let off_kis = aux.len();
+    aux.extend(common.k_is.iter().map(canon));
+    let off_betas = aux.len();
+    aux.extend(betas.iter().map(canon));
+    let off_gammas = aux.len();
+    aux.extend(gammas.iter().map(canon));
+    let off_alpha = aux.len();
+    for &alpha in alphas {
+        let mut p = F::ONE;
+        for _ in 0..num_terms {
+            aux.push(p.to_canonical_u64());
+            p *= alpha;
+        }
+    }
+    let off_gate_data = aux.len();
+    aux.extend_from_slice(&plan.data);
+
+    let z_h = ZeroPolyOnCoset::<F>::new(lg_n, quotient_degree_bits);
+    let rate = 1usize << quotient_degree_bits;
+    let mut zh_evals = [0u64; 8];
+    let mut zh_invs = [0u64; 8];
+    for r in 0..rate {
+        zh_evals[r] = z_h.eval(r).to_canonical_u64();
+        zh_invs[r] = z_h.eval_inverse(r).to_canonical_u64();
+    }
+    let mut pih = [0u64; 4];
+    for (d, s) in pih.iter_mut().zip(public_inputs_hash) {
+        *d = s.to_canonical_u64();
+    }
+    let mut args = QuotientArgs {
+        cs: core::ptr::null(),
+        wires: core::ptr::null(),
+        zs: core::ptr::null(),
+        aux: core::ptr::null(),
+        gates: core::ptr::null(),
+        out: core::ptr::null_mut(),
+        debug: core::ptr::null_mut(),
+        coset_shift: F::coset_shift().to_canonical_u64(),
+        omega: F::primitive_root_of_unity(lg_lde).to_canonical_u64(),
+        n_field: F::from_canonical_usize(n).to_canonical_u64(),
+        zh_evals,
+        zh_invs,
+        pih,
+        lg_lde: lg_lde as u32,
+        rate_mask: (rate - 1) as u32,
+        next_step: rate as u32,
+        num_constants: common.num_constants as u32,
+        const_prefix: (common.selectors_info.num_selectors() + common.num_lookup_selectors) as u32,
+        many_selectors: (common.selectors_info.num_selectors() > 1) as u32,
+        num_routed: num_routed as u32,
+        num_wires: config.num_wires as u32,
+        num_prods: num_prods as u32,
+        max_degree: max_degree as u32,
+        off_kis: off_kis as u32,
+        off_betas: off_betas as u32,
+        off_gammas: off_gammas as u32,
+        off_alpha: off_alpha as u32,
+        num_terms: num_terms as u32,
+        off_gate_data: off_gate_data as u32,
+        num_gates: plan.gates.len() as u32,
+        debug_stride: plan.max_constraints.max(1) as u32,
+        debug_point: debug_point.map_or(-1, |p| p as i32),
+    };
+
+    let total = Instant::now();
+    let wait = Instant::now();
+    let mut state = range("gpu:quotient_lock_wait", || b.state.lock().unwrap_or_else(|e| e.into_inner()));
+    Q_LOCK_WAIT_NS.fetch_add(wait.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let exec = Instant::now();
+    let result = range("gpu:quotient", || {
+        device_run(&mut state.q, &mut args, &all_polys, cols, n, total_cols, big_n, lg_n, rate_bits, &aux, &plan.gates)
+    });
+    drop(state);
+    match result {
+        Ok(out) => {
+            if debug_point.is_none() {
+                Q_GPU.fetch_add(1, Ordering::Relaxed);
+                Q_EXEC_NS.fetch_add(exec.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                stage_log::quotient_event("gpu", "", exec.elapsed().as_secs_f64(), total.elapsed().as_secs_f64());
+            }
+            Ok((out, big_n))
+        }
+        Err(e) => {
+            Q_FAILED.store(true, Ordering::Relaxed);
+            log::error!("plonky2 GPU quotient failed, using the CPU from now on: {e}");
+            Err("gpu_error".into())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn device_run<F: RichField>(
+    q: &mut QuotientBufs,
+    args: &mut QuotientArgs,
+    polys: &[&PolynomialCoeffs<F>],
+    cols: [usize; 3],
+    n: usize,
+    total_cols: usize,
+    big_n: usize,
+    lg_n: usize,
+    rate_bits: usize,
+    aux: &[u64],
+    gates: &[GateDesc],
+) -> GpuResult<Vec<u64>> {
+    init_once()?;
+    // Canonical coefficients, column after column, then one upload.
+    let input = q.input.ensure(total_cols * n)?;
+    range("gpu:quotient_pack", || {
+        input.par_chunks_mut(n).zip(polys.par_iter()).for_each(|(dst, p)| {
+            for (d, c) in dst.iter_mut().zip(&p.coeffs) {
+                *d = c.to_canonical_u64();
+            }
+        })
+    });
+    let d_in = q.d_in.ensure(total_cols * n)?;
+    cuda(unsafe { ffi::cudaMemcpy(d_in, input.as_ptr() as *const c_void, total_cols * n * 8, ffi::H2D) }, "quotient H2D")?;
+    let d_lde = q.d_lde.ensure(total_cols * big_n)?;
+    let cfg = ffi::NttConfig {
+        batches: total_cols as u32,
+        order: ffi::Order::NN,
+        ntt_type: ffi::NttType::Standard,
+        extension_rate_bits: rate_bits as u32,
+        are_inputs_on_device: true,
+        are_outputs_on_device: true,
+        with_coset: true,
+        is_multi_gpu: false,
+        salt_size: 0,
+    };
+    range("gpu:quotient_lde", || {
+        zeknox(unsafe { ffi::compute_batched_lde(0, d_lde, d_in, lg_n as u32, ffi::Direction::Forward, cfg) }, "quotient lde")
+    })?;
+    sync("quotient lde")?;
+
+    let d_aux = q.d_aux.ensure(aux.len())?;
+    cuda(unsafe { ffi::cudaMemcpy(d_aux, aux.as_ptr() as *const c_void, aux.len() * 8, ffi::H2D) }, "quotient aux")?;
+    let gate_bytes = core::mem::size_of_val(gates);
+    let d_gates = q.d_gates.ensure(gate_bytes.div_ceil(8))?;
+    cuda(unsafe { ffi::cudaMemcpy(d_gates, gates.as_ptr() as *const c_void, gate_bytes, ffi::H2D) }, "quotient gates")?;
+    let d_out = q.d_out.ensure(NC * big_n)?;
+    let debug_len = gates.len() * args.debug_stride as usize;
+    let d_debug = if args.debug_point >= 0 { q.d_debug.ensure(debug_len)? } else { core::ptr::null_mut() };
+
+    // Column offsets of the three batches inside the LDE buffer.
+    let col = |c: usize| unsafe { (d_lde as *const u64).add(c * big_n) };
+    args.cs = col(0);
+    args.wires = col(cols[0]);
+    args.zs = col(cols[0] + cols[1]);
+    args.aux = d_aux as *const u64;
+    args.gates = d_gates as *const GateDesc;
+    args.out = d_out as *mut u64;
+    args.debug = d_debug as *mut u64;
+    range("gpu:quotient_kernel", || -> GpuResult<()> {
+        cuda(unsafe { plonky2_quotient_launch(args) }, "quotient kernel launch")?;
+        sync("quotient kernel")
+    })?;
+    let (src, len) = if args.debug_point >= 0 { (d_debug, debug_len) } else { (d_out, NC * big_n) };
+    let out = q.out.ensure(len)?;
+    cuda(unsafe { ffi::cudaMemcpy(out.as_mut_ptr() as *mut c_void, src, len * 8, ffi::D2H) }, "quotient D2H")?;
+    Ok(out.to_vec())
+}
+
+/// At LDE point `k`, compares every gate's unfiltered constraints computed by the kernel with the
+/// CPU's and describes the differences (for check-mode mismatches).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn diagnose<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
+    common: &CommonCircuitData<F, D>,
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    public_inputs_hash: &[F],
+    wires: &PolynomialBatch<F, C, D>,
+    zs: &PolynomialBatch<F, C, D>,
+    betas: &[F],
+    gammas: &[F],
+    alphas: &[F],
+    k: usize,
+) -> String {
+    let dbg = match run(common, prover_data, public_inputs_hash, wires, zs, betas, gammas, alphas, Some(k)) {
+        Ok((v, _)) => v,
+        Err(e) => return format!("debug run failed: {e}"),
+    };
+    let stride = common.gates.iter().map(|g| g.0.num_constraints()).max().unwrap_or(1).max(1);
+    let cs_row = prover_data.constants_sigmas_commitment.get_lde_values(k, 1);
+    let prefix = common.selectors_info.num_selectors() + common.num_lookup_selectors;
+    let pih = HashOut::<F>::from_partial(public_inputs_hash);
+    let vars = EvaluationVarsBaseBatch::new(1, &cs_row[prefix..common.num_constants], wires.get_lde_values(k, 1), &pih);
+    let mut report = Vec::new();
+    for (gi, g) in common.gates.iter().enumerate() {
+        let cpu = g.0.eval_unfiltered_base_batch(vars);
+        let gpu = &dbg[gi * stride..gi * stride + cpu.len()];
+        let bad: Vec<usize> = (0..cpu.len()).filter(|&c| cpu[c].to_canonical_u64() != gpu[c]).collect();
+        if !bad.is_empty() {
+            report.push(format!(
+                "{}: {} of {} constraints differ, first #{} cpu {} gpu {}",
+                g.0.id().chars().take(60).collect::<String>(),
+                bad.len(),
+                cpu.len(),
+                bad[0],
+                cpu[bad[0]].to_canonical_u64(),
+                gpu[bad[0]]
+            ));
+        }
+    }
+    let _ = zs;
+    if report.is_empty() {
+        format!("point {k}: every gate's constraints match; the difference is in the vanishing terms")
+    } else {
+        format!("point {k}: {}", report.join("; "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+
+    use super::*;
+    use crate::gates::noop::NoopGate;
+    use crate::iop::witness::{PartialWitness, WitnessWrite};
+    use crate::plonk::circuit_builder::CircuitBuilder;
+    use crate::plonk::circuit_data::CircuitConfig;
+    use crate::plonk::config::PoseidonGoldilocksConfig;
+
+    /// A recursive verifier circuit uses every standard recursion gate; proving it with
+    /// `PLONKY2_GPU=1 PLONKY2_GPU_QUOTIENT=1` runs the kernel, and the test build compares every
+    /// GPU quotient with the CPU's (a mismatch panics with a per-gate diagnosis).
+    #[test]
+    fn recursive_circuit_quotient_on_gpu() -> Result<()> {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = GoldilocksField;
+        if !enabled() || std::env::var("PLONKY2_GPU").ok().as_deref() != Some("1") {
+            eprintln!("skipped: set PLONKY2_GPU=1 PLONKY2_GPU_QUOTIENT=1");
+            return Ok(());
+        }
+        let config = CircuitConfig::standard_recursion_config();
+
+        let mut builder = CircuitBuilder::<F, D>::new(config.clone());
+        for _ in 0..4_000 {
+            builder.add_gate(NoopGate, vec![]);
+        }
+        let inner = builder.build::<C>();
+        let inner_proof = inner.prove(PartialWitness::new())?;
+
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let mut pw = PartialWitness::new();
+        let pt = builder.add_virtual_proof_with_pis(&inner.common);
+        pw.set_proof_with_pis_target(&pt, &inner_proof)?;
+        let vd = builder.add_virtual_verifier_data(inner.common.config.fri_config.cap_height);
+        pw.set_cap_target(&vd.constants_sigmas_cap, &inner.verifier_only.constants_sigmas_cap)?;
+        pw.set_hash_target(vd.circuit_digest, inner.verifier_only.circuit_digest)?;
+        builder.verify_proof::<C>(&pt, &vd, &inner.common);
+        let outer = builder.build::<C>();
+        plan(&outer.common).map_err(anyhow::Error::msg)?;
+
+        let before = Q_GPU.load(Ordering::Relaxed);
+        let proof = outer.prove(pw)?;
+        outer.verify(proof)?;
+        assert!(Q_GPU.load(Ordering::Relaxed) > before, "the outer proof's quotient did not run on the GPU");
+        Ok(())
+    }
+}

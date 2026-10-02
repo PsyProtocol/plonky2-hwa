@@ -39,6 +39,7 @@ use crate::plonk::config::Hasher;
 use crate::util::stage_log;
 
 mod leaf_pool;
+pub(crate) mod quotient;
 
 const P: u64 = 0xffff_ffff_0000_0001;
 const HASH_U64: usize = 4;
@@ -293,6 +294,7 @@ struct State {
     input: Pinned,
     copy_stream: *mut c_void,
     ws: Workspace,
+    q: quotient::QuotientBufs,
 }
 
 /// Growable device buffers reused across commitments (only touched under the GPU lock).
@@ -524,6 +526,13 @@ pub struct GpuStats {
     pub device_ws_peak_bytes: u64,
     pub device_ws_allocs: u64,
     pub device_call_allocs: u64,
+    /// Quotient evaluation (PLONKY2_GPU_QUOTIENT=1): on the GPU, on the CPU, check mismatches,
+    /// device time and GPU lock wait.
+    pub quotient_gpu: u64,
+    pub quotient_cpu: u64,
+    pub quotient_mismatch: u64,
+    pub quotient_exec_ns: u64,
+    pub quotient_lock_wait_ns: u64,
 }
 
 pub fn stats() -> GpuStats {
@@ -552,6 +561,11 @@ pub fn stats() -> GpuStats {
         device_ws_peak_bytes: DEVICE_WS_PEAK.load(Ordering::Relaxed),
         device_ws_allocs: DEVICE_WS_ALLOCS.load(Ordering::Relaxed),
         device_call_allocs: DEVICE_CALL_ALLOCS.load(Ordering::Relaxed),
+        quotient_gpu: quotient::quotient_stats().0,
+        quotient_cpu: quotient::quotient_stats().1,
+        quotient_mismatch: quotient::quotient_stats().2,
+        quotient_exec_ns: quotient::quotient_stats().3,
+        quotient_lock_wait_ns: quotient::quotient_stats().4,
     }
 }
 
@@ -603,6 +617,7 @@ fn backend() -> Option<&'static Backend> {
                             input: Pinned::empty(),
                             copy_stream: copy_stream_for_init(),
                             ws: Workspace { bufs: [DevBuf::empty(), DevBuf::empty(), DevBuf::empty(), DevBuf::empty(), DevBuf::empty()] },
+                            q: quotient::QuotientBufs::new(),
                         }),
                         pool: Pool {
                             size: buffers,

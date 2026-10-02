@@ -42,5 +42,25 @@ fn main() {
     assert!(std::process::Command::new("ar").arg("rcs").arg(&lib).arg(&obj).status().unwrap().success());
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=plonky2_nvtx");
+
+    // Quotient polynomial kernel. PLONKY2_CUDA_ARCH selects the target (default sm_120).
+    println!("cargo:rerun-if-changed=cuda/quotient.cu");
+    println!("cargo:rerun-if-env-changed=PLONKY2_CUDA_ARCH");
+    let arch = std::env::var("PLONKY2_CUDA_ARCH").unwrap_or_else(|_| "120".into());
+    let qobj = out.join("quotient.o");
+    let ok = std::process::Command::new(format!("{cuda}/bin/nvcc"))
+        .args(["-O3", "-std=c++17", "-Xcompiler", "-fPIC", "-c"])
+        .arg(format!("-arch=sm_{arch}"))
+        .arg("cuda/quotient.cu")
+        .arg("-o")
+        .arg(&qobj)
+        .status()
+        .expect("run nvcc for cuda/quotient.cu")
+        .success();
+    assert!(ok, "compiling cuda/quotient.cu failed");
+    let qlib = out.join("libplonky2_quotient.a");
+    let _ = std::fs::remove_file(&qlib);
+    assert!(std::process::Command::new("ar").arg("rcs").arg(&qlib).arg(&qobj).status().unwrap().success());
+    println!("cargo:rustc-link-lib=static=plonky2_quotient");
     println!("cargo:rustc-link-lib=dylib=dl");
 }

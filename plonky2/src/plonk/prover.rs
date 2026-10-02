@@ -631,7 +631,87 @@ fn compute_all_lookup_polys<
 
 const BATCH_SIZE: usize = 32;
 
+/// The quotient polynomials' values on the quotient domain: on the GPU when possible
+/// (`PLONKY2_GPU_QUOTIENT=1`, feature `cuda`), otherwise on the CPU.
+#[allow(clippy::too_many_arguments)]
 fn compute_quotient_polys_pre_transpose<
+    'a,
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    common_data: &CommonCircuitData<F, D>,
+    prover_data: &'a ProverOnlyCircuitData<F, C, D>,
+    public_inputs_hash: &<<C as GenericConfig<D>>::InnerHasher as Hasher<F>>::Hash,
+    wires_commitment: &'a PolynomialBatch<F, C, D>,
+    zs_partial_products_and_lookup_commitment: &'a PolynomialBatch<F, C, D>,
+    betas: &[F],
+    gammas: &[F],
+    deltas: &[F],
+    alphas: &[F],
+) -> Vec<Vec<F>> {
+    let cpu = || {
+        compute_quotient_polys_cpu::<F, C, D>(
+            common_data,
+            prover_data,
+            public_inputs_hash,
+            wires_commitment,
+            zs_partial_products_and_lookup_commitment,
+            betas,
+            gammas,
+            deltas,
+            alphas,
+        )
+    };
+    #[cfg(feature = "cuda")]
+    {
+        use crate::gpu::quotient;
+        let pih = crate::plonk::config::GenericHashOut::to_vec(public_inputs_hash);
+        let zs = zs_partial_products_and_lookup_commitment;
+        match quotient::try_compute::<F, C, D>(
+            common_data,
+            prover_data,
+            &pih,
+            wires_commitment,
+            zs,
+            betas,
+            gammas,
+            alphas,
+        ) {
+            Ok(gpu) => {
+                if !quotient::check_enabled() {
+                    return gpu;
+                }
+                let expected = cpu();
+                let Some(k) = (0..expected.len()).find(|&k| gpu[k] != expected[k]) else {
+                    return gpu;
+                };
+                quotient::record_mismatch();
+                let why = quotient::diagnose::<F, C, D>(
+                    common_data,
+                    prover_data,
+                    &pih,
+                    wires_commitment,
+                    zs,
+                    betas,
+                    gammas,
+                    alphas,
+                    k,
+                );
+                log::error!("plonky2 GPU quotient differs from the CPU at point {k}: {why}");
+                #[cfg(test)]
+                panic!("GPU quotient differs from the CPU at point {k}: {why}");
+                #[cfg(not(test))]
+                return expected;
+            }
+            Err(_) => quotient::record_cpu(),
+        }
+    }
+    cpu()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_quotient_polys_cpu<
     'a,
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
