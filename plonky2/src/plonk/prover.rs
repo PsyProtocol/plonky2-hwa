@@ -679,14 +679,16 @@ fn compute_quotient_polys_pre_transpose<
             alphas,
         ) {
             Ok(gpu) => {
-                if !quotient::check_enabled() {
-                    return gpu;
+                if !gpu.needs_check() {
+                    return gpu.values;
                 }
                 let expected = cpu();
-                let Some(k) = (0..expected.len()).find(|&k| gpu[k] != expected[k]) else {
-                    return gpu;
+                let Some(k) = (0..expected.len()).find(|&k| gpu.values[k] != expected[k]) else {
+                    gpu.passed();
+                    return gpu.values;
                 };
                 quotient::record_mismatch();
+                gpu.failed();
                 let why = quotient::diagnose::<F, C, D>(
                     common_data,
                     prover_data,

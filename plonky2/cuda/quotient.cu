@@ -136,6 +136,15 @@ enum GateKind : u32 {
     G_POSEIDON_MDS = 10,
     G_POSEIDON = 11,
     G_COSET_INTERP = 12,  // p0 = subgroup_bits, p1 = degree; data: domain[2^bits], weights[2^bits]
+    G_EXPONENTIATION = 13,    // p0 = num_power_bits
+    // psy u32 gates (psy_common_circuit / psy_plonky2_basic_helpers; same constraints in both)
+    G_COMPARISON = 14,        // p0 = num_bits, p1 = num_chunks
+    G_U32_ADD_MANY = 15,      // p0 = num_addends, p1 = num_ops, p2 = limbs per op (2-bit limbs)
+    G_U32_ARITHMETIC = 16,    // p0 = num_ops
+    G_U32_SUBTRACTION = 17,   // p0 = num_ops
+    G_U32_INTERLEAVE = 18,    // p0 = num_ops
+    G_UNINTERLEAVE_B32 = 19,  // p0 = num_ops
+    G_UNINTERLEAVE_U32 = 20,  // p0 = num_ops
 };
 
 struct GateDesc {
@@ -376,6 +385,176 @@ __device__ void g_random_access(const Point& p, const GateDesc& g, Sink& s) {
     for (u32 k = 0; k < num_extra; k++) s.one(gsub(p.cons(k), p.wire(start_extra + k)));
 }
 
+// prod_{x < 4} (l - x): range check of a 2-bit limb.
+__device__ __forceinline__ u64 limb2_check(u64 l) {
+    return gmul(gmul(l, gsub(l, 1)), gmul(gsub(l, 2), gsub(l, 3)));
+}
+
+__device__ void g_exponentiation(const Point& p, const GateDesc& g, Sink& s) {
+    const u32 n = g.p0;
+    u64 base = p.wire(0);
+    for (u32 k = 0; k < n; k++) {
+        u64 prev = 1;
+        if (k > 0) {
+            u64 v = p.wire(2 + n + k - 1);
+            prev = gmul(v, v);
+        }
+        u64 bit = p.wire(1 + (n - k - 1));
+        u64 computed = gmul(prev, gadd(gmul(bit, base), gsub(1, bit)));
+        s.one(gsub(computed, p.wire(2 + n + k)));
+    }
+    s.one(gsub(p.wire(1 + n), p.wire(2 + n + n - 1)));
+}
+
+__device__ void g_comparison(const Point& p, const GateDesc& g, Sink& s) {
+    const u32 num_bits = g.p0, nc = g.p1;
+    const u32 chunk_bits = (num_bits + nc - 1) / nc;
+    const u64 chunk_base = 1ull << chunk_bits;
+    const u32 chunk_size = 1u << chunk_bits;
+    u64 first = 0, second = 0;
+    for (int k = (int)nc - 1; k >= 0; k--) {
+        first = gadd(gmul(first, chunk_base), p.wire(4 + k));
+        second = gadd(gmul(second, chunk_base), p.wire(4 + nc + k));
+    }
+    s.one(gsub(first, p.wire(0)));
+    s.one(gsub(second, p.wire(1)));
+    u64 msd = 0;
+    for (u32 k = 0; k < nc; k++) {
+        u64 fc = p.wire(4 + k), sc = p.wire(4 + nc + k);
+        u64 fp = 1, sp = 1;
+        for (u32 x = 0; x < chunk_size; x++) {
+            fp = gmul(fp, gsub(fc, x));
+            sp = gmul(sp, gsub(sc, x));
+        }
+        s.one(fp);
+        s.one(sp);
+        u64 diff = gsub(sc, fc);
+        u64 eq_dummy = p.wire(4 + 2 * nc + k);
+        u64 equal = p.wire(4 + 3 * nc + k);
+        s.one(gsub(gmul(diff, eq_dummy), gsub(1, equal)));
+        s.one(gmul(equal, diff));
+        u64 inter = p.wire(4 + 4 * nc + k);
+        s.one(gsub(inter, gmul(equal, msd)));
+        msd = gadd(inter, gmul(gsub(1, equal), diff));
+    }
+    u64 msd_wire = p.wire(3);
+    s.one(gsub(msd_wire, msd));
+    u64 bits_combined = 0;
+    for (int k = (int)chunk_bits; k >= 0; k--) bits_combined = gadd(gadd(bits_combined, bits_combined), p.wire(4 + 5 * nc + k));
+    for (u32 k = 0; k <= chunk_bits; k++) {
+        u64 b = p.wire(4 + 5 * nc + k);
+        s.one(gmul(b, gsub(1, b)));
+    }
+    s.one(gsub(gadd(msd_wire, chunk_base), bits_combined));
+    s.one(gsub(p.wire(2), p.wire(4 + 5 * nc + chunk_bits)));
+}
+
+__device__ void g_u32_add_many(const Point& p, const GateDesc& g, Sink& s) {
+    const u32 na = g.p0, num_ops = g.p1, num_limbs = g.p2, result_limbs = 16;
+    for (u32 op = 0; op < num_ops; op++) {
+        const u32 w = (na + 3) * op;
+        u64 computed = 0;
+        for (u32 j = 0; j < na; j++) computed = gadd(computed, p.wire(w + j));
+        computed = gadd(computed, p.wire(w + na));
+        u64 out_result = p.wire(w + na + 1), out_carry = p.wire(w + na + 2);
+        s.one(gsub(gadd(gmul(out_carry, 1ull << 32), out_result), computed));
+        u64 cr = 0, cc = 0;
+        const u32 limbs = (na + 3) * num_ops + num_limbs * op;
+        for (int j = (int)num_limbs - 1; j >= 0; j--) {
+            u64 l = p.wire(limbs + j);
+            s.one(limb2_check(l));
+            if ((u32)j < result_limbs) cr = gadd(gmul(cr, 4), l);
+            else cc = gadd(gmul(cc, 4), l);
+        }
+        s.one(gsub(cr, out_result));
+        s.one(gsub(cc, out_carry));
+    }
+}
+
+__device__ void g_u32_arithmetic(const Point& p, const GateDesc& g, Sink& s) {
+    const u32 num_ops = g.p0;
+    for (u32 op = 0; op < num_ops; op++) {
+        const u32 w = 6 * op;
+        u64 computed = gadd(gmul(p.wire(w), p.wire(w + 1)), p.wire(w + 2));
+        u64 out_low = p.wire(w + 3), out_high = p.wire(w + 4), inverse = p.wire(w + 5);
+        u64 diff = gsub(0xFFFFFFFFull, out_high);
+        u64 hi_not_max = gsub(gmul(inverse, diff), 1);
+        s.one(gmul(hi_not_max, out_low));
+        s.one(gsub(gadd(gmul(out_high, 1ull << 32), out_low), computed));
+        u64 cl = 0, ch = 0;
+        const u32 limbs = 6 * num_ops + 32 * op;
+        for (int j = 31; j >= 0; j--) {
+            u64 l = p.wire(limbs + j);
+            s.one(limb2_check(l));
+            if (j < 16) cl = gadd(gmul(cl, 4), l);
+            else ch = gadd(gmul(ch, 4), l);
+        }
+        s.one(gsub(cl, out_low));
+        s.one(gsub(ch, out_high));
+    }
+}
+
+__device__ void g_u32_subtraction(const Point& p, const GateDesc& g, Sink& s) {
+    const u32 num_ops = g.p0;
+    for (u32 op = 0; op < num_ops; op++) {
+        const u32 w = 5 * op;
+        u64 initial = gsub(gsub(p.wire(w), p.wire(w + 1)), p.wire(w + 2));
+        u64 out_result = p.wire(w + 3), out_borrow = p.wire(w + 4);
+        s.one(gsub(out_result, gadd(initial, gmul(out_borrow, 1ull << 32))));
+        u64 c = 0;
+        const u32 limbs = 5 * num_ops + 16 * op;
+        for (int j = 15; j >= 0; j--) {
+            u64 l = p.wire(limbs + j);
+            s.one(limb2_check(l));
+            c = gadd(gmul(c, 4), l);
+        }
+        s.one(gsub(c, out_result));
+        s.one(gmul(out_borrow, gsub(1, out_borrow)));
+    }
+}
+
+__device__ void g_u32_interleave(const Point& p, const GateDesc& g, Sink& s) {
+    const u32 num_ops = g.p0;
+    for (u32 op = 0; op < num_ops; op++) {
+        const u32 bits = 2 * num_ops + 32 * op;
+        u64 x = 0, xi = 0;
+        for (u32 j = 0; j < 32; j++) {
+            u64 b = p.wire(bits + j);
+            x = gadd(gadd(x, x), b);
+            xi = gadd(gmul(xi, 4), b);
+        }
+        s.one(gsub(x, p.wire(2 * op)));
+        s.one(gsub(xi, p.wire(2 * op + 1)));
+        for (u32 j = 0; j < 32; j++) {
+            u64 b = p.wire(bits + j);
+            s.one(gmul(b, gsub(b, 1)));
+        }
+    }
+}
+
+// UninterleaveToB32 (`to_u32` false) and UninterleaveToU32 (`to_u32` true).
+__device__ void g_uninterleave(const Point& p, const GateDesc& g, Sink& s, bool to_u32) {
+    const u32 num_ops = g.p0;
+    for (u32 op = 0; op < num_ops; op++) {
+        const u32 bits = 3 * num_ops + 64 * op;
+        u64 xi = 0;
+        for (u32 j = 0; j < 64; j++) xi = gadd(gadd(xi, xi), p.wire(bits + j));
+        s.one(gsub(xi, p.wire(3 * op)));
+        u64 evens = 0, odds = 0;
+        for (u32 k = 0; k < 32; k++) {
+            u64 coeff = to_u32 ? (1ull << (31 - k)) : (1ull << (2 * (31 - k)));
+            evens = gadd(evens, gmul(p.wire(bits + 2 * k), coeff));
+            odds = gadd(odds, gmul(p.wire(bits + 2 * k + 1), coeff));
+        }
+        s.one(gsub(evens, p.wire(3 * op + 1)));
+        s.one(gsub(odds, p.wire(3 * op + 2)));
+        for (u32 j = 0; j < 64; j++) {
+            u64 b = p.wire(bits + j);
+            s.one(gmul(b, gsub(b, 1)));
+        }
+    }
+}
+
 __device__ void eval_gate(const Point& p, const GateDesc& g, const u64* gate_data, Sink& s) {
     switch (g.kind) {
     case G_NOOP:
@@ -456,6 +635,30 @@ __device__ void eval_gate(const Point& p, const GateDesc& g, const u64* gate_dat
         break;
     case G_COSET_INTERP:
         g_coset_interp(p, g, gate_data + g.data_off, s);
+        break;
+    case G_EXPONENTIATION:
+        g_exponentiation(p, g, s);
+        break;
+    case G_COMPARISON:
+        g_comparison(p, g, s);
+        break;
+    case G_U32_ADD_MANY:
+        g_u32_add_many(p, g, s);
+        break;
+    case G_U32_ARITHMETIC:
+        g_u32_arithmetic(p, g, s);
+        break;
+    case G_U32_SUBTRACTION:
+        g_u32_subtraction(p, g, s);
+        break;
+    case G_U32_INTERLEAVE:
+        g_u32_interleave(p, g, s);
+        break;
+    case G_UNINTERLEAVE_B32:
+        g_uninterleave(p, g, s, false);
+        break;
+    case G_UNINTERLEAVE_U32:
+        g_uninterleave(p, g, s, true);
         break;
     }
 }

@@ -13,6 +13,7 @@
 //! gate.
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 
 use super::*;
@@ -24,6 +25,7 @@ use crate::gates::arithmetic_extension::ArithmeticExtensionGate;
 use crate::gates::base_sum::BaseSumGate;
 use crate::gates::constant::ConstantGate;
 use crate::gates::coset_interpolation::CosetInterpolationGate;
+use crate::gates::exponentiation::ExponentiationGate;
 use crate::gates::multiplication_extension::MulExtensionGate;
 use crate::gates::noop::NoopGate;
 use crate::gates::poseidon::PoseidonGate;
@@ -53,6 +55,14 @@ mod kind {
     pub const POSEIDON_MDS: u32 = 10;
     pub const POSEIDON: u32 = 11;
     pub const COSET_INTERP: u32 = 12;
+    pub const EXPONENTIATION: u32 = 13;
+    pub const COMPARISON: u32 = 14;
+    pub const U32_ADD_MANY: u32 = 15;
+    pub const U32_ARITHMETIC: u32 = 16;
+    pub const U32_SUBTRACTION: u32 = 17;
+    pub const U32_INTERLEAVE: u32 = 18;
+    pub const UNINTERLEAVE_B32: u32 = 19;
+    pub const UNINTERLEAVE_U32: u32 = 20;
 }
 
 /// Number of challenges the kernel is compiled for (`NC` in the kernel).
@@ -229,12 +239,19 @@ struct Plan {
     gates: Vec<GateDesc>,
     data: Vec<u64>,
     max_constraints: usize,
+    /// Some gates were recognised by id rather than by type.
+    by_id: bool,
+    /// Quotients still to be compared with the CPU before the plan is trusted.
+    probation: AtomicU32,
+    /// Set after a mismatch: the circuit stays on the CPU.
+    disabled: AtomicBool,
 }
 
 fn plan<F: RichField + Extendable<D>, const D: usize>(common: &CommonCircuitData<F, D>) -> Result<Plan, String> {
     let mut gates = Vec::with_capacity(common.gates.len());
     let mut data: Vec<u64> = Vec::new();
     let mut max_constraints = 0;
+    let mut by_id = false;
     for (i, g) in common.gates.iter().enumerate() {
         let any = g.0.as_any();
         let selector = common.selectors_info.selector_indices[i];
@@ -296,12 +313,76 @@ fn plan<F: RichField + Extendable<D>, const D: usize>(common: &CommonCircuitData
             d.data_off = data.len() as u32;
             data.extend(F::two_adic_subgroup(x.subgroup_bits).iter().map(|v| v.to_canonical_u64()));
             data.extend(x.barycentric_weights.iter().map(|v| v.to_canonical_u64()));
+        } else if let Some(x) = any.downcast_ref::<ExponentiationGate<F, D>>() {
+            d.kind = kind::EXPONENTIATION;
+            d.p0 = x.num_power_bits as u32;
+        } else if let Some((k, p0, p1, p2)) = psy_u32_gate(&g.0.id(), g.0.num_constraints()) {
+            // Gates defined outside plonky2 are recognised by id; the plan is then on probation
+            // (its first quotient is compared with the CPU's).
+            d.kind = k;
+            d.p0 = p0;
+            d.p1 = p1;
+            d.p2 = p2;
+            by_id = true;
         } else {
             return Err(format!("no device implementation for {}", g.0.id()));
         }
         gates.push(d);
     }
-    Ok(Plan { gates, data, max_constraints })
+    Ok(Plan { gates, data, max_constraints, by_id, probation: AtomicU32::new(probation()), disabled: AtomicBool::new(false) })
+}
+
+/// Parses `name { key: value, ... }` gate ids of the psy u32 gates (both crates define the same
+/// constraints). The constraint count must match the layout the kernel assumes.
+fn psy_u32_gate(id: &str, num_constraints: usize) -> Option<(u32, u32, u32, u32)> {
+    let name = id.split([' ', '{', '(', '<']).next()?;
+    let param = |key: &str| -> Option<u32> {
+        let rest = &id[id.find(&format!("{key}: "))? + key.len() + 2..];
+        rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+    };
+    let n = num_constraints as u32;
+    match name {
+        "ComparisonGate" => {
+            let (bits, chunks) = (param("num_bits")?, param("num_chunks")?);
+            let chunk_bits = bits.div_ceil(chunks);
+            (chunks > 0 && chunk_bits <= 8 && n == 2 + 5 * chunks + 1 + (chunk_bits + 1) + 2)
+                .then_some((kind::COMPARISON, bits, chunks, 0))
+        }
+        "U32AddManyGate" => {
+            let (addends, ops) = (param("num_addends")?, param("num_ops")?);
+            (ops > 0 && n % ops == 0 && n / ops >= 3 + 16).then_some((kind::U32_ADD_MANY, addends, ops, n / ops - 3))
+        }
+        "U32ArithmeticGate" => {
+            let ops = param("num_ops")?;
+            (n == 36 * ops).then_some((kind::U32_ARITHMETIC, ops, 0, 0))
+        }
+        "U32SubtractionGate" => {
+            let ops = param("num_ops")?;
+            (n == 19 * ops).then_some((kind::U32_SUBTRACTION, ops, 0, 0))
+        }
+        "U32InterleaveGate" => {
+            let ops = param("num_ops")?;
+            (n == 34 * ops).then_some((kind::U32_INTERLEAVE, ops, 0, 0))
+        }
+        "UninterleaveToB32Gate" => {
+            let ops = param("num_ops")?;
+            (n == 67 * ops).then_some((kind::UNINTERLEAVE_B32, ops, 0, 0))
+        }
+        "UninterleaveToU32Gate" => {
+            let ops = param("num_ops")?;
+            (n == 67 * ops).then_some((kind::UNINTERLEAVE_U32, ops, 0, 0))
+        }
+        _ => None,
+    }
+}
+
+/// `PLONKY2_GPU_QUOTIENT_PROBATION` (default 1): how many quotients of each circuit are compared
+/// with the CPU's before the GPU result is trusted. Any mismatch moves the circuit to the CPU.
+fn probation() -> u32 {
+    static V: OnceLock<u32> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("PLONKY2_GPU_QUOTIENT_PROBATION").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
+    })
 }
 
 fn cached_plan<F: RichField + Extendable<D>, const D: usize>(
@@ -332,9 +413,42 @@ pub(crate) fn try_compute<F: RichField + Extendable<D>, C: GenericConfig<D, F = 
     betas: &[F],
     gammas: &[F],
     alphas: &[F],
-) -> Result<Vec<Vec<F>>, String> {
-    let (out, n_points) = run(common, prover_data, public_inputs_hash, wires, zs, betas, gammas, alphas, None)?;
-    Ok((0..n_points).map(|i| (0..NC).map(|c| F::from_canonical_u64(out[c * n_points + i])).collect()).collect())
+) -> Result<GpuQuotient<F>, String> {
+    let (out, n_points, plan) = run(common, prover_data, public_inputs_hash, wires, zs, betas, gammas, alphas, None)?;
+    let values = (0..n_points).map(|i| (0..NC).map(|c| F::from_canonical_u64(out[c * n_points + i])).collect()).collect();
+    Ok(GpuQuotient { values, plan })
+}
+
+/// A GPU quotient and the circuit plan that produced it.
+pub(crate) struct GpuQuotient<F> {
+    pub values: Vec<Vec<F>>,
+    plan: Arc<Result<Plan, String>>,
+}
+
+impl<F> GpuQuotient<F> {
+    fn plan(&self) -> &Plan {
+        self.plan.as_ref().as_ref().expect("only successful plans produce results")
+    }
+
+    /// The result must be compared with the CPU's before use: check mode, or the circuit is
+    /// still on probation.
+    pub fn needs_check(&self) -> bool {
+        check_enabled() || self.plan().probation.load(Ordering::Relaxed) > 0
+    }
+
+    /// The comparison matched.
+    pub fn passed(&self) {
+        let _ = self.plan().probation.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
+    }
+
+    /// The comparison failed: the circuit stays on the CPU from now on.
+    pub fn failed(&self) {
+        self.plan().disabled.store(true, Ordering::Relaxed);
+        log::error!(
+            "plonky2 GPU quotient: circuit moved to the CPU after a mismatch (gates recognised by id: {})",
+            self.plan().by_id
+        );
+    }
 }
 
 /// Runs the evaluation; with `debug_point`, returns instead every gate's unfiltered constraints
@@ -350,7 +464,7 @@ fn run<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     gammas: &[F],
     alphas: &[F],
     debug_point: Option<usize>,
-) -> Result<(Vec<u64>, usize), String> {
+) -> Result<(Vec<u64>, usize, Arc<Result<Plan, String>>), String> {
     if !enabled() {
         return Err("disabled".into());
     }
@@ -404,6 +518,9 @@ fn run<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     let digest = crate::plonk::config::GenericHashOut::to_vec(&prover_data.circuit_digest)[0].to_canonical_u64();
     let plan_ref = cached_plan(common, digest);
     let plan = plan_ref.as_ref().as_ref().map_err(|e| e.clone())?;
+    if plan.disabled.load(Ordering::Relaxed) {
+        return Err("disabled after a mismatch".into());
+    }
 
     // Auxiliary data: k_is | betas | gammas | alpha powers [NC][num_terms] | gate data.
     let num_chunks = num_prods + 1;
@@ -490,7 +607,7 @@ fn run<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 Q_EXEC_NS.fetch_add(exec.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 stage_log::quotient_event("gpu", "", exec.elapsed().as_secs_f64(), total.elapsed().as_secs_f64());
             }
-            Ok((out, big_n))
+            Ok((out, big_n, plan_ref.clone()))
         }
         Err(e) => {
             Q_FAILED.store(true, Ordering::Relaxed);
@@ -586,7 +703,7 @@ pub(crate) fn diagnose<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
     k: usize,
 ) -> String {
     let dbg = match run(common, prover_data, public_inputs_hash, wires, zs, betas, gammas, alphas, Some(k)) {
-        Ok((v, _)) => v,
+        Ok((v, _, _)) => v,
         Err(e) => return format!("debug run failed: {e}"),
     };
     let stride = common.gates.iter().map(|g| g.0.num_constraints()).max().unwrap_or(1).max(1);
@@ -624,6 +741,7 @@ mod tests {
     use anyhow::Result;
 
     use super::*;
+    use crate::field::types::Field;
     use crate::gates::noop::NoopGate;
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_builder::CircuitBuilder;
@@ -667,5 +785,46 @@ mod tests {
         outer.verify(proof)?;
         assert!(Q_GPU.load(Ordering::Relaxed) > before, "the outer proof's quotient did not run on the GPU");
         Ok(())
+    }
+
+    /// ExponentiationGate (with Arithmetic, Constant and PublicInput gates).
+    #[test]
+    fn exponentiation_quotient_on_gpu() -> Result<()> {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = GoldilocksField;
+        if !enabled() || std::env::var("PLONKY2_GPU").ok().as_deref() != Some("1") {
+            eprintln!("skipped: set PLONKY2_GPU=1 PLONKY2_GPU_QUOTIENT=1");
+            return Ok(());
+        }
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let mut pw = PartialWitness::new();
+        for k in 0..40u64 {
+            let base = builder.add_virtual_target();
+            pw.set_target(base, F::from_canonical_u64(3 + k))?;
+            let power = builder.exp_u64(base, 0x1234_5678_9abc + k);
+            let sum = builder.add(power, base);
+            builder.register_public_input(sum);
+        }
+        let data = builder.build::<C>();
+        assert!(data.common.gates.iter().any(|g| g.0.as_any().is::<ExponentiationGate<F, D>>()));
+        plan(&data.common).map_err(anyhow::Error::msg)?;
+        let before = Q_GPU.load(Ordering::Relaxed);
+        let proof = data.prove(pw)?;
+        data.verify(proof)?;
+        assert!(Q_GPU.load(Ordering::Relaxed) > before, "the quotient did not run on the GPU");
+        Ok(())
+    }
+
+    #[test]
+    fn psy_u32_gate_ids_parse() {
+        let cmp = "ComparisonGate { num_bits: 32, num_chunks: 16, _phantom: PhantomData<plonky2_field::goldilocks_field::GoldilocksField> }<D=2>";
+        assert_eq!(psy_u32_gate(cmp, 88), Some((kind::COMPARISON, 32, 16, 0)));
+        assert_eq!(psy_u32_gate(cmp, 87), None);
+        let add = "U32AddManyGate { num_addends: 3, num_ops: 5, _phantom: PhantomData<plonky2_field::goldilocks_field::GoldilocksField> }";
+        assert_eq!(psy_u32_gate(add, 105), Some((kind::U32_ADD_MANY, 3, 5, 18)));
+        assert_eq!(psy_u32_gate("U32InterleaveGate { num_ops: 4 }", 136), Some((kind::U32_INTERLEAVE, 4, 0, 0)));
+        assert_eq!(psy_u32_gate("UninterleaveToU32Gate { num_ops: 2 }", 134), Some((kind::UNINTERLEAVE_U32, 2, 0, 0)));
+        assert_eq!(psy_u32_gate("U32RangeCheckGate { num_input_limbs: 1 }", 17), None);
     }
 }
