@@ -490,11 +490,11 @@ fn resident_budget() -> u64 {
 }
 
 /// Device memory left free for the commitments' workspace when caching LDEs for the quotient
-/// (`PLONKY2_GPU_RESERVE_BYTES`, default 2 GiB).
+/// (`PLONKY2_GPU_RESERVE_BYTES`, default 3 GiB: a 2^17-row commitment's workspace).
 fn device_reserve() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("PLONKY2_GPU_RESERVE_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(2 << 30)
+        std::env::var("PLONKY2_GPU_RESERVE_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(3 << 30)
     })
 }
 
@@ -623,6 +623,8 @@ static FAILED: AtomicBool = AtomicBool::new(false);
 static GPU_COMMITS: AtomicU64 = AtomicU64::new(0);
 static CPU_COMMITS: AtomicU64 = AtomicU64::new(0);
 static GPU_ERRORS: AtomicU64 = AtomicU64::new(0);
+static OOM_RETRIES: AtomicU64 = AtomicU64::new(0);
+static OOM_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static QUARANTINED: AtomicU64 = AtomicU64::new(0);
 static LOCK_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static BUF_WAIT_NS: AtomicU64 = AtomicU64::new(0);
@@ -688,6 +690,10 @@ pub struct GpuStats {
     /// FRI proof-of-work searches done on the GPU (PLONKY2_GPU_POW=1) and their wall time.
     pub pow_gpu: u64,
     pub pow_ns: u64,
+    /// Commitments that ran out of device memory: retried after dropping the quotient caches, and
+    /// computed on the CPU after all.
+    pub oom_retries: u64,
+    pub oom_fallbacks: u64,
 }
 
 pub fn stats() -> GpuStats {
@@ -728,6 +734,8 @@ pub fn stats() -> GpuStats {
         kept_lde_bytes: resident_stats().2,
         pow_gpu: pow::pow_stats().0,
         pow_ns: pow::pow_stats().1,
+        oom_retries: OOM_RETRIES.load(Ordering::Relaxed),
+        oom_fallbacks: OOM_FALLBACKS.load(Ordering::Relaxed),
     }
 }
 
@@ -898,9 +906,19 @@ pub(crate) fn try_commit<F: RichField, H: Hasher<F>>(
     let wait = Instant::now();
     let mut state = range("gpu:lock_wait", || b.state.lock().unwrap_or_else(|e| e.into_inner()));
     let lock_wait = wait.elapsed().as_secs_f64();
-    let result = range("gpu:device", || {
+    let mut result = range("gpu:device", || {
         run(&mut state, out.set.as_mut().expect("claimed"), pre_canon, lease_ptr, polynomials, lg_n, rate_bits, cap_height)
     });
+    // Out of device memory while growing buffers (nothing was launched yet): drop the quotient's
+    // caches and try once more.
+    if matches!(&result, Err(e) if e.contains("out of memory")) {
+        unsafe { ffi::cudaGetLastError() };
+        quotient::release_device_caches(&mut state.q);
+        OOM_RETRIES.fetch_add(1, Ordering::Relaxed);
+        result = range("gpu:device", || {
+            run(&mut state, out.set.as_mut().expect("claimed"), pre_canon, lease_ptr, polynomials, lg_n, rate_bits, cap_height)
+        });
+    }
     // 3. Device work is complete (synchronous copies + device sync); the set is ours alone.
     drop(state);
 
@@ -930,6 +948,16 @@ pub(crate) fn try_commit<F: RichField, H: Hasher<F>>(
             EXEC_NS.fetch_add((exec_s * 1e9) as u64, Ordering::Relaxed);
             REBUILD_NS.fetch_add((rebuild_s * 1e9) as u64, Ordering::Relaxed);
             Ok(tree)
+        }
+        Err(e) if e.contains("out of memory") && confirm_device_idle_after_error() => {
+            // Still no room after dropping the caches: this commitment uses the CPU; the GPU stays
+            // on for the next ones.
+            unsafe { ffi::cudaGetLastError() };
+            drop(out);
+            drop(lease);
+            OOM_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            log::warn!("plonky2 GPU commitment: out of device memory, this commitment on the CPU: {e}");
+            Err("gpu_oom")
         }
         Err(e) => {
             // The failed run may have left an async download in flight into `out` / `lease`.
@@ -1044,6 +1072,16 @@ fn run<F: RichField>(
             v > 0
         });
     let kept = if capture { RESIDENT_POOL.take(cols * rows * 8) } else { None };
+    // Returns the kept buffer to the pool if this run fails before it is recorded.
+    struct KeptGuard(Option<(usize, usize)>);
+    impl Drop for KeptGuard {
+        fn drop(&mut self) {
+            if let Some((p, b)) = self.0.take() {
+                RESIDENT_POOL.give(p, b);
+            }
+        }
+    }
+    let mut kept_guard = KeptGuard(kept.map(|p| (p as usize, cols * rows * 8)));
     let d_lde = match kept {
         Some(p) => p,
         None => dev(WS_LDE, cols * rows)?,
@@ -1121,8 +1159,8 @@ fn run<F: RichField>(
     sync("download")?;
     drop(_d2h);
     range("gpu:free", || drop(owned));
-    if let Some(p) = kept {
-        RESIDENT.with(|r| r.borrow_mut().push(Resident { ptr: p as usize, bytes: cols * rows * 8, cols, lg_rows }));
+    if let Some((p, bytes)) = kept_guard.0.take() {
+        RESIDENT.with(|r| r.borrow_mut().push(Resident { ptr: p, bytes, cols, lg_rows }));
     }
     Ok((cols * rows, num_digests * HASH_U64, caps * HASH_U64, t.elapsed().as_secs_f64()))
 }

@@ -832,7 +832,7 @@ fn evict_lru(c: &mut ConstCache) {
 
 /// After running out of device memory: frees every cache the quotient keeps (call under the GPU
 /// lock) and clears the error.
-fn release_device_caches(q: &mut QuotientBufs) {
+pub(super) fn release_device_caches(q: &mut QuotientBufs) {
     if let Some(cache) = CONST_CACHE.get() {
         let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
         while !c.entries.is_empty() {
