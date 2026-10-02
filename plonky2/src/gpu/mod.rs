@@ -38,6 +38,8 @@ use crate::hash::poseidon::PoseidonHash;
 use crate::plonk::config::Hasher;
 use crate::util::stage_log;
 
+mod leaf_pool;
+
 const P: u64 = 0xffff_ffff_0000_0001;
 const HASH_U64: usize = 4;
 /// Twiddles are precomputed up to this NTT size; larger commitments stay on the CPU.
@@ -330,6 +332,41 @@ struct Backend {
     min_lde_rows: usize,
     state: Mutex<State>,
     pool: Pool,
+    /// `PLONKY2_GPU_LEAF_LEASE=1`: leaves are downloaded into leased pinned buffers that the tree
+    /// keeps (no copy); budget `PLONKY2_GPU_LEAF_POOL_BYTES` (default 4 GiB, at most 32 GiB).
+    leaf_pool: Option<std::sync::Arc<leaf_pool::LeafPool>>,
+}
+
+struct CudaPinned;
+
+impl leaf_pool::HostAlloc for CudaPinned {
+    fn alloc(&self, bytes: usize) -> Option<*mut u8> {
+        let mut p = core::ptr::null_mut();
+        let ok = unsafe { ffi::cudaMallocHost(&mut p, bytes) } == 0;
+        if ok {
+            log::info!("plonky2 GPU leaf pool: pinned {bytes} bytes");
+        }
+        ok.then_some(p as *mut u8)
+    }
+
+    unsafe fn free(&self, ptr: *mut u8, _bytes: usize) {
+        ffi::cudaFreeHost(ptr as *mut c_void);
+    }
+}
+
+fn make_leaf_pool() -> Option<std::sync::Arc<leaf_pool::LeafPool>> {
+    if std::env::var("PLONKY2_GPU_LEAF_LEASE").ok().as_deref() != Some("1") {
+        return None;
+    }
+    let mut budget = std::env::var("PLONKY2_GPU_LEAF_POOL_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(leaf_pool::DEFAULT_BUDGET);
+    if budget > leaf_pool::MAX_BUDGET {
+        log::warn!("PLONKY2_GPU_LEAF_POOL_BYTES={budget} exceeds the 32 GiB cap; using 32 GiB");
+        budget = leaf_pool::MAX_BUDGET;
+    }
+    Some(leaf_pool::LeafPool::new(budget, Box::new(CudaPinned)))
 }
 
 /// `PLONKY2_GPU_OVERLAP_D2H=1`: download the leaves on a separate non-blocking stream while the
@@ -369,6 +406,13 @@ pub struct GpuStats {
     /// Output buffer sets: pool size and how many are free right now.
     pub pool_size: u64,
     pub pool_free: u64,
+    /// Leaf leases (PLONKY2_GPU_LEAF_LEASE=1): granted, refused (copied instead), leased bytes now
+    /// and at peak, pinned bytes held by the leaf pool at peak.
+    pub leases_granted: u64,
+    pub leases_refused: u64,
+    pub leased_bytes: u64,
+    pub leased_peak_bytes: u64,
+    pub leaf_pool_peak_bytes: u64,
 }
 
 pub fn stats() -> GpuStats {
@@ -384,7 +428,16 @@ pub fn stats() -> GpuStats {
         pinned_peak_bytes: PINNED_PEAK.load(Ordering::Relaxed),
         pool_size: BACKEND.get().and_then(|b| b.as_ref()).map_or(0, |b| b.pool.size as u64),
         pool_free: BACKEND.get().and_then(|b| b.as_ref()).map_or(0, |b| b.pool.free.lock().map_or(0, |f| f.len() as u64)),
+        leases_granted: leaf_stat(|p| p.granted.load(Ordering::Relaxed)),
+        leases_refused: leaf_stat(|p| p.refused.load(Ordering::Relaxed)),
+        leased_bytes: leaf_stat(|p| p.leased_bytes.load(Ordering::Relaxed)),
+        leased_peak_bytes: leaf_stat(|p| p.leased_peak.load(Ordering::Relaxed)),
+        leaf_pool_peak_bytes: leaf_stat(|p| p.allocated_peak.load(Ordering::Relaxed)),
     }
+}
+
+fn leaf_stat(f: impl Fn(&leaf_pool::LeafPool) -> u64) -> u64 {
+    BACKEND.get().and_then(|b| b.as_ref()).and_then(|b| b.leaf_pool.as_deref()).map_or(0, f)
 }
 
 pub(crate) fn count_cpu_commit() {
@@ -413,7 +466,13 @@ fn backend() -> Option<&'static Backend> {
                          {buffers} output buffer sets, twiddles up to 2^{MAX_LG}",
                         std::env::var("CUDA_VISIBLE_DEVICES").ok()
                     );
+                    let leaf_pool = make_leaf_pool();
+                    log::info!(
+                        "plonky2 GPU leaf leases: {}",
+                        leaf_pool.as_ref().map_or("off".to_string(), |p| format!("on, budget {} bytes", p.budget()))
+                    );
                     Some(Backend {
+                        leaf_pool,
                         min_lde_rows,
                         state: Mutex::new(State { input: Pinned::empty(), copy_stream: copy_stream_for_init() }),
                         pool: Pool {
@@ -501,6 +560,10 @@ pub(crate) fn try_commit<F: RichField, H: Hasher<F>>(
     }
     let b: &'static Backend = backend().expect("checked by cpu_reason");
 
+    // 0. Lease leaf storage (non-blocking; None -> leaves are copied out of the output set).
+    let mut lease = b.leaf_pool.as_ref().and_then(|p| p.try_lease(cols * (n << rate_bits) * 8));
+    let lease_ptr = lease.as_mut().map(|l| l.as_mut_ptr() as *mut u64);
+
     // 1. Claim an exclusive output set (bounded pool).
     let buf_wait_start = Instant::now();
     let mut out = range("gpu:buffer_wait", || b.pool.acquire());
@@ -511,7 +574,9 @@ pub(crate) fn try_commit<F: RichField, H: Hasher<F>>(
     let mut state = range("gpu:lock_wait", || b.state.lock().unwrap_or_else(|e| e.into_inner()));
     let lock_wait = wait.elapsed().as_secs_f64();
     let copy_stream = state.copy_stream;
-    let result = range("gpu:device", || run(&mut state.input, copy_stream, out.set.as_mut().expect("claimed"), polynomials, lg_n, rate_bits, cap_height));
+    let result = range("gpu:device", || {
+        run(&mut state.input, copy_stream, out.set.as_mut().expect("claimed"), lease_ptr, polynomials, lg_n, rate_bits, cap_height)
+    });
     // 3. Device work is complete (synchronous copies + device sync); the set is ours alone.
     drop(state);
 
@@ -519,12 +584,14 @@ pub(crate) fn try_commit<F: RichField, H: Hasher<F>>(
         Ok((leaves_flat_len, digests_len, cap_len, exec_s)) => {
             // 4. Rebuild outside the GPU lock; the set returns to the pool when `out` drops.
             let rebuild = Instant::now();
+            let leased = lease.is_some();
             let tree = range("gpu:rebuild", || {
-                rebuild_tree::<F, H>(out.set.as_ref().expect("claimed"), cols, lg_n + rate_bits, cap_height, leaves_flat_len, digests_len, cap_len)
+                rebuild_tree::<F, H>(out.set.as_ref().expect("claimed"), lease, cols, lg_n + rate_bits, cap_height, leaves_flat_len, digests_len, cap_len)
             });
             drop(out);
             let rebuild_s = rebuild.elapsed().as_secs_f64();
-            stage_log::commit_event("gpu", "", lg_n, rate_bits, cols, buf_wait, lock_wait, exec_s, rebuild_s, total.elapsed().as_secs_f64());
+            let mode = if leased { "leaves:lease" } else if b.leaf_pool.is_some() { "leaves:copy_refused" } else { "leaves:copy" };
+            stage_log::commit_event("gpu", mode, lg_n, rate_bits, cols, buf_wait, lock_wait, exec_s, rebuild_s, total.elapsed().as_secs_f64());
             BUF_WAIT_NS.fetch_add((buf_wait * 1e9) as u64, Ordering::Relaxed);
             GPU_COMMITS.fetch_add(1, Ordering::Relaxed);
             LOCK_WAIT_NS.fetch_add((lock_wait * 1e9) as u64, Ordering::Relaxed);
@@ -534,6 +601,7 @@ pub(crate) fn try_commit<F: RichField, H: Hasher<F>>(
         }
         Err(e) => {
             drop(out);
+            drop(lease);
             FAILED.store(true, Ordering::Relaxed);
             GPU_ERRORS.fetch_add(1, Ordering::Relaxed);
             log::error!("plonky2 GPU commitment failed, falling back to CPU for the rest of the process: {e}");
@@ -548,6 +616,7 @@ fn run<F: RichField>(
     input_staging: &mut Pinned,
     copy_stream: *mut c_void,
     out: &mut OutputSet,
+    lease_ptr: Option<*mut u64>,
     polynomials: &[PolynomialCoeffs<F>],
     lg_n: usize,
     rate_bits: usize,
@@ -568,7 +637,11 @@ fn run<F: RichField>(
 
     // Grow the pinned outputs first: cudaMallocHost may synchronise and must not split the
     // overlapped download from the Merkle kernels below.
-    let leaves = out.leaves.ensure(cols * rows)?;
+    let leaves: &mut [u64] = match lease_ptr {
+        // SAFETY: the lease holds at least `cols * rows` u64 and is exclusively ours.
+        Some(p) => unsafe { core::slice::from_raw_parts_mut(p, cols * rows) },
+        None => out.leaves.ensure(cols * rows)?,
+    };
     let digests = out.digests.ensure((num_digests + caps) * HASH_U64)?;
     let overlap = overlap_d2h();
 
@@ -680,8 +753,10 @@ impl Drop for NvtxScope {
 /// Builds the plonky2 `MerkleTree` from the pinned buffers: row-major leaves, zeknox's linear
 /// digest layout (per cap subtree, node k has children 2k+2 and 2k+3) converted to plonky2's
 /// recursive layout, and the cap.
+#[allow(clippy::too_many_arguments)]
 fn rebuild_tree<F: RichField, H: Hasher<F>>(
     state: &OutputSet,
+    lease: Option<leaf_pool::Lease>,
     cols: usize,
     lg_rows: usize,
     cap_height: usize,
@@ -695,13 +770,24 @@ fn rebuild_tree<F: RichField, H: Hasher<F>>(
     if inject("rebuild_panic") {
         panic!("injected rebuild_panic");
     }
+    if let Some(mut lease) = lease {
+        // The leaves are already in the leased buffer: hand it to the tree, no copy.
+        let ptr = lease.as_mut_ptr() as *const F;
+        let digest_flat = unsafe { core::slice::from_raw_parts(state.digests.ptr, digests_len + cap_len) };
+        let (digests, cap) = rebuild_digests(digest_flat, digests_len, lg_rows, cap_height);
+        // SAFETY: F == GoldilocksField (repr(transparent) u64); `leaves_len` elements were
+        // downloaded into the lease, which `ExternalLeaves` keeps alive and never writes again.
+        let leaves = unsafe { crate::hash::leaf_matrix::ExternalLeaves::new(ptr, leaves_len, Box::new(lease)) };
+        return unsafe {
+            MerkleTree {
+                leaves: crate::hash::leaf_matrix::LeafMatrix::from_external(leaves, cols),
+                digests: cast_vec::<HashOut<GoldilocksField>, H::Hash>(digests),
+                cap: MerkleCap(cast_vec::<HashOut<GoldilocksField>, H::Hash>(cap)),
+            }
+        };
+    }
     let leaves_flat = unsafe { core::slice::from_raw_parts(state.leaves.ptr, leaves_len) };
     let digest_flat = unsafe { core::slice::from_raw_parts(state.digests.ptr, digests_len + cap_len) };
-    let (lin_flat, cap_flat) = digest_flat.split_at(digests_len);
-
-    let to_hash = |c: &[u64]| -> HashOut<GoldilocksField> {
-        HashOut { elements: [GoldilocksField(c[0]), GoldilocksField(c[1]), GoldilocksField(c[2]), GoldilocksField(c[3])] }
-    };
 
     // One contiguous row-major copy out of the pinned buffer (no per-row allocation).
     let mut leaves: Vec<GoldilocksField> = Vec::with_capacity(leaves_flat.len());
@@ -715,18 +801,7 @@ fn rebuild_tree<F: RichField, H: Hasher<F>>(
     }
     // SAFETY: every element up to `leaves_flat.len()` was written above.
     unsafe { leaves.set_len(leaves_flat.len()) };
-
-    let caps = 1usize << cap_height;
-    let subtree_leaves = 1usize << (lg_rows - cap_height);
-    let per_subtree = if subtree_leaves > 1 { 2 * subtree_leaves - 2 } else { 0 };
-    let mut digests = std::vec![HashOut::<GoldilocksField>::default(); caps * per_subtree];
-    if per_subtree > 0 {
-        digests.par_chunks_mut(per_subtree).enumerate().for_each(|(s, out)| {
-            let lin = &lin_flat[s * per_subtree * HASH_U64..(s + 1) * per_subtree * HASH_U64];
-            linear_to_recursive(out, lin, 0, &to_hash);
-        });
-    }
-    let cap: Vec<HashOut<GoldilocksField>> = cap_flat.chunks_exact(HASH_U64).map(to_hash).collect();
+    let (digests, cap) = rebuild_digests(digest_flat, digests_len, lg_rows, cap_height);
 
     // SAFETY: F == GoldilocksField and H == PoseidonHash (checked by `cpu_reason`), so
     // H::Hash == HashOut<GoldilocksField>; the casts are identities.
@@ -737,6 +812,32 @@ fn rebuild_tree<F: RichField, H: Hasher<F>>(
             cap: MerkleCap(cast_vec::<HashOut<GoldilocksField>, H::Hash>(cap)),
         }
     }
+}
+
+/// zeknox's linear digests (per cap subtree, node k has children 2k+2 and 2k+3) followed by the
+/// cap, converted to plonky2's recursive digest layout and cap.
+fn rebuild_digests(
+    digest_flat: &[u64],
+    digests_len: usize,
+    lg_rows: usize,
+    cap_height: usize,
+) -> (Vec<HashOut<GoldilocksField>>, Vec<HashOut<GoldilocksField>>) {
+    let (lin_flat, cap_flat) = digest_flat.split_at(digests_len);
+    let to_hash = |c: &[u64]| -> HashOut<GoldilocksField> {
+        HashOut { elements: [GoldilocksField(c[0]), GoldilocksField(c[1]), GoldilocksField(c[2]), GoldilocksField(c[3])] }
+    };
+    let caps = 1usize << cap_height;
+    let subtree_leaves = 1usize << (lg_rows - cap_height);
+    let per_subtree = if subtree_leaves > 1 { 2 * subtree_leaves - 2 } else { 0 };
+    let mut digests = std::vec![HashOut::<GoldilocksField>::default(); caps * per_subtree];
+    if per_subtree > 0 {
+        digests.par_chunks_mut(per_subtree).enumerate().for_each(|(s, out)| {
+            let lin = &lin_flat[s * per_subtree * HASH_U64..(s + 1) * per_subtree * HASH_U64];
+            linear_to_recursive(out, lin, 0, &to_hash);
+        });
+    }
+    let cap = cap_flat.chunks_exact(HASH_U64).map(to_hash).collect();
+    (digests, cap)
 }
 
 /// `out` is one subtree in plonky2's layout (left subtree || left digest || right digest || right

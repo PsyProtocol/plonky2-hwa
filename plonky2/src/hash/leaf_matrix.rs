@@ -7,14 +7,59 @@
 //! `Vec<Vec<F>>` encoding regardless of the in-memory form, so stored data is unchanged.
 
 #[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use core::ops::Index;
 
-#[derive(Clone, Debug)]
+/// Read-only contiguous leaves owned by something else (e.g. a pinned buffer leased from a
+/// pool); `owner` keeps the memory alive and is dropped (returning the buffer) with the matrix.
+pub struct ExternalLeaves<F> {
+    data: *const F,
+    len: usize,
+    _owner: Box<dyn core::any::Any + Send + Sync>,
+}
+
+// SAFETY: the data is never written after construction and lives as long as `_owner`.
+unsafe impl<F: Sync> Send for ExternalLeaves<F> {}
+unsafe impl<F: Sync> Sync for ExternalLeaves<F> {}
+
+impl<F> core::fmt::Debug for ExternalLeaves<F> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "ExternalLeaves {{ len: {} }}", self.len)
+    }
+}
+
+impl<F> ExternalLeaves<F> {
+    /// # Safety
+    /// `data` must point to `len` initialised elements that stay valid and unmodified for as long
+    /// as `owner` is alive.
+    pub unsafe fn new(data: *const F, len: usize, owner: Box<dyn core::any::Any + Send + Sync>) -> Self {
+        Self { data, len, _owner: owner }
+    }
+
+    fn as_slice(&self) -> &[F] {
+        // SAFETY: see `new`.
+        unsafe { core::slice::from_raw_parts(self.data, self.len) }
+    }
+}
+
+#[derive(Debug)]
 pub enum LeafMatrix<F> {
     /// `rows * width` elements, row `i` at `data[i * width..(i + 1) * width]`; `width > 0`.
     Flat { data: Vec<F>, width: usize },
     Nested(Vec<Vec<F>>),
+    /// Contiguous like `Flat`, but the storage belongs to `leaves`' owner.
+    External { leaves: ExternalLeaves<F>, width: usize },
+}
+
+impl<F: Clone> Clone for LeafMatrix<F> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Flat { data, width } => Self::Flat { data: data.clone(), width: *width },
+            Self::Nested(v) => Self::Nested(v.clone()),
+            // A clone never shares the external owner: copy into a flat matrix.
+            Self::External { leaves, width } => Self::Flat { data: leaves.as_slice().to_vec(), width: *width },
+        }
+    }
 }
 
 impl<F> Default for LeafMatrix<F> {
@@ -31,11 +76,19 @@ impl<F> LeafMatrix<F> {
         Self::Flat { data, width }
     }
 
+    /// Contiguous leaves of `width` elements each in external storage.
+    pub fn from_external(leaves: ExternalLeaves<F>, width: usize) -> Self {
+        assert!(width > 0, "external leaves need a non-zero width");
+        assert_eq!(leaves.len % width, 0, "external leaves length must be a multiple of the width");
+        Self::External { leaves, width }
+    }
+
     /// Number of leaves (rows).
     pub fn len(&self) -> usize {
         match self {
             Self::Flat { data, width } => data.len() / width,
             Self::Nested(v) => v.len(),
+            Self::External { leaves, width } => leaves.len / width,
         }
     }
 
@@ -47,6 +100,7 @@ impl<F> LeafMatrix<F> {
         match self {
             Self::Flat { data, width } => data.get(i * width..(i + 1) * width),
             Self::Nested(v) => v.get(i).map(|r| r.as_slice()),
+            Self::External { leaves, width } => leaves.as_slice().get(i * width..(i + 1) * width),
         }
     }
 
@@ -56,6 +110,10 @@ impl<F> LeafMatrix<F> {
 
     pub const fn is_flat(&self) -> bool {
         matches!(self, Self::Flat { .. })
+    }
+
+    pub const fn is_external(&self) -> bool {
+        matches!(self, Self::External { .. })
     }
 
     /// The nested form (copies when the storage is flat).
@@ -80,6 +138,7 @@ impl<F> Index<usize> for LeafMatrix<F> {
         match self {
             Self::Flat { data, width } => &data[i * width..(i + 1) * width],
             Self::Nested(v) => &v[i],
+            Self::External { leaves, width } => &leaves.as_slice()[i * width..(i + 1) * width],
         }
     }
 }
@@ -154,7 +213,7 @@ impl<C: speedy::Context, F: speedy::Writable<C> + Clone> speedy::Writable<C> for
     fn write_to<T: ?Sized + speedy::Writer<C>>(&self, writer: &mut T) -> Result<(), C::Error> {
         match self {
             Self::Nested(v) => v.write_to(writer),
-            Self::Flat { .. } => self.to_nested().write_to(writer),
+            Self::Flat { .. } | Self::External { .. } => self.to_nested().write_to(writer),
         }
     }
 }
@@ -174,6 +233,29 @@ mod tests {
         assert_eq!(flat.iter().map(|r| r.len()).sum::<usize>(), 40);
         assert_eq!(flat.to_nested(), nested);
         assert_eq!(flat.get(8), None);
+    }
+
+    #[test]
+    fn external_leaves_behave_like_flat_and_drop_their_owner() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        struct Owner(Vec<u64>, Arc<AtomicUsize>);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.1.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let nested: Vec<Vec<u64>> = (0..6).map(|i| vec![i, i + 1, i + 2]).collect();
+        let owner = Box::new(Owner(nested.concat(), dropped.clone()));
+        let ptr = owner.0.as_ptr();
+        let m = LeafMatrix::from_external(unsafe { ExternalLeaves::new(ptr, 18, owner) }, 3);
+        assert!(m == nested && m.len() == 6 && &m[2] == &[2, 3, 4][..]);
+        let c = m.clone();
+        assert!(!c.is_external() && c == m);
+        drop(m);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1, "owner dropped with the matrix");
+        assert!(c == nested, "clone owns its data");
     }
 
     #[cfg(feature = "serialize_speedy")]
