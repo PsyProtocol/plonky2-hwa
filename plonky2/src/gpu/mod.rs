@@ -143,6 +143,7 @@ mod ffi {
         pub fn cudaFreeHost(ptr: *mut c_void) -> i32;
         pub fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
         pub fn cudaSetDeviceFlags(flags: u32) -> i32;
+        pub fn cudaStreamSynchronize(stream: *mut c_void) -> i32;
     }
 
     pub const H2D: i32 = 1;
@@ -302,7 +303,6 @@ struct State {
     copy_stream: *mut c_void,
     ws: Workspace,
     q: quotient::QuotientBufs,
-    pow_best: DevBuf,
 }
 
 /// Growable device buffers reused across commitments (only touched under the GPU lock).
@@ -794,7 +794,6 @@ fn backend() -> Option<&'static Backend> {
                             copy_stream: copy_stream_for_init(),
                             ws: Workspace { bufs: [DevBuf::empty(), DevBuf::empty(), DevBuf::empty(), DevBuf::empty(), DevBuf::empty(), DevBuf::empty()] },
                             q: quotient::QuotientBufs::new(),
-                            pow_best: DevBuf::empty(),
                         }),
                         pool: Pool {
                             size: buffers,

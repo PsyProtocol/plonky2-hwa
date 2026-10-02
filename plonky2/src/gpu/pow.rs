@@ -4,6 +4,10 @@
 //! consecutive candidates per launch and keeps the smallest accepting one, so the result equals
 //! the CPU's ordered search (`find_first`). Batches continue from where the previous one ended;
 //! after `MAX_BATCHES` without a hit, or after a device error, the CPU searches instead.
+//!
+//! The search does not take the GPU lock: each search borrows a context (its own non-blocking
+//! stream, a device word and a pinned host word) from a small pool, so it runs alongside the
+//! commitments instead of queueing behind them.
 
 use super::*;
 
@@ -19,7 +23,7 @@ struct PowArgs {
 }
 
 extern "C" {
-    fn plonky2_pow_launch(args: *const PowArgs) -> i32;
+    fn plonky2_pow_launch(args: *const PowArgs, stream: *mut c_void) -> i32;
     #[cfg(test)]
     fn plonky2_poseidon_permute_states(states: *mut u64, n: u32) -> i32;
 }
@@ -49,11 +53,17 @@ pub(crate) fn search(state: &[u64; 12], pos: usize, response: usize, min_leading
     if !enabled() || POW_FAILED.load(Ordering::Relaxed) || FAILED.load(Ordering::Relaxed) {
         return None;
     }
-    let b = backend()?;
+    backend()?;
     let t = Instant::now();
-    let mut st = range("gpu:pow_lock_wait", || b.state.lock().unwrap_or_else(|e| e.into_inner()));
-    let result = range("gpu:pow", || device_search(&mut st.pow_best, state, pos, response, min_leading_zeros));
-    drop(st);
+    let result = range("gpu:pow", || -> GpuResult<Option<u64>> {
+        super::quotient::init_once()?;
+        let ctx = PowCtx::take()?;
+        let r = device_search(&ctx, state, pos, response, min_leading_zeros);
+        if r.is_ok() {
+            ctx.give();
+        }
+        r
+    });
     match result {
         Ok(found) => {
             if found.is_some() {
@@ -70,17 +80,46 @@ pub(crate) fn search(state: &[u64; 12], pos: usize, response: usize, min_leading
     }
 }
 
+/// A non-blocking stream with a device word for the result and a pinned host word to read it.
+struct PowCtx {
+    stream: usize,
+    d_best: usize,
+    h_best: usize,
+}
+
+static POW_CTXS: Mutex<Vec<PowCtx>> = Mutex::new(Vec::new());
+
+impl PowCtx {
+    fn take() -> GpuResult<Self> {
+        if let Some(c) = POW_CTXS.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+            return Ok(c);
+        }
+        let (mut stream, mut d, mut h) = (core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut());
+        cuda(unsafe { ffi::cudaStreamCreateWithFlags(&mut stream, 1) }, "pow stream")?;
+        cuda(unsafe { ffi::cudaMalloc(&mut d, 8) }, "pow device word")?;
+        cuda(unsafe { ffi::cudaMallocHost(&mut h, 8) }, "pow host word")?;
+        Ok(Self { stream: stream as usize, d_best: d as usize, h_best: h as usize })
+    }
+
+    /// Returns the context for reuse (only after a successful search: after an error its stream
+    /// may still be busy, so it is dropped with the process).
+    fn give(self) {
+        POW_CTXS.lock().unwrap_or_else(|e| e.into_inner()).push(self);
+    }
+}
+
 fn device_search(
-    best_buf: &mut DevBuf,
+    ctx: &PowCtx,
     state: &[u64; 12],
     pos: usize,
     response: usize,
     min_leading_zeros: u32,
 ) -> GpuResult<Option<u64>> {
-    super::quotient::init_once()?;
-    let d_best = best_buf.ensure(1)?;
-    let none = u64::MAX;
-    cuda(unsafe { ffi::cudaMemcpy(d_best, &none as *const u64 as *const c_void, 8, ffi::H2D) }, "pow init")?;
+    let stream = ctx.stream as *mut c_void;
+    let h_best = ctx.h_best as *mut u64;
+    let d_best = ctx.d_best as *mut c_void;
+    unsafe { *h_best = u64::MAX };
+    cuda(unsafe { ffi::cudaMemcpyAsync(d_best, h_best as *const c_void, 8, ffi::H2D, stream) }, "pow init")?;
     for batch in 0..MAX_BATCHES {
         let args = PowArgs {
             state: *state,
@@ -91,9 +130,10 @@ fn device_search(
             min_leading_zeros,
             count: BATCH,
         };
-        cuda(unsafe { plonky2_pow_launch(&args) }, "pow launch")?;
-        let mut best = u64::MAX;
-        cuda(unsafe { ffi::cudaMemcpy(&mut best as *mut u64 as *mut c_void, d_best, 8, ffi::D2H) }, "pow result")?;
+        cuda(unsafe { plonky2_pow_launch(&args, stream) }, "pow launch")?;
+        cuda(unsafe { ffi::cudaMemcpyAsync(h_best as *mut c_void, d_best, 8, ffi::D2H, stream) }, "pow result")?;
+        cuda(unsafe { ffi::cudaStreamSynchronize(stream) }, "pow sync")?;
+        let best = unsafe { *h_best };
         if best != u64::MAX {
             return Ok(Some(best));
         }
@@ -126,10 +166,9 @@ mod tests {
         let inputs: Vec<[GoldilocksField; 12]> =
             (0..n).map(|_| core::array::from_fn(|_| GoldilocksField::from_noncanonical_u64(rng.gen()))).collect();
         let flat: Vec<u64> = inputs.iter().flat_map(|s| s.iter().map(|x| x.to_canonical_u64())).collect();
-        let b = backend().unwrap();
-        let mut st = b.state.lock().unwrap();
         super::super::quotient::init_once().unwrap();
-        let d = st.pow_best.ensure(flat.len()).unwrap();
+        let buf = DeviceBuffer::alloc(flat.len()).unwrap();
+        let d = buf.ptr;
         unsafe {
             assert_eq!(ffi::cudaMemcpy(d, flat.as_ptr() as *const c_void, flat.len() * 8, ffi::H2D), 0);
             assert_eq!(plonky2_poseidon_permute_states(d as *mut u64, n as u32), 0);
@@ -137,7 +176,7 @@ mod tests {
         }
         let mut out = vec![0u64; flat.len()];
         unsafe { assert_eq!(ffi::cudaMemcpy(out.as_mut_ptr() as *mut c_void, d, out.len() * 8, ffi::D2H), 0) };
-        drop(st);
+        drop(buf);
         for (k, input) in inputs.iter().enumerate() {
             let expected = GoldilocksField::poseidon(*input);
             for i in 0..12 {

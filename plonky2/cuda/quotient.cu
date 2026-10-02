@@ -811,9 +811,9 @@ __global__ void __launch_bounds__(128) pow_kernel(const PowArgs a) {
     if ((u32)__clzll((long long)st[a.response]) >= a.min_leading_zeros) atomicMin(a.best, candidate);
 }
 
-extern "C" int plonky2_pow_launch(const PowArgs* args) {
+extern "C" int plonky2_pow_launch(const PowArgs* args, cudaStream_t stream) {
     const u32 threads = 128;
-    pow_kernel<<<(args->count + threads - 1) / threads, threads>>>(*args);
+    pow_kernel<<<(args->count + threads - 1) / threads, threads, 0, stream>>>(*args);
     return (int)cudaGetLastError();
 }
 
