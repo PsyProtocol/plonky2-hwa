@@ -690,6 +690,7 @@ pub struct GpuStats {
     /// buffers handed out, refused for the budget, and bytes allocated.
     pub quotient_reused_lde: u64,
     pub quotient_const_hits: u64,
+    pub quotient_unlocked: u64,
     pub kept_lde_taken: u64,
     pub kept_lde_refused: u64,
     pub kept_lde_bytes: u64,
@@ -735,6 +736,7 @@ pub fn stats() -> GpuStats {
         quotient_lock_wait_ns: quotient::quotient_stats().4,
         quotient_reused_lde: quotient::reuse_stats().1,
         quotient_const_hits: quotient::reuse_stats().0,
+        quotient_unlocked: quotient::reuse_stats().2,
         kept_lde_taken: resident_stats().0,
         kept_lde_refused: resident_stats().1,
         kept_lde_bytes: resident_stats().2,

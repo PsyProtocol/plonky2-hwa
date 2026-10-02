@@ -126,7 +126,7 @@ struct QuotientArgs {
 extern "C" {
     fn plonky2_quotient_init(poseidon_constants: *const u64, len: u32) -> i32;
     fn plonky2_quotient_poseidon_constants_len() -> u32;
-    fn plonky2_quotient_launch(args: *const QuotientArgs) -> i32;
+    fn plonky2_quotient_launch(args: *const QuotientArgs, stream: *mut c_void) -> i32;
 }
 
 /// Device buffers of the quotient evaluation (only touched under the GPU lock).
@@ -167,6 +167,7 @@ static Q_EXEC_NS: AtomicU64 = AtomicU64::new(0);
 static Q_LOCK_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static Q_FAILED: AtomicBool = AtomicBool::new(false);
 static Q_OOM: AtomicU64 = AtomicU64::new(0);
+static Q_UNLOCKED: AtomicU64 = AtomicU64::new(0);
 
 /// (GPU evaluations, CPU fallbacks, check mismatches, device ns, lock wait ns).
 pub fn quotient_stats() -> (u64, u64, u64, u64, u64) {
@@ -639,6 +640,45 @@ fn run<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     };
 
     let total = Instant::now();
+    // Fast path: the kept wires and Z LDEs and a cached constants LDE are all on the device, so
+    // nothing needs the GPU lock; the kernel runs on a pooled stream alongside the commitments.
+    if debug_point.is_none() {
+        let kept = super::resident();
+        let kept_lde = |i: usize, c: usize| {
+            kept.get(i).filter(|r| r.cols == c && r.lg_rows == lg_lde).map(|r| r.ptr as *const u64)
+        };
+        if let (Some(w), Some(z)) = (kept_lde(0, cols[1]), kept_lde(1, cols[2])) {
+            if let Some(pin) = ConstPin::get(digest) {
+                let exec = Instant::now();
+                args.cs = pin.ptr;
+                args.wires = w;
+                args.zs = z;
+                Q_RESIDENT_USED.fetch_add(1, Ordering::Relaxed);
+                let result = range("gpu:quotient_unlocked", || run_unlocked(&mut args, &aux, &plan.gates, big_n));
+                drop(pin);
+                super::release_resident();
+                return match result {
+                    Ok(out) => {
+                        Q_GPU.fetch_add(1, Ordering::Relaxed);
+                        Q_UNLOCKED.fetch_add(1, Ordering::Relaxed);
+                        Q_EXEC_NS.fetch_add(exec.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        stage_log::quotient_event("gpu", "", exec.elapsed().as_secs_f64(), total.elapsed().as_secs_f64());
+                        Ok((out, big_n, plan_ref.clone()))
+                    }
+                    Err(e) if e.contains("out of memory") => {
+                        unsafe { ffi::cudaGetLastError() };
+                        Q_OOM.fetch_add(1, Ordering::Relaxed);
+                        Err("gpu_oom".into())
+                    }
+                    Err(e) => {
+                        Q_FAILED.store(true, Ordering::Relaxed);
+                        log::error!("plonky2 GPU quotient failed, using the CPU from now on: {e}");
+                        Err("gpu_error".into())
+                    }
+                };
+            }
+        }
+    }
     let wait = Instant::now();
     let mut state = range("gpu:quotient_lock_wait", || b.state.lock().unwrap_or_else(|e| e.into_inner()));
     Q_LOCK_WAIT_NS.fetch_add(wait.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -756,9 +796,39 @@ fn upload_lde<F: RichField>(
 /// Per-circuit constants/sigmas LDEs kept on the device (least recently used evicted), at most
 /// `PLONKY2_GPU_CONST_CACHE_BYTES` (default 2 GiB). Only used under the GPU lock.
 struct ConstCache {
-    entries: HashMap<u64, (usize, usize, u64)>, // digest -> (ptr, bytes, last use)
+    entries: HashMap<u64, (usize, usize, u64, u32)>, // digest -> (ptr, bytes, last use, pins)
     bytes: usize,
     tick: u64,
+}
+
+/// A cached constants LDE held by a quotient running outside the GPU lock: it cannot be evicted
+/// until dropped.
+struct ConstPin {
+    digest: u64,
+    ptr: *const u64,
+}
+
+impl ConstPin {
+    fn get(digest: u64) -> Option<Self> {
+        let mut c = CONST_CACHE.get()?.lock().unwrap_or_else(|e| e.into_inner());
+        c.tick += 1;
+        let tick = c.tick;
+        let e = c.entries.get_mut(&digest)?;
+        e.2 = tick;
+        e.3 += 1;
+        Q_CONST_HITS.fetch_add(1, Ordering::Relaxed);
+        Some(Self { digest, ptr: e.0 as *const u64 })
+    }
+}
+
+impl Drop for ConstPin {
+    fn drop(&mut self) {
+        if let Some(cache) = CONST_CACHE.get() {
+            if let Some(e) = cache.lock().unwrap_or_else(|e| e.into_inner()).entries.get_mut(&self.digest) {
+                e.3 -= 1;
+            }
+        }
+    }
 }
 
 fn const_budget() -> usize {
@@ -772,9 +842,10 @@ static CONST_CACHE: OnceLock<Mutex<ConstCache>> = OnceLock::new();
 static Q_CONST_HITS: AtomicU64 = AtomicU64::new(0);
 static Q_RESIDENT_USED: AtomicU64 = AtomicU64::new(0);
 
-/// (constants cache hits, wires+Z LDEs taken from the commitments).
-pub fn reuse_stats() -> (u64, u64) {
-    (Q_CONST_HITS.load(Ordering::Relaxed), Q_RESIDENT_USED.load(Ordering::Relaxed))
+/// (constants cache hits, wires+Z LDEs taken from the commitments, quotients run outside the GPU
+/// lock).
+pub fn reuse_stats() -> (u64, u64, u64) {
+    (Q_CONST_HITS.load(Ordering::Relaxed), Q_RESIDENT_USED.load(Ordering::Relaxed), Q_UNLOCKED.load(Ordering::Relaxed))
 }
 
 /// The constants/sigmas LDE of circuit `digest`: cached, or extended now (into the cache when it
@@ -800,16 +871,12 @@ fn constants_lde<F: RichField>(
         return Ok(e.0 as *const u64);
     }
     let bytes = polys.len() * big_n * 8;
-    while !c.entries.is_empty() && c.bytes + bytes <= const_budget() && !super::device_room(bytes) {
-        evict_lru(&mut c);
-    }
-    if bytes > const_budget() || !super::device_room(bytes) {
+    while c.bytes + bytes <= const_budget() && !super::device_room(bytes) && evict_lru(&mut c) {}
+    while c.bytes + bytes > const_budget() && evict_lru(&mut c) {}
+    if c.bytes + bytes > const_budget() || !super::device_room(bytes) {
         let dst = q.d_cs.ensure(polys.len() * big_n)?;
         upload_lde(&mut q.input, &mut q.d_in, polys, n, lg_n, rate_bits, dst, lap)?;
         return Ok(dst as *const u64);
-    }
-    while c.bytes + bytes > const_budget() {
-        evict_lru(&mut c);
     }
     let mut p = core::ptr::null_mut();
     cuda(unsafe { ffi::cudaMalloc(&mut p, bytes) }, "cudaMalloc (constants cache)")?;
@@ -817,17 +884,21 @@ fn constants_lde<F: RichField>(
         unsafe { ffi::cudaFree(p) };
         return Err(e);
     }
-    c.entries.insert(digest, (p as usize, bytes, tick));
+    c.entries.insert(digest, (p as usize, bytes, tick, 0));
     c.bytes += bytes;
     Ok(p as *const u64)
 }
 
-fn evict_lru(c: &mut ConstCache) {
-    if let Some((&old, &(ptr, b, _))) = c.entries.iter().min_by_key(|(_, e)| e.2) {
-        unsafe { ffi::cudaFree(ptr as *mut c_void) };
-        c.entries.remove(&old);
-        c.bytes -= b;
-    }
+/// Frees the least recently used constants LDE that no quotient is reading; false when none can
+/// be evicted.
+fn evict_lru(c: &mut ConstCache) -> bool {
+    let Some((&old, &(ptr, b, _, _))) = c.entries.iter().filter(|(_, e)| e.3 == 0).min_by_key(|(_, e)| e.2) else {
+        return false;
+    };
+    unsafe { ffi::cudaFree(ptr as *mut c_void) };
+    c.entries.remove(&old);
+    c.bytes -= b;
+    true
 }
 
 /// After running out of device memory: frees every cache the quotient keeps (call under the GPU
@@ -835,9 +906,7 @@ fn evict_lru(c: &mut ConstCache) {
 pub(super) fn release_device_caches(q: &mut QuotientBufs) {
     if let Some(cache) = CONST_CACHE.get() {
         let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
-        while !c.entries.is_empty() {
-            evict_lru(&mut c);
-        }
+        while evict_lru(&mut c) {}
     }
     for b in [&mut q.d_in, &mut q.d_cs, &mut q.d_wires, &mut q.d_zs] {
         b.release();
@@ -898,7 +967,7 @@ fn device_run<F: RichField>(
     args.out = d_out as *mut u64;
     args.debug = d_debug as *mut u64;
     range("gpu:quotient_kernel", || -> GpuResult<()> {
-        cuda(unsafe { plonky2_quotient_launch(args) }, "quotient kernel launch")?;
+        cuda(unsafe { plonky2_quotient_launch(args, core::ptr::null_mut()) }, "quotient kernel launch")?;
         sync("quotient kernel")
     })?;
     lap("q_kernel");
@@ -908,6 +977,76 @@ fn device_run<F: RichField>(
     let out = out.to_vec();
     lap("q_d2h");
     Ok(out)
+}
+
+/// Device buffers and a non-blocking stream for one quotient running outside the GPU lock.
+struct QCtx {
+    stream: usize,
+    staging: Pinned,
+    out: Pinned,
+    d_aux: DevBuf,
+    d_gates: DevBuf,
+    d_out: DevBuf,
+}
+
+// The raw pointers are only used by the thread that took the context from the pool.
+unsafe impl Send for QCtx {}
+
+static Q_CTXS: Mutex<Vec<QCtx>> = Mutex::new(Vec::new());
+
+/// Runs the kernel with `args.cs`, `args.wires` and `args.zs` already pointing at device data.
+fn run_unlocked(args: &mut QuotientArgs, aux: &[u64], gates: &[GateDesc], big_n: usize) -> GpuResult<Vec<u64>> {
+    init_once()?;
+    let mut ctx = match Q_CTXS.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+        Some(c) => c,
+        None => {
+            let mut stream = core::ptr::null_mut();
+            cuda(unsafe { ffi::cudaStreamCreateWithFlags(&mut stream, 1) }, "quotient stream")?;
+            QCtx {
+                stream: stream as usize,
+                staging: Pinned::empty(),
+                out: Pinned::empty(),
+                d_aux: DevBuf::empty(),
+                d_gates: DevBuf::empty(),
+                d_out: DevBuf::empty(),
+            }
+        }
+    };
+    let result = ctx_run(&mut ctx, args, aux, gates, big_n);
+    if result.is_ok() {
+        // After an error the stream may still be busy; such a context is dropped.
+        Q_CTXS.lock().unwrap_or_else(|e| e.into_inner()).push(ctx);
+    }
+    result
+}
+
+fn ctx_run(ctx: &mut QCtx, args: &mut QuotientArgs, aux: &[u64], gates: &[GateDesc], big_n: usize) -> GpuResult<Vec<u64>> {
+    let stream = ctx.stream as *mut c_void;
+    let gate_bytes = core::mem::size_of_val(gates);
+    let gate_u64 = gate_bytes.div_ceil(8);
+    // Aux data and gate descriptors go up from pinned staging, asynchronously on this stream.
+    let host = ctx.staging.ensure(aux.len() + gate_u64)?;
+    host[..aux.len()].copy_from_slice(aux);
+    unsafe {
+        core::ptr::copy_nonoverlapping(gates.as_ptr() as *const u8, host[aux.len()..].as_mut_ptr() as *mut u8, gate_bytes)
+    };
+    let d_aux = ctx.d_aux.ensure(aux.len())?;
+    let d_gates = ctx.d_gates.ensure(gate_u64)?;
+    let d_out = ctx.d_out.ensure(NC * big_n)?;
+    cuda(unsafe { ffi::cudaMemcpyAsync(d_aux, host.as_ptr() as *const c_void, aux.len() * 8, ffi::H2D, stream) }, "quotient aux")?;
+    cuda(
+        unsafe { ffi::cudaMemcpyAsync(d_gates, host[aux.len()..].as_ptr() as *const c_void, gate_bytes, ffi::H2D, stream) },
+        "quotient gates",
+    )?;
+    args.aux = d_aux as *const u64;
+    args.gates = d_gates as *const GateDesc;
+    args.out = d_out as *mut u64;
+    args.debug = core::ptr::null_mut();
+    cuda(unsafe { plonky2_quotient_launch(args, stream) }, "quotient kernel launch")?;
+    let out = ctx.out.ensure(NC * big_n)?;
+    cuda(unsafe { ffi::cudaMemcpyAsync(out.as_mut_ptr() as *mut c_void, d_out, NC * big_n * 8, ffi::D2H, stream) }, "quotient D2H")?;
+    cuda(unsafe { ffi::cudaStreamSynchronize(stream) }, "quotient sync")?;
+    Ok(out.to_vec())
 }
 
 /// At LDE point `k`, compares every gate's unfiltered constraints computed by the kernel with the
@@ -1004,12 +1143,17 @@ mod tests {
 
         let before = Q_GPU.load(Ordering::Relaxed);
         let reused_before = Q_RESIDENT_USED.load(Ordering::Relaxed);
-        let proof = outer.prove(pw)?;
+        let proof = outer.prove(pw.clone())?;
         outer.verify(proof)?;
         assert!(Q_GPU.load(Ordering::Relaxed) > before, "the outer proof's quotient did not run on the GPU");
-        // With every commitment on the GPU, the quotient reads the commitments' kept LDEs.
+        // With every commitment on the GPU, the quotient reads the commitments' kept LDEs; the
+        // second proof also finds the constants cached and runs outside the GPU lock.
         if backend().is_some_and(|b| b.min_lde_rows <= 1 << 10) {
             assert!(Q_RESIDENT_USED.load(Ordering::Relaxed) > reused_before, "kept LDEs were not used");
+            let unlocked_before = Q_UNLOCKED.load(Ordering::Relaxed);
+            let proof = outer.prove(pw)?;
+            outer.verify(proof)?;
+            assert!(Q_UNLOCKED.load(Ordering::Relaxed) > unlocked_before, "the second quotient took the locked path");
         }
         Ok(())
     }

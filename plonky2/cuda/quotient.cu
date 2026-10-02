@@ -864,9 +864,9 @@ extern "C" int plonky2_quotient_init(const u64* poseidon_constants, u32 len) {
 
 extern "C" u32 plonky2_quotient_poseidon_constants_len() { return POS_LEN; }
 
-extern "C" int plonky2_quotient_launch(const QuotientArgs* args) {
+extern "C" int plonky2_quotient_launch(const QuotientArgs* args, cudaStream_t stream) {
     const u32 N = 1u << args->lg_lde;
     const u32 threads = QK_THREADS;
-    quotient_kernel<<<(N + threads - 1) / threads, threads>>>(*args);
+    quotient_kernel<<<(N + threads - 1) / threads, threads, 0, stream>>>(*args);
     return (int)cudaGetLastError();
 }
