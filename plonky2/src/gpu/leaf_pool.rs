@@ -99,6 +99,11 @@ impl LeafPool {
         self.budget
     }
 
+    /// Bytes of all buffers the pool holds (leased + idle).
+    pub(crate) fn allocated(&self) -> usize {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).allocated
+    }
+
     /// Non-blocking: a buffer of at least `bytes`, or `None` if the budget cannot fit one.
     pub(crate) fn try_lease(self: &Arc<Self>, bytes: usize) -> Option<Lease> {
         let class = class_of(bytes);

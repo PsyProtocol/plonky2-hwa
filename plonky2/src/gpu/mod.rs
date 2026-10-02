@@ -383,6 +383,7 @@ static FAILED: AtomicBool = AtomicBool::new(false);
 static GPU_COMMITS: AtomicU64 = AtomicU64::new(0);
 static CPU_COMMITS: AtomicU64 = AtomicU64::new(0);
 static GPU_ERRORS: AtomicU64 = AtomicU64::new(0);
+static QUARANTINED: AtomicU64 = AtomicU64::new(0);
 static LOCK_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static BUF_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static PINNED_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -396,6 +397,8 @@ pub struct GpuStats {
     pub gpu_commits: u64,
     pub cpu_commits: u64,
     pub gpu_errors: u64,
+    /// Errors after which the device could not be confirmed idle; their buffers were leaked.
+    pub quarantined: u64,
     pub buffer_wait_ns: u64,
     pub lock_wait_ns: u64,
     pub exec_ns: u64,
@@ -413,6 +416,8 @@ pub struct GpuStats {
     pub leased_bytes: u64,
     pub leased_peak_bytes: u64,
     pub leaf_pool_peak_bytes: u64,
+    /// Pinned bytes the leaf pool holds right now (leased + idle cache), at most its budget.
+    pub leaf_pool_bytes: u64,
 }
 
 pub fn stats() -> GpuStats {
@@ -420,6 +425,7 @@ pub fn stats() -> GpuStats {
         gpu_commits: GPU_COMMITS.load(Ordering::Relaxed),
         cpu_commits: CPU_COMMITS.load(Ordering::Relaxed),
         gpu_errors: GPU_ERRORS.load(Ordering::Relaxed),
+        quarantined: QUARANTINED.load(Ordering::Relaxed),
         buffer_wait_ns: BUF_WAIT_NS.load(Ordering::Relaxed),
         lock_wait_ns: LOCK_WAIT_NS.load(Ordering::Relaxed),
         exec_ns: EXEC_NS.load(Ordering::Relaxed),
@@ -433,6 +439,7 @@ pub fn stats() -> GpuStats {
         leased_bytes: leaf_stat(|p| p.leased_bytes.load(Ordering::Relaxed)),
         leased_peak_bytes: leaf_stat(|p| p.leased_peak.load(Ordering::Relaxed)),
         leaf_pool_peak_bytes: leaf_stat(|p| p.allocated_peak.load(Ordering::Relaxed)),
+        leaf_pool_bytes: leaf_stat(|p| p.allocated() as u64),
     }
 }
 
@@ -467,6 +474,12 @@ fn backend() -> Option<&'static Backend> {
                         std::env::var("CUDA_VISIBLE_DEVICES").ok()
                     );
                     let leaf_pool = make_leaf_pool();
+                    if let Some(secs) = std::env::var("PLONKY2_GPU_STATS_LOG_SECS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&s| s > 0) {
+                        std::thread::spawn(move || loop {
+                            std::thread::sleep(std::time::Duration::from_secs(secs));
+                            log::info!("plonky2 GPU stats {:?}", stats());
+                        });
+                    }
                     log::info!(
                         "plonky2 GPU leaf leases: {}",
                         leaf_pool.as_ref().map_or("off".to_string(), |p| format!("on, budget {} bytes", p.budget()))
@@ -600,14 +613,32 @@ pub(crate) fn try_commit<F: RichField, H: Hasher<F>>(
             Ok(tree)
         }
         Err(e) => {
-            drop(out);
-            drop(lease);
+            // The failed run may have left an async download in flight into `out` / `lease`.
+            // Return them only once the device confirms all work is done; otherwise quarantine
+            // (leak) them so no later commitment can reuse memory the DMA may still write.
+            if confirm_device_idle_after_error() {
+                drop(out);
+                drop(lease);
+            } else {
+                QUARANTINED.fetch_add(1, Ordering::Relaxed);
+                log::error!("plonky2 GPU: could not confirm device idle after an error; quarantining its buffers");
+                core::mem::forget(out);
+                core::mem::forget(lease);
+            }
             FAILED.store(true, Ordering::Relaxed);
             GPU_ERRORS.fetch_add(1, Ordering::Relaxed);
             log::error!("plonky2 GPU commitment failed, falling back to CPU for the rest of the process: {e}");
             Err("gpu_error")
         }
     }
+}
+
+fn confirm_device_idle_after_error() -> bool {
+    #[cfg(feature = "gpu-fault-injection")]
+    if std::env::var("PLONKY2_GPU_FAULT").ok().as_deref() == Some("d2h_inflight_sync_fail") {
+        return false;
+    }
+    unsafe { ffi::cudaDeviceSynchronize() == 0 }
 }
 
 /// Upload, LDE, transpose, Merkle, download into the pinned buffers. Returns the element counts
@@ -696,6 +727,11 @@ fn run<F: RichField>(
             },
             "D2H leaves (async)",
         )?;
+        // Lab: fail while the async download is submitted but not yet confirmed complete.
+        #[cfg(feature = "gpu-fault-injection")]
+        if inject("d2h_inflight_error") || inject("d2h_inflight_sync_fail") {
+            return Err("injected failure with the leaf download in flight".into());
+        }
     }
     range(if overlap { "gpu:merkle+d2h_leaves" } else { "gpu:merkle" }, || {
         unsafe {
