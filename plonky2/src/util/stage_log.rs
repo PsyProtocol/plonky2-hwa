@@ -189,12 +189,61 @@ mod imp {
         shape: String,
     }
 
+    /// The first time a circuit is proven, appends one `{"circuit_gates":...}` line listing its
+    /// gates (id, selector, group, constraint count, degree) and constraint layout.
+    fn log_circuit_gates_once<F: RichField + Extendable<D>, const D: usize>(
+        common: &CommonCircuitData<F, D>,
+        circuit_digest: u64,
+    ) {
+        static SEEN: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+        {
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if seen.contains(&circuit_digest) {
+                return;
+            }
+            seen.push(circuit_digest);
+        }
+        let Some(path) = path() else { return };
+        let escape = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        let gates: Vec<String> = common
+            .gates
+            .iter()
+            .enumerate()
+            .map(|(i, g)| {
+                let s = common.selectors_info.selector_indices[i];
+                let r = &common.selectors_info.groups[s];
+                format!(
+                    "{{\"id\":\"{}\",\"selector\":{s},\"group\":[{},{}],\"constraints\":{},\"degree\":{}}}",
+                    escape(&g.0.id()),
+                    r.start,
+                    r.end,
+                    g.0.num_constraints(),
+                    g.0.degree()
+                )
+            })
+            .collect();
+        let line = format!(
+            "{{\"circuit_gates\":\"{circuit_digest:016x}\",\"degree_bits\":{},\"num_constants\":{},\"num_selectors\":{},\"num_lookup_selectors\":{},\"num_gate_constraints\":{},\"num_wires\":{},\"gates\":[{}]}}\n",
+            common.degree_bits(),
+            common.num_constants,
+            common.selectors_info.num_selectors(),
+            common.num_lookup_selectors,
+            common.num_gate_constraints,
+            common.config.num_wires,
+            gates.join(",")
+        );
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+
     impl StageLog {
         pub fn start<F: RichField + Extendable<D>, const D: usize>(
             common: &CommonCircuitData<F, D>,
             circuit_digest: u64,
         ) -> Option<Self> {
             path()?;
+            log_circuit_gates_once(common, circuit_digest);
             let config = &common.config;
             let fri = &common.fri_params;
             let shape = format!(
