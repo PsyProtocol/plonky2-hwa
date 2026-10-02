@@ -53,6 +53,8 @@ pub(crate) struct LeafPool {
     pub(crate) leased_bytes: AtomicU64,
     pub(crate) leased_peak: AtomicU64,
     pub(crate) allocated_peak: AtomicU64,
+    pub(crate) allocs: AtomicU64,
+    pub(crate) frees: AtomicU64,
 }
 
 /// An exclusive lease on one buffer; returns it to the pool when dropped.
@@ -92,6 +94,8 @@ impl LeafPool {
             leased_bytes: AtomicU64::new(0),
             leased_peak: AtomicU64::new(0),
             allocated_peak: AtomicU64::new(0),
+            allocs: AtomicU64::new(0),
+            frees: AtomicU64::new(0),
         })
     }
 
@@ -123,6 +127,7 @@ impl LeafPool {
                     // SAFETY: the buffer came from this allocator and is idle.
                     unsafe { self.alloc.free(victim.ptr, victim.class) };
                     inner.allocated -= victim.class;
+                    self.frees.fetch_add(1, Ordering::Relaxed);
                 }
                 if inner.allocated + class > self.budget {
                     drop(inner);
@@ -135,6 +140,7 @@ impl LeafPool {
                     return None;
                 };
                 inner.allocated += class;
+                self.allocs.fetch_add(1, Ordering::Relaxed);
                 self.allocated_peak.fetch_max(inner.allocated as u64, Ordering::Relaxed);
                 Buf { ptr, class }
             }

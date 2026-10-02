@@ -256,6 +256,14 @@ impl Pinned {
         Self { ptr: core::ptr::null_mut(), len: 0 }
     }
 
+    fn as_slice(&self) -> &[u64] {
+        if self.ptr.is_null() {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
+        }
+    }
+
     fn ensure(&mut self, len: usize) -> GpuResult<&mut [u64]> {
         if self.len < len {
             self.release();
@@ -284,6 +292,48 @@ impl Pinned {
 struct State {
     input: Pinned,
     copy_stream: *mut c_void,
+    ws: Workspace,
+}
+
+/// Growable device buffers reused across commitments (only touched under the GPU lock).
+struct Workspace {
+    bufs: [DevBuf; 5],
+}
+
+const WS_IN: usize = 0;
+const WS_LDE: usize = 1;
+const WS_LEAVES: usize = 2;
+const WS_DIGESTS: usize = 3;
+const WS_CAP: usize = 4;
+
+struct DevBuf {
+    ptr: *mut c_void,
+    cap_u64: usize,
+}
+
+impl DevBuf {
+    const fn empty() -> Self {
+        Self { ptr: core::ptr::null_mut(), cap_u64: 0 }
+    }
+
+    fn ensure(&mut self, len_u64: usize) -> GpuResult<*mut c_void> {
+        if self.cap_u64 < len_u64.max(1) {
+            if !self.ptr.is_null() {
+                range("gpu:ws_free", || unsafe { ffi::cudaFree(self.ptr) });
+                DEVICE_WS_BYTES.fetch_sub(self.cap_u64 as u64 * 8, Ordering::Relaxed);
+                self.ptr = core::ptr::null_mut();
+                self.cap_u64 = 0;
+            }
+            let mut p = core::ptr::null_mut();
+            range("gpu:ws_alloc", || cuda(unsafe { ffi::cudaMalloc(&mut p, len_u64.max(1) * 8) }, "cudaMalloc (workspace)"))?;
+            self.ptr = p;
+            self.cap_u64 = len_u64.max(1);
+            DEVICE_WS_ALLOCS.fetch_add(1, Ordering::Relaxed);
+            let now = DEVICE_WS_BYTES.fetch_add(self.cap_u64 as u64 * 8, Ordering::Relaxed) + self.cap_u64 as u64 * 8;
+            DEVICE_WS_PEAK.fetch_max(now, Ordering::Relaxed);
+        }
+        Ok(self.ptr)
+    }
 }
 
 // The raw stream handle is only used while holding the backend lock.
@@ -293,6 +343,8 @@ unsafe impl Send for State {}
 struct OutputSet {
     leaves: Pinned,
     digests: Pinned,
+    /// Canonicalised coefficients when canonicalising outside the GPU lock.
+    input: Pinned,
 }
 
 /// Bounded pool of output sets; a claimed set is owned by one commitment until it is rebuilt.
@@ -396,6 +448,20 @@ fn make_leaf_pool() -> Option<std::sync::Arc<leaf_pool::LeafPool>> {
     Some(leaf_pool::LeafPool::new(budget, Box::new(CudaPinned)))
 }
 
+/// `PLONKY2_GPU_CANON_OUTSIDE_LOCK=1`: canonicalise into the claimed output set's own input
+/// staging before taking the GPU lock (the set is not reused before its upload completed).
+fn canon_outside_lock() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLONKY2_GPU_CANON_OUTSIDE_LOCK").ok().as_deref() == Some("1"))
+}
+
+/// `PLONKY2_GPU_DEVICE_WORKSPACE=1`: one device workspace, protected by the GPU lock, grown on
+/// demand and reused, instead of cudaMalloc / cudaFree per commitment.
+fn device_workspace() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLONKY2_GPU_DEVICE_WORKSPACE").ok().as_deref() == Some("1"))
+}
+
 /// `PLONKY2_GPU_OVERLAP_D2H=1`: download the leaves on a separate non-blocking stream while the
 /// Merkle kernels run (both only read the device leaves), instead of after them.
 fn overlap_d2h() -> bool {
@@ -414,6 +480,10 @@ static QUARANTINED: AtomicU64 = AtomicU64::new(0);
 static LOCK_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static BUF_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static PINNED_BYTES: AtomicU64 = AtomicU64::new(0);
+static DEVICE_WS_BYTES: AtomicU64 = AtomicU64::new(0);
+static DEVICE_WS_PEAK: AtomicU64 = AtomicU64::new(0);
+static DEVICE_WS_ALLOCS: AtomicU64 = AtomicU64::new(0);
+static DEVICE_CALL_ALLOCS: AtomicU64 = AtomicU64::new(0);
 static PINNED_PEAK: AtomicU64 = AtomicU64::new(0);
 static EXEC_NS: AtomicU64 = AtomicU64::new(0);
 static REBUILD_NS: AtomicU64 = AtomicU64::new(0);
@@ -445,6 +515,15 @@ pub struct GpuStats {
     pub leaf_pool_peak_bytes: u64,
     /// Pinned bytes the leaf pool holds right now (leased + idle cache), at most its budget.
     pub leaf_pool_bytes: u64,
+    /// Leaf pool pinned allocations and frees (reclaims of idle buffers to fit a new class).
+    pub leaf_pool_allocs: u64,
+    pub leaf_pool_frees: u64,
+    /// Device workspace (PLONKY2_GPU_DEVICE_WORKSPACE=1): bytes now / peak, cudaMalloc calls; and
+    /// per-commitment cudaMalloc calls when the workspace is off.
+    pub device_ws_bytes: u64,
+    pub device_ws_peak_bytes: u64,
+    pub device_ws_allocs: u64,
+    pub device_call_allocs: u64,
 }
 
 pub fn stats() -> GpuStats {
@@ -467,6 +546,12 @@ pub fn stats() -> GpuStats {
         leased_peak_bytes: leaf_stat(|p| p.leased_peak.load(Ordering::Relaxed)),
         leaf_pool_peak_bytes: leaf_stat(|p| p.allocated_peak.load(Ordering::Relaxed)),
         leaf_pool_bytes: leaf_stat(|p| p.allocated() as u64),
+        leaf_pool_allocs: leaf_stat(|p| p.allocs.load(Ordering::Relaxed)),
+        leaf_pool_frees: leaf_stat(|p| p.frees.load(Ordering::Relaxed)),
+        device_ws_bytes: DEVICE_WS_BYTES.load(Ordering::Relaxed),
+        device_ws_peak_bytes: DEVICE_WS_PEAK.load(Ordering::Relaxed),
+        device_ws_allocs: DEVICE_WS_ALLOCS.load(Ordering::Relaxed),
+        device_call_allocs: DEVICE_CALL_ALLOCS.load(Ordering::Relaxed),
     }
 }
 
@@ -514,11 +599,15 @@ fn backend() -> Option<&'static Backend> {
                     Some(Backend {
                         leaf_pool,
                         min_lde_rows,
-                        state: Mutex::new(State { input: Pinned::empty(), copy_stream: copy_stream_for_init() }),
+                        state: Mutex::new(State {
+                            input: Pinned::empty(),
+                            copy_stream: copy_stream_for_init(),
+                            ws: Workspace { bufs: [DevBuf::empty(), DevBuf::empty(), DevBuf::empty(), DevBuf::empty(), DevBuf::empty()] },
+                        }),
                         pool: Pool {
                             size: buffers,
                             free: Mutex::new(
-                                (0..buffers).map(|_| OutputSet { leaves: Pinned::empty(), digests: Pinned::empty() }).collect(),
+                                (0..buffers).map(|_| OutputSet { leaves: Pinned::empty(), digests: Pinned::empty(), input: Pinned::empty() }).collect(),
                             ),
                             returned: Condvar::new(),
                         },
@@ -609,13 +698,30 @@ pub(crate) fn try_commit<F: RichField, H: Hasher<F>>(
     let mut out = range("gpu:buffer_wait", || b.pool.acquire());
     let buf_wait = buf_wait_start.elapsed().as_secs_f64();
 
+    // 1b. Optionally canonicalise into the set's own staging before taking the GPU lock.
+    let pre_canon = if canon_outside_lock() {
+        let set = out.set.as_mut().expect("claimed");
+        match canonicalize_into(&mut set.input, polynomials) {
+            Ok(()) => true,
+            Err(e) => {
+                drop(out);
+                drop(lease);
+                FAILED.store(true, Ordering::Relaxed);
+                GPU_ERRORS.fetch_add(1, Ordering::Relaxed);
+                log::error!("plonky2 GPU staging failed, falling back to CPU for the rest of the process: {e}");
+                return Err("gpu_error");
+            }
+        }
+    } else {
+        false
+    };
+
     // 2. GPU lock: upload, kernels, synchronous download into the claimed set.
     let wait = Instant::now();
     let mut state = range("gpu:lock_wait", || b.state.lock().unwrap_or_else(|e| e.into_inner()));
     let lock_wait = wait.elapsed().as_secs_f64();
-    let copy_stream = state.copy_stream;
     let result = range("gpu:device", || {
-        run(&mut state.input, copy_stream, out.set.as_mut().expect("claimed"), lease_ptr, polynomials, lg_n, rate_bits, cap_height)
+        run(&mut state, out.set.as_mut().expect("claimed"), pre_canon, lease_ptr, polynomials, lg_n, rate_bits, cap_height)
     });
     // 3. Device work is complete (synchronous copies + device sync); the set is ours alone.
     drop(state);
@@ -678,10 +784,26 @@ fn confirm_device_idle_after_error() -> bool {
 
 /// Upload, LDE, transpose, Merkle, download into the pinned buffers. Returns the element counts
 /// written (leaves, digests, cap, in u64) and the execution time.
+/// Canonicalises the coefficients (column after column) into `staging`.
+fn canonicalize_into<F: RichField>(staging: &mut Pinned, polynomials: &[PolynomialCoeffs<F>]) -> GpuResult<()> {
+    let n = polynomials[0].len();
+    let input = staging.ensure(polynomials.len() * n)?;
+    range("gpu:canonicalize", || {
+        input.par_chunks_mut(n).zip(polynomials.par_iter()).for_each(|(dst, p)| {
+            for (d, c) in dst.iter_mut().zip(&p.coeffs) {
+                let x = plonky2_field::types::PrimeField64::to_noncanonical_u64(c);
+                *d = if x >= P { x - P } else { x };
+            }
+        })
+    });
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run<F: RichField>(
-    input_staging: &mut Pinned,
-    copy_stream: *mut c_void,
+    state: &mut State,
     out: &mut OutputSet,
+    pre_canon: bool,
     lease_ptr: Option<*mut u64>,
     polynomials: &[PolynomialCoeffs<F>],
     lg_n: usize,
@@ -711,20 +833,35 @@ fn run<F: RichField>(
     let digests = out.digests.ensure((num_digests + caps) * HASH_U64)?;
     let overlap = overlap_d2h();
 
-    // Canonicalise into the pinned input buffer (CPU, see module docs).
-    let input = input_staging.ensure(cols * n)?;
-    range("gpu:canonicalize", || {
-        input.par_chunks_mut(n).zip(polynomials.par_iter()).for_each(|(dst, p)| {
-            for (d, c) in dst.iter_mut().zip(&p.coeffs) {
-                let x = plonky2_field::types::PrimeField64::to_noncanonical_u64(c);
-                *d = if x >= P { x - P } else { x };
-            }
-        })
-    });
+    let copy_stream = state.copy_stream;
+    // Canonicalised input: already in the set's staging, or canonicalise now (under the lock).
+    let input: &[u64] = if pre_canon {
+        &out.input.as_slice()[..cols * n]
+    } else {
+        canonicalize_into(&mut state.input, polynomials)?;
+        &state.input.as_slice()[..cols * n]
+    };
 
-    let d_in = DeviceBuffer::alloc(cols * n)?;
-    let d_lde = DeviceBuffer::alloc(cols * rows)?;
-    range("gpu:h2d", || cuda(unsafe { ffi::cudaMemcpy(d_in.ptr, input.as_ptr() as *const c_void, cols * n * 8, ffi::H2D) }, "H2D"))?;
+    // Device memory: the reusable workspace, or per-commitment allocations freed when done.
+    let ws_on = device_workspace();
+    let mut owned: Vec<DeviceBuffer> = Vec::new();
+    let mut dev = |slot: usize, len: usize| -> GpuResult<*mut c_void> {
+        if ws_on {
+            state.ws.bufs[slot].ensure(len)
+        } else {
+            let b = range("gpu:alloc", || DeviceBuffer::alloc(len))?;
+            DEVICE_CALL_ALLOCS.fetch_add(1, Ordering::Relaxed);
+            let p = b.ptr;
+            owned.push(b);
+            Ok(p)
+        }
+    };
+    let d_in = dev(WS_IN, cols * n)?;
+    let d_lde = dev(WS_LDE, cols * rows)?;
+    let d_leaves = dev(WS_LEAVES, cols * rows)?;
+    let d_digests = dev(WS_DIGESTS, num_digests * HASH_U64)?;
+    let d_cap = dev(WS_CAP, caps * HASH_U64)?;
+    range("gpu:h2d", || cuda(unsafe { ffi::cudaMemcpy(d_in, input.as_ptr() as *const c_void, cols * n * 8, ffi::H2D) }, "H2D"))?;
 
     let cfg = ffi::NttConfig {
         batches: cols as u32,
@@ -737,28 +874,25 @@ fn run<F: RichField>(
         is_multi_gpu: false,
         salt_size: 0,
     };
-    range("gpu:lde", || {
-        zeknox(unsafe { ffi::compute_batched_lde(0, d_lde.ptr, d_in.ptr, lg_n as u32, ffi::Direction::Forward, cfg) }, "lde")?;
-        sync("lde")
+    // zeknox's LDE and transpose synchronise internally, so their submit ranges include the
+    // kernel time; the separate sync ranges then only catch what is left.
+    range("gpu:lde:submit", || {
+        zeknox(unsafe { ffi::compute_batched_lde(0, d_lde, d_in, lg_n as u32, ffi::Direction::Forward, cfg) }, "lde")
     })?;
-    drop(d_in);
+    range("gpu:lde:sync", || sync("lde"))?;
 
-    let d_leaves = DeviceBuffer::alloc(cols * rows)?;
     let tcfg = ffi::TransposeConfig { batches: cols as u32, are_inputs_on_device: true, are_outputs_on_device: true };
-    range("gpu:transpose", || {
-        zeknox(unsafe { ffi::compute_transpose_rev(0, d_leaves.ptr, d_lde.ptr, lg_rows as u32, tcfg) }, "transpose")?;
-        sync("transpose")
+    range("gpu:transpose:submit", || {
+        zeknox(unsafe { ffi::compute_transpose_rev(0, d_leaves, d_lde, lg_rows as u32, tcfg) }, "transpose")
     })?;
-    drop(d_lde);
+    range("gpu:transpose:sync", || sync("transpose"))?;
 
-    let d_digests = DeviceBuffer::alloc(num_digests * HASH_U64)?;
-    let d_cap = DeviceBuffer::alloc(caps * HASH_U64)?;
     if overlap {
         // Starts now on the non-blocking stream; the device sync after the Merkle kernels waits
         // for it as well.
         cuda(
             unsafe {
-                ffi::cudaMemcpyAsync(leaves.as_mut_ptr() as *mut c_void, d_leaves.ptr, cols * rows * 8, ffi::D2H, copy_stream)
+                ffi::cudaMemcpyAsync(leaves.as_mut_ptr() as *mut c_void, d_leaves, cols * rows * 8, ffi::D2H, copy_stream)
             },
             "D2H leaves (async)",
         )?;
@@ -768,12 +902,11 @@ fn run<F: RichField>(
             return Err("injected failure with the leaf download in flight".into());
         }
     }
-    range(if overlap { "gpu:merkle+d2h_leaves" } else { "gpu:merkle" }, || {
-        unsafe {
+    range("gpu:merkle:submit", || unsafe {
             ffi::fill_digests_buf_linear_gpu_with_gpu_ptr(
-                d_digests.ptr,
-                d_cap.ptr,
-                d_leaves.ptr,
+                d_digests,
+                d_cap,
+                d_leaves,
                 num_digests as u64,
                 caps as u64,
                 rows as u64,
@@ -781,21 +914,23 @@ fn run<F: RichField>(
                 cap_height as u64,
                 0,
                 0,
-            );
-        }
-        sync("merkle")
-    })?;
+            )
+    });
+    // Waits for the Merkle kernels (and the overlapped leaf download, if any).
+    range(if overlap { "gpu:merkle+d2h_leaves:sync" } else { "gpu:merkle:sync" }, || sync("merkle"))?;
 
     let _d2h = NvtxScope::new("gpu:d2h");
     if !overlap {
-        cuda(unsafe { ffi::cudaMemcpy(leaves.as_mut_ptr() as *mut c_void, d_leaves.ptr, cols * rows * 8, ffi::D2H) }, "D2H leaves")?;
+        cuda(unsafe { ffi::cudaMemcpy(leaves.as_mut_ptr() as *mut c_void, d_leaves, cols * rows * 8, ffi::D2H) }, "D2H leaves")?;
     }
     let (dg, cp) = digests.split_at_mut(num_digests * HASH_U64);
     if num_digests > 0 {
-        cuda(unsafe { ffi::cudaMemcpy(dg.as_mut_ptr() as *mut c_void, d_digests.ptr, num_digests * HASH_U64 * 8, ffi::D2H) }, "D2H digests")?;
+        cuda(unsafe { ffi::cudaMemcpy(dg.as_mut_ptr() as *mut c_void, d_digests, num_digests * HASH_U64 * 8, ffi::D2H) }, "D2H digests")?;
     }
-    cuda(unsafe { ffi::cudaMemcpy(cp.as_mut_ptr() as *mut c_void, d_cap.ptr, caps * HASH_U64 * 8, ffi::D2H) }, "D2H cap")?;
+    cuda(unsafe { ffi::cudaMemcpy(cp.as_mut_ptr() as *mut c_void, d_cap, caps * HASH_U64 * 8, ffi::D2H) }, "D2H cap")?;
     sync("download")?;
+    drop(_d2h);
+    range("gpu:free", || drop(owned));
     Ok((cols * rows, num_digests * HASH_U64, caps * HASH_U64, t.elapsed().as_secs_f64()))
 }
 
@@ -950,7 +1085,7 @@ mod pool_tests {
     fn pool(n: usize) -> &'static Pool {
         Box::leak(Box::new(Pool {
             size: n,
-            free: Mutex::new((0..n).map(|_| OutputSet { leaves: Pinned::empty(), digests: Pinned::empty() }).collect()),
+            free: Mutex::new((0..n).map(|_| OutputSet { leaves: Pinned::empty(), digests: Pinned::empty(), input: Pinned::empty() }).collect()),
             returned: Condvar::new(),
         }))
     }
