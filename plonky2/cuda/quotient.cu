@@ -213,17 +213,17 @@ struct Acc {
     }
 };
 
-// Receives one gate's constraints in order.
+// Receives one gate's constraints in order and accumulates them, unfiltered, into `g` (the
+// gate's filter multiplies the sum once, in the caller).
 struct Sink {
-    Acc& acc;
-    u64 filter;
+    Acc& g;
     u32 m;        // index of the gate's next constraint among all vanishing terms
     u64* dbg;     // non-null: also store the unfiltered value
     u32 c;
     __device__ __forceinline__ void one(u64 v) {
         if (dbg) dbg[c] = v;
         c++;
-        acc.add(m++, gmul(v, filter));
+        g.add(m++, v);
     }
     __device__ __forceinline__ void ext(E2 v) {
         one(v.a);
@@ -682,7 +682,16 @@ __device__ void eval_gate(const Point& p, const GateDesc& g, const u64* gate_dat
     }
 }
 
-__global__ void quotient_kernel(const QuotientArgs a) {
+#ifndef QK_THREADS
+#define QK_THREADS 128
+#endif
+#ifndef QK_MIN_BLOCKS
+#define QK_MIN_BLOCKS 5
+#endif
+
+// Register cap from the launch bounds: about 100 registers per thread measured best (occupancy over
+// spills) on sm_120.
+__global__ void __launch_bounds__(QK_THREADS, QK_MIN_BLOCKS) quotient_kernel(const QuotientArgs a) {
     const u32 N = 1u << a.lg_lde;
     const u32 i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
@@ -731,8 +740,13 @@ __global__ void quotient_kernel(const QuotientArgs a) {
         for (u32 k = g.group_lo; k < g.group_hi; k++)
             if (k != g.row) filter = gmul(filter, gsub(k, s));
         if (a.many_selectors) filter = gmul(filter, gsub(UNUSED_SELECTOR % GL_P, s));
-        Sink sink{acc, filter, m, dbg ? a.debug + (size_t)gi * a.debug_stride : nullptr, 0};
+        Acc gacc;
+        for (int k = 0; k < NC; k++) gacc.v[k] = 0;
+        gacc.ap = acc.ap;
+        gacc.stride = acc.stride;
+        Sink sink{gacc, m, dbg ? a.debug + (size_t)gi * a.debug_stride : nullptr, 0};
         eval_gate(p, g, gate_data, sink);
+        for (int k = 0; k < NC; k++) acc.v[k] = gadd(acc.v[k], gmul(gacc.v[k], filter));
     }
 
     const u64 zh_inv = a.zh_invs[r];
@@ -748,7 +762,7 @@ extern "C" u32 plonky2_quotient_poseidon_constants_len() { return POS_LEN; }
 
 extern "C" int plonky2_quotient_launch(const QuotientArgs* args) {
     const u32 N = 1u << args->lg_lde;
-    const u32 threads = 128;
+    const u32 threads = QK_THREADS;
     quotient_kernel<<<(N + threads - 1) / threads, threads>>>(*args);
     return (int)cudaGetLastError();
 }
