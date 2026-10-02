@@ -134,6 +134,8 @@ mod ffi {
         pub fn cudaGetLastError() -> i32;
         pub fn cudaGetErrorString(err: i32) -> *const c_char;
         pub fn cudaMallocHost(ptr: *mut *mut c_void, size: usize) -> i32;
+        pub fn cudaStreamCreateWithFlags(stream: *mut *mut c_void, flags: u32) -> i32;
+        pub fn cudaMemcpyAsync(dst: *mut c_void, src: *const c_void, count: usize, kind: i32, stream: *mut c_void) -> i32;
         pub fn cudaFreeHost(ptr: *mut c_void) -> i32;
     }
 
@@ -276,10 +278,14 @@ impl Pinned {
     }
 }
 
-/// Pinned input staging, used only under the GPU lock.
+/// Pinned input staging and the copy stream, used only under the GPU lock.
 struct State {
     input: Pinned,
+    copy_stream: *mut c_void,
 }
+
+// The raw stream handle is only used while holding the backend lock.
+unsafe impl Send for State {}
 
 /// One commitment's pinned output: row-major leaves and (digests || cap).
 struct OutputSet {
@@ -324,6 +330,13 @@ struct Backend {
     min_lde_rows: usize,
     state: Mutex<State>,
     pool: Pool,
+}
+
+/// `PLONKY2_GPU_OVERLAP_D2H=1`: download the leaves on a separate non-blocking stream while the
+/// Merkle kernels run (both only read the device leaves), instead of after them.
+fn overlap_d2h() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLONKY2_GPU_OVERLAP_D2H").ok().as_deref() == Some("1"))
 }
 
 static BACKEND: OnceLock<Option<Backend>> = OnceLock::new();
@@ -402,7 +415,7 @@ fn backend() -> Option<&'static Backend> {
                     );
                     Some(Backend {
                         min_lde_rows,
-                        state: Mutex::new(State { input: Pinned::empty() }),
+                        state: Mutex::new(State { input: Pinned::empty(), copy_stream: copy_stream_for_init() }),
                         pool: Pool {
                             size: buffers,
                             free: Mutex::new(
@@ -421,6 +434,12 @@ fn backend() -> Option<&'static Backend> {
         .as_ref()
 }
 
+static COPY_STREAM: OnceLock<usize> = OnceLock::new();
+
+fn copy_stream_for_init() -> *mut c_void {
+    *COPY_STREAM.get().expect("created by init_device") as *mut c_void
+}
+
 fn init_device() -> GpuResult<()> {
     use plonky2_field::types::{Field, PrimeField64};
     cuda(unsafe { ffi::cudaSetDevice(0) }, "cudaSetDevice")?;
@@ -428,6 +447,9 @@ fn init_device() -> GpuResult<()> {
         zeknox(unsafe { ffi::init_twiddle_factors(0, lg) }, "init_twiddle_factors")?;
     }
     zeknox(unsafe { ffi::init_coset(0, MAX_LG, GoldilocksField::coset_shift().to_canonical_u64()) }, "init_coset")?;
+    let mut stream = core::ptr::null_mut();
+    cuda(unsafe { ffi::cudaStreamCreateWithFlags(&mut stream, 1) }, "cudaStreamCreateWithFlags")?; // cudaStreamNonBlocking
+    let _ = COPY_STREAM.set(stream as usize);
     sync("init")
 }
 
@@ -488,7 +510,8 @@ pub(crate) fn try_commit<F: RichField, H: Hasher<F>>(
     let wait = Instant::now();
     let mut state = range("gpu:lock_wait", || b.state.lock().unwrap_or_else(|e| e.into_inner()));
     let lock_wait = wait.elapsed().as_secs_f64();
-    let result = range("gpu:device", || run(&mut state.input, out.set.as_mut().expect("claimed"), polynomials, lg_n, rate_bits, cap_height));
+    let copy_stream = state.copy_stream;
+    let result = range("gpu:device", || run(&mut state.input, copy_stream, out.set.as_mut().expect("claimed"), polynomials, lg_n, rate_bits, cap_height));
     // 3. Device work is complete (synchronous copies + device sync); the set is ours alone.
     drop(state);
 
@@ -523,6 +546,7 @@ pub(crate) fn try_commit<F: RichField, H: Hasher<F>>(
 /// written (leaves, digests, cap, in u64) and the execution time.
 fn run<F: RichField>(
     input_staging: &mut Pinned,
+    copy_stream: *mut c_void,
     out: &mut OutputSet,
     polynomials: &[PolynomialCoeffs<F>],
     lg_n: usize,
@@ -541,6 +565,12 @@ fn run<F: RichField>(
     if inject("run_error") {
         return Err("injected run_error".into());
     }
+
+    // Grow the pinned outputs first: cudaMallocHost may synchronise and must not split the
+    // overlapped download from the Merkle kernels below.
+    let leaves = out.leaves.ensure(cols * rows)?;
+    let digests = out.digests.ensure((num_digests + caps) * HASH_U64)?;
+    let overlap = overlap_d2h();
 
     // Canonicalise into the pinned input buffer (CPU, see module docs).
     let input = input_staging.ensure(cols * n)?;
@@ -584,7 +614,17 @@ fn run<F: RichField>(
 
     let d_digests = DeviceBuffer::alloc(num_digests * HASH_U64)?;
     let d_cap = DeviceBuffer::alloc(caps * HASH_U64)?;
-    range("gpu:merkle", || {
+    if overlap {
+        // Starts now on the non-blocking stream; the device sync after the Merkle kernels waits
+        // for it as well.
+        cuda(
+            unsafe {
+                ffi::cudaMemcpyAsync(leaves.as_mut_ptr() as *mut c_void, d_leaves.ptr, cols * rows * 8, ffi::D2H, copy_stream)
+            },
+            "D2H leaves (async)",
+        )?;
+    }
+    range(if overlap { "gpu:merkle+d2h_leaves" } else { "gpu:merkle" }, || {
         unsafe {
             ffi::fill_digests_buf_linear_gpu_with_gpu_ptr(
                 d_digests.ptr,
@@ -603,9 +643,9 @@ fn run<F: RichField>(
     })?;
 
     let _d2h = NvtxScope::new("gpu:d2h");
-    let leaves = out.leaves.ensure(cols * rows)?;
-    cuda(unsafe { ffi::cudaMemcpy(leaves.as_mut_ptr() as *mut c_void, d_leaves.ptr, cols * rows * 8, ffi::D2H) }, "D2H leaves")?;
-    let digests = out.digests.ensure((num_digests + caps) * HASH_U64)?;
+    if !overlap {
+        cuda(unsafe { ffi::cudaMemcpy(leaves.as_mut_ptr() as *mut c_void, d_leaves.ptr, cols * rows * 8, ffi::D2H) }, "D2H leaves")?;
+    }
     let (dg, cp) = digests.split_at_mut(num_digests * HASH_U64);
     if num_digests > 0 {
         cuda(unsafe { ffi::cudaMemcpy(dg.as_mut_ptr() as *mut c_void, d_digests.ptr, num_digests * HASH_U64 * 8, ffi::D2H) }, "D2H digests")?;
