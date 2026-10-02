@@ -119,6 +119,20 @@ mod imp {
         *ON.get_or_init(|| std::env::var("PLONKY2_POW_DETERMINISTIC").ok().as_deref() == Some("1"))
     }
 
+    /// `PLONKY2_POW_SCALAR=1`: the FRI proof-of-work search uses the one-at-a-time scalar
+    /// permutation instead of the lane-parallel one (same result; for A/B measurements).
+    pub fn pow_scalar() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLONKY2_POW_SCALAR").ok().as_deref() == Some("1"))
+    }
+
+    /// `PLONKY2_QUOTIENT_REFERENCE=1`: the quotient polynomials are evaluated one point at a time
+    /// by the original code instead of the packed path (same result; for A/B measurements).
+    pub fn quotient_reference() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLONKY2_QUOTIENT_REFERENCE").ok().as_deref() == Some("1"))
+    }
+
     /// `PLONKY2_DETERMINISTIC_RANDOM=1`: `RandomValueGenerator` (unused public-input-gate wires,
     /// ZK blinding rows) uses a fixed function of the target instead of fresh randomness.
     /// Correctness comparisons only; never for production (it removes the blinding).
@@ -284,6 +298,12 @@ mod imp {
         false
     }
     pub fn pow_deterministic() -> bool {
+        false
+    }
+    pub fn pow_scalar() -> bool {
+        false
+    }
+    pub fn quotient_reference() -> bool {
         false
     }
     pub fn deterministic_random() -> bool {

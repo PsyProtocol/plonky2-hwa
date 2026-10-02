@@ -193,6 +193,7 @@ pub(crate) fn fri_proof_of_work<
     let first = crate::util::stage_log::pow_deterministic();
     let pow_witness = if <<F as Packable>::Packing as PackedField>::WIDTH > 1
         && TypeId::of::<C::Hasher>() == TypeId::of::<PoseidonHash>()
+        && !crate::util::stage_log::pow_scalar()
     {
         // `PoseidonPermutation::permute` is `F::poseidon`, which `poseidon_packed` matches lane by
         // lane, so both searches accept exactly the same candidates.
