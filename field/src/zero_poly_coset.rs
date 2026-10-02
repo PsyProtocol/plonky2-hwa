@@ -62,4 +62,42 @@ impl<F: Field> ZeroPolyOnCoset<F> {
         // Could also precompute the inverses using Montgomery.
         self.eval(i) * (self.n * (x - F::ONE)).inverse()
     }
+
+    /// `eval_l_0(indices[k], xs[k])` for every `k`, with one batch inversion. Panics if some
+    /// `xs[k]` is one, like `eval_l_0`.
+    pub fn eval_l_0_batch(&self, indices: &[usize], xs: &[F]) -> Vec<F> {
+        assert_eq!(indices.len(), xs.len());
+        let denominators: Vec<F> = xs.iter().map(|&x| self.n * (x - F::ONE)).collect();
+        assert!(
+            denominators.iter().all(|d| d.is_nonzero()),
+            "L_0 is undefined at x = 1"
+        );
+        F::batch_multiplicative_inverse(&denominators)
+            .into_iter()
+            .zip(indices)
+            .map(|(inv, &i)| self.eval(i) * inv)
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec::Vec;
+
+    use super::ZeroPolyOnCoset;
+    use crate::goldilocks_field::GoldilocksField as F;
+    use crate::types::Field;
+
+    #[test]
+    fn eval_l_0_batch_matches_eval_l_0() {
+        let (n_log, rate_bits) = (5, 3);
+        let z_h = ZeroPolyOnCoset::<F>::new(n_log, rate_bits);
+        let points = F::two_adic_subgroup(n_log + rate_bits);
+        let indices: Vec<usize> = (3..3 + 40).collect();
+        let xs: Vec<F> = indices.iter().map(|&i| F::coset_shift() * points[i]).collect();
+        let batch = z_h.eval_l_0_batch(&indices, &xs);
+        for (k, (&i, &x)) in indices.iter().zip(&xs).enumerate() {
+            assert_eq!(batch[k], z_h.eval_l_0(i, x));
+        }
+    }
 }
