@@ -828,6 +828,35 @@ extern "C" int plonky2_poseidon_permute_states(u64* states, u32 n) {
     return (int)cudaGetLastError();
 }
 
+// ---- Merkle digest layout -------------------------------------------------------------------
+
+// zeknox fills each cap subtree's digests in heap order (node k has children 2k+2 and 2k+3, so
+// level d holds k in [2^d - 2, 2^(d+1) - 2)); plonky2 stores node `index` of `layer` (0 = leaf
+// digests) at 2 * (((index >> 1) << (layer + 1)) + 2^layer - 1) + (index & 1)
+// (`subtree_digest_index` in merkle_tree.rs). Moves every 4-element digest to its plonky2 slot.
+__global__ void digest_layout_kernel(u64* dst, const u64* src, u32 per_subtree, u32 lg_leaves, u32 total) {
+    const u32 t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= total) return;
+    const u32 s = t / per_subtree, k = t % per_subtree;
+    const u32 d = 31 - __clz(k + 2);
+    const u32 index = k + 2 - (1u << d);
+    const u32 layer = lg_leaves - d;
+    const u32 pos = 2 * (((index >> 1) << (layer + 1)) + (1u << layer) - 1) + (index & 1);
+    const u64* sp = src + ((size_t)s * per_subtree + k) * 4;
+    u64* dp = dst + ((size_t)s * per_subtree + pos) * 4;
+    dp[0] = sp[0];
+    dp[1] = sp[1];
+    dp[2] = sp[2];
+    dp[3] = sp[3];
+}
+
+extern "C" int plonky2_digest_layout(u64* dst, const u64* src, u32 per_subtree, u32 lg_leaves, u32 num_subtrees) {
+    const u32 total = per_subtree * num_subtrees;
+    if (total == 0) return 0;
+    digest_layout_kernel<<<(total + 255) / 256, 256>>>(dst, src, per_subtree, lg_leaves, total);
+    return (int)cudaGetLastError();
+}
+
 extern "C" int plonky2_quotient_init(const u64* poseidon_constants, u32 len) {
     if (len != POS_LEN) return -1;
     return (int)cudaMemcpyToSymbol(c_pos, poseidon_constants, sizeof(u64) * POS_LEN);

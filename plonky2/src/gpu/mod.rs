@@ -152,6 +152,10 @@ mod ffi {
 type GpuResult<T> = Result<T, String>;
 
 extern "C" {
+    fn plonky2_digest_layout(dst: *mut u64, src: *const u64, per_subtree: u32, lg_leaves: u32, num_subtrees: u32) -> i32;
+}
+
+extern "C" {
     fn plonky2_nvtx_push(name: *const c_char);
     fn plonky2_nvtx_pop();
 }
@@ -303,7 +307,7 @@ struct State {
 
 /// Growable device buffers reused across commitments (only touched under the GPU lock).
 struct Workspace {
-    bufs: [DevBuf; 5],
+    bufs: [DevBuf; 6],
 }
 
 const WS_IN: usize = 0;
@@ -311,6 +315,7 @@ const WS_LDE: usize = 1;
 const WS_LEAVES: usize = 2;
 const WS_DIGESTS: usize = 3;
 const WS_CAP: usize = 4;
+const WS_DIGESTS_PLONKY2: usize = 5;
 
 struct DevBuf {
     ptr: *mut c_void,
@@ -787,7 +792,7 @@ fn backend() -> Option<&'static Backend> {
                         state: Mutex::new(State {
                             input: Pinned::empty(),
                             copy_stream: copy_stream_for_init(),
-                            ws: Workspace { bufs: [DevBuf::empty(), DevBuf::empty(), DevBuf::empty(), DevBuf::empty(), DevBuf::empty()] },
+                            ws: Workspace { bufs: [DevBuf::empty(), DevBuf::empty(), DevBuf::empty(), DevBuf::empty(), DevBuf::empty(), DevBuf::empty()] },
                             q: quotient::QuotientBufs::new(),
                             pow_best: DevBuf::empty(),
                         }),
@@ -1171,7 +1176,14 @@ fn run<F: RichField>(
     }
     let (dg, cp) = digests.split_at_mut(num_digests * HASH_U64);
     if num_digests > 0 {
-        cuda(unsafe { ffi::cudaMemcpy(dg.as_mut_ptr() as *mut c_void, d_digests, num_digests * HASH_U64 * 8, ffi::D2H) }, "D2H digests")?;
+        // Reorder the digests into plonky2's layout on the device; the host then only copies them.
+        let d_plonky2 = dev(WS_DIGESTS_PLONKY2, num_digests * HASH_U64)?;
+        let per_subtree = num_digests / caps;
+        cuda(
+            unsafe { plonky2_digest_layout(d_plonky2 as *mut u64, d_digests as *const u64, per_subtree as u32, (lg_rows - cap_height) as u32, caps as u32) },
+            "digest layout",
+        )?;
+        cuda(unsafe { ffi::cudaMemcpy(dg.as_mut_ptr() as *mut c_void, d_plonky2, num_digests * HASH_U64 * 8, ffi::D2H) }, "D2H digests")?;
     }
     cuda(unsafe { ffi::cudaMemcpy(cp.as_mut_ptr() as *mut c_void, d_cap, caps * HASH_U64 * 8, ffi::D2H) }, "D2H cap")?;
     sync("download")?;
@@ -1284,20 +1296,27 @@ fn rebuild_digests(
     let caps = 1usize << cap_height;
     let subtree_leaves = 1usize << (lg_rows - cap_height);
     let per_subtree = if subtree_leaves > 1 { 2 * subtree_leaves - 2 } else { 0 };
-    let mut digests = std::vec![HashOut::<GoldilocksField>::default(); caps * per_subtree];
-    if per_subtree > 0 {
-        digests.par_chunks_mut(per_subtree).enumerate().for_each(|(s, out)| {
-            let lin = &lin_flat[s * per_subtree * HASH_U64..(s + 1) * per_subtree * HASH_U64];
-            linear_to_recursive(out, lin, 0, &to_hash);
-        });
-    }
+    // Already in plonky2's layout (reordered on the device by `plonky2_digest_layout`).
+    debug_assert_eq!(lin_flat.len(), caps * per_subtree * HASH_U64);
+    let digests = lin_flat.chunks_exact(HASH_U64).map(to_hash).collect();
     let cap = cap_flat.chunks_exact(HASH_U64).map(to_hash).collect();
     (digests, cap)
 }
 
+/// Position in plonky2's subtree layout of the digest at heap index `k` (see
+/// `plonky2_digest_layout` in cuda/quotient.cu).
+#[cfg(test)]
+fn heap_to_plonky2_index(k: usize, lg_leaves: usize) -> usize {
+    let d = (usize::BITS - 1 - (k + 2).leading_zeros()) as usize;
+    let index = k + 2 - (1 << d);
+    let layer = lg_leaves - d;
+    2 * (((index >> 1) << (layer + 1)) + (1 << layer) - 1) + (index & 1)
+}
+
 /// `out` is one subtree in plonky2's layout (left subtree || left digest || right digest || right
 /// subtree), `lin` the same subtree in zeknox's heap layout, `left` the heap index of the left
-/// child of the subtree's root.
+/// child of the subtree's root. The reference for the device reordering.
+#[cfg(test)]
 fn linear_to_recursive<T: Send + Copy>(out: &mut [T], lin: &[u64], left: usize, to_hash: &(impl Fn(&[u64]) -> T + Sync)) {
     let half = out.len() / 2;
     out[half - 1] = to_hash(&lin[left * HASH_U64..(left + 1) * HASH_U64]);
@@ -1322,6 +1341,24 @@ unsafe fn cast_vec<A: 'static, B: 'static>(v: Vec<A>) -> Vec<B> {
     assert_eq!(TypeId::of::<A>(), TypeId::of::<B>());
     let mut v = core::mem::ManuallyDrop::new(v);
     Vec::from_raw_parts(v.as_mut_ptr() as *mut B, v.len(), v.capacity())
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn heap_index_mapping_matches_linear_to_recursive() {
+        for lg in 1..=12 {
+            let per = (1usize << (lg + 1)) - 2;
+            let lin: Vec<u64> = (0..per as u64).flat_map(|k| [k, 0, 0, 0]).collect();
+            let mut out = vec![u64::MAX; per];
+            linear_to_recursive(&mut out, &lin, 0, &|c: &[u64]| c[0]);
+            for k in 0..per {
+                assert_eq!(out[heap_to_plonky2_index(k, lg)], k as u64, "lg {lg} heap index {k}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
