@@ -151,6 +151,8 @@ where
     let quotient_degree = common_data.quotient_degree();
     let degree = common_data.degree();
 
+    #[cfg(feature = "cuda")]
+    let _proof_scope = crate::gpu::proof_scope();
     let mut stage_log = crate::util::stage_log::StageLog::start(
         common_data,
         crate::plonk::config::GenericHashOut::to_vec(&prover_data.circuit_digest)[0]

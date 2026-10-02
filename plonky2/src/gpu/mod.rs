@@ -337,6 +337,33 @@ struct Backend {
     leaf_pool: Option<std::sync::Arc<leaf_pool::LeafPool>>,
 }
 
+std::thread_local! {
+    /// Depth of `prove_with_partition_witness` calls on this thread.
+    static IN_PROOF: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// Marks the current thread as proving until dropped. Leaf leases are only granted inside a
+/// proof: their lifetime is bounded by the proof's `PolynomialBatch` values. Commitments made
+/// elsewhere (circuit preprocessing, whose trees live as long as the circuit data) copy their
+/// leaves instead, so they can never hold leases indefinitely.
+#[derive(Debug)]
+pub struct ProofScope(());
+
+pub fn proof_scope() -> ProofScope {
+    IN_PROOF.with(|d| d.set(d.get() + 1));
+    ProofScope(())
+}
+
+impl Drop for ProofScope {
+    fn drop(&mut self) {
+        IN_PROOF.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+fn in_proof() -> bool {
+    IN_PROOF.with(|d| d.get() > 0)
+}
+
 struct CudaPinned;
 
 impl leaf_pool::HostAlloc for CudaPinned {
@@ -574,7 +601,7 @@ pub(crate) fn try_commit<F: RichField, H: Hasher<F>>(
     let b: &'static Backend = backend().expect("checked by cpu_reason");
 
     // 0. Lease leaf storage (non-blocking; None -> leaves are copied out of the output set).
-    let mut lease = b.leaf_pool.as_ref().and_then(|p| p.try_lease(cols * (n << rate_bits) * 8));
+    let mut lease = if in_proof() { b.leaf_pool.as_ref().and_then(|p| p.try_lease(cols * (n << rate_bits) * 8)) } else { None };
     let lease_ptr = lease.as_mut().map(|l| l.as_mut_ptr() as *mut u64);
 
     // 1. Claim an exclusive output set (bounded pool).
@@ -603,7 +630,15 @@ pub(crate) fn try_commit<F: RichField, H: Hasher<F>>(
             });
             drop(out);
             let rebuild_s = rebuild.elapsed().as_secs_f64();
-            let mode = if leased { "leaves:lease" } else if b.leaf_pool.is_some() { "leaves:copy_refused" } else { "leaves:copy" };
+            let mode = if leased {
+                "leaves:lease"
+            } else if b.leaf_pool.is_none() {
+                "leaves:copy"
+            } else if !in_proof() {
+                "leaves:copy_preprocessing"
+            } else {
+                "leaves:copy_refused"
+            };
             stage_log::commit_event("gpu", mode, lg_n, rate_bits, cols, buf_wait, lock_wait, exec_s, rebuild_s, total.elapsed().as_secs_f64());
             BUF_WAIT_NS.fetch_add((buf_wait * 1e9) as u64, Ordering::Relaxed);
             GPU_COMMITS.fetch_add(1, Ordering::Relaxed);
