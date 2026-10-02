@@ -191,7 +191,27 @@ pub(crate) fn fri_proof_of_work<
     duplex_intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
 
     let first = crate::util::stage_log::pow_deterministic();
-    let pow_witness = if <<F as Packable>::Packing as PackedField>::WIDTH > 1
+    // On the GPU (`PLONKY2_GPU_POW=1`): the smallest accepting candidate, like `find_first`.
+    #[cfg(feature = "cuda")]
+    let gpu = if TypeId::of::<C::Hasher>() == TypeId::of::<PoseidonHash>()
+        && TypeId::of::<F>() == TypeId::of::<plonky2_field::goldilocks_field::GoldilocksField>()
+    {
+        let state: [u64; SPONGE_WIDTH] =
+            core::array::from_fn(|i| duplex_intermediate_state.as_ref()[i].to_canonical_u64());
+        crate::gpu::pow::search(
+            &state,
+            witness_input_pos,
+            <<C::Hasher as Hasher<F>>::Permutation as PlonkyPermutation<F>>::RATE - 1,
+            min_leading_zeros,
+        )
+    } else {
+        None
+    };
+    #[cfg(not(feature = "cuda"))]
+    let gpu: Option<u64> = None;
+    let pow_witness = if let Some(w) = gpu {
+        Some(w)
+    } else if <<F as Packable>::Packing as PackedField>::WIDTH > 1
         && TypeId::of::<C::Hasher>() == TypeId::of::<PoseidonHash>()
         && !crate::util::stage_log::pow_scalar()
     {
@@ -225,7 +245,7 @@ pub(crate) fn fri_proof_of_work<
 
 /// Searches PoW witness candidates one permutation at a time. With `first`, returns the smallest
 /// accepting candidate; otherwise any accepting candidate.
-fn pow_search_scalar<F: RichField, H: Hasher<F>>(
+pub(crate) fn pow_search_scalar<F: RichField, H: Hasher<F>>(
     duplex_intermediate_state: H::Permutation,
     witness_input_pos: usize,
     min_leading_zeros: u32,

@@ -227,7 +227,7 @@ fn poseidon_constants() -> Vec<u64> {
 }
 
 /// Uploads the Poseidon constants once (call under the GPU lock).
-fn init_once() -> GpuResult<()> {
+pub(super) fn init_once() -> GpuResult<()> {
     static INIT: OnceLock<Result<(), String>> = OnceLock::new();
     INIT.get_or_init(|| {
         let c = poseidon_constants();

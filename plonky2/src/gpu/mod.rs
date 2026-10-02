@@ -39,6 +39,7 @@ use crate::plonk::config::Hasher;
 use crate::util::stage_log;
 
 mod leaf_pool;
+pub(crate) mod pow;
 pub(crate) mod quotient;
 
 const P: u64 = 0xffff_ffff_0000_0001;
@@ -296,6 +297,7 @@ struct State {
     copy_stream: *mut c_void,
     ws: Workspace,
     q: quotient::QuotientBufs,
+    pow_best: DevBuf,
 }
 
 /// Growable device buffers reused across commitments (only touched under the GPU lock).
@@ -683,6 +685,9 @@ pub struct GpuStats {
     pub kept_lde_taken: u64,
     pub kept_lde_refused: u64,
     pub kept_lde_bytes: u64,
+    /// FRI proof-of-work searches done on the GPU (PLONKY2_GPU_POW=1) and their wall time.
+    pub pow_gpu: u64,
+    pub pow_ns: u64,
 }
 
 pub fn stats() -> GpuStats {
@@ -721,6 +726,8 @@ pub fn stats() -> GpuStats {
         kept_lde_taken: resident_stats().0,
         kept_lde_refused: resident_stats().1,
         kept_lde_bytes: resident_stats().2,
+        pow_gpu: pow::pow_stats().0,
+        pow_ns: pow::pow_stats().1,
     }
 }
 
@@ -773,6 +780,7 @@ fn backend() -> Option<&'static Backend> {
                             copy_stream: copy_stream_for_init(),
                             ws: Workspace { bufs: [DevBuf::empty(), DevBuf::empty(), DevBuf::empty(), DevBuf::empty(), DevBuf::empty()] },
                             q: quotient::QuotientBufs::new(),
+                            pow_best: DevBuf::empty(),
                         }),
                         pool: Pool {
                             size: buffers,

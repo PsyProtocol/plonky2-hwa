@@ -753,6 +753,81 @@ __global__ void __launch_bounds__(QK_THREADS, QK_MIN_BLOCKS) quotient_kernel(con
     for (u32 c = 0; c < NC; c++) a.out[(size_t)c * N + i] = gmul(acc.v[c], zh_inv);
 }
 
+// ---- Poseidon permutation and the FRI proof-of-work search ------------------------------------
+
+// `Poseidon::poseidon`: full rounds, fast partial rounds, full rounds.
+__device__ void poseidon_permute(u64* st) {
+    u32 round_ctr = 0;
+    for (u32 r = 0; r < HALF_N_FULL_ROUNDS; r++) {
+        for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = gsbox(gadd(st[k], c_pos[POS_RC + k + SPONGE_WIDTH * round_ctr]));
+        pos_mds(st);
+        round_ctr++;
+    }
+    for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = gadd(st[k], c_pos[POS_FIRST + k]);
+    {
+        u64 r0[SPONGE_WIDTH];
+        r0[0] = st[0];
+        for (u32 c = 1; c < SPONGE_WIDTH; c++) r0[c] = 0;
+        for (u32 r = 1; r < SPONGE_WIDTH; r++)
+            for (u32 c = 1; c < SPONGE_WIDTH; c++)
+                r0[c] = gadd(r0[c], gmul(st[r], c_pos[POS_INIT + (r - 1) * 11 + (c - 1)]));
+        for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = r0[k];
+    }
+    const u64 mds0to0 = c_pos[POS_CIRC] + c_pos[POS_DIAG];
+    for (u32 r = 0; r < N_PARTIAL_ROUNDS; r++) {
+        st[0] = gadd(gsbox(st[0]), c_pos[POS_FAST_RC + r]);
+        u64 d = gmul(st[0], mds0to0);
+        for (u32 k = 1; k < SPONGE_WIDTH; k++) d = gadd(d, gmul(st[k], c_pos[POS_WHATS + r * 11 + (k - 1)]));
+        u64 s0 = st[0];
+        st[0] = d;
+        for (u32 k = 1; k < SPONGE_WIDTH; k++) st[k] = gadd(gmul(s0, c_pos[POS_VS + r * 11 + (k - 1)]), st[k]);
+    }
+    round_ctr += N_PARTIAL_ROUNDS;
+    for (u32 r = 0; r < HALF_N_FULL_ROUNDS; r++) {
+        for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = gsbox(gadd(st[k], c_pos[POS_RC + k + SPONGE_WIDTH * round_ctr]));
+        pos_mds(st);
+        round_ctr++;
+    }
+}
+
+struct PowArgs {
+    u64 state[SPONGE_WIDTH];  // duplex state before the candidate is written (canonical)
+    u64 base;                 // first candidate of this launch
+    u64* best;                // smallest accepting candidate so far (atomicMin)
+    u32 pos;                  // index the candidate overwrites
+    u32 response;             // index of the PoW response after the permutation
+    u32 min_leading_zeros;
+    u32 count;                // candidates in this launch
+};
+
+__global__ void __launch_bounds__(128) pow_kernel(const PowArgs a) {
+    const u32 t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= a.count) return;
+    const u64 candidate = a.base + t;
+    u64 st[SPONGE_WIDTH];
+    for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = a.state[k];
+    st[a.pos] = candidate;
+    poseidon_permute(st);
+    if ((u32)__clzll((long long)st[a.response]) >= a.min_leading_zeros) atomicMin(a.best, candidate);
+}
+
+extern "C" int plonky2_pow_launch(const PowArgs* args) {
+    const u32 threads = 128;
+    pow_kernel<<<(args->count + threads - 1) / threads, threads>>>(*args);
+    return (int)cudaGetLastError();
+}
+
+__global__ void permute_kernel(u64* states, u32 n) {
+    const u32 t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t < n) poseidon_permute(states + (size_t)t * SPONGE_WIDTH);
+}
+
+// Test hook: permutes `n` device-resident states in place.
+extern "C" int plonky2_poseidon_permute_states(u64* states, u32 n) {
+    permute_kernel<<<(n + 127) / 128, 128>>>(states, n);
+    return (int)cudaGetLastError();
+}
+
 extern "C" int plonky2_quotient_init(const u64* poseidon_constants, u32 len) {
     if (len != POS_LEN) return -1;
     return (int)cudaMemcpyToSymbol(c_pos, poseidon_constants, sizeof(u64) * POS_LEN);
