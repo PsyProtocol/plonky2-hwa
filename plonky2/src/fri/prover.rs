@@ -2,7 +2,10 @@
 use alloc::vec;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
+use core::any::TypeId;
 
+use plonky2_field::packable::Packable;
+use plonky2_field::packed::PackedField;
 use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
@@ -13,8 +16,9 @@ use crate::fri::{FriConfig, FriParams};
 use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
 use crate::hash::merkle_tree::MerkleTree;
+use crate::hash::poseidon::{PoseidonHash, SPONGE_WIDTH};
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::GenericConfig;
+use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
 use crate::util::reverse_index_bits_in_place;
@@ -186,6 +190,46 @@ pub(crate) fn fri_proof_of_work<
     let witness_input_pos = challenger.input_buffer.len();
     duplex_intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
 
+    let first = crate::util::stage_log::pow_deterministic();
+    let pow_witness = if <<F as Packable>::Packing as PackedField>::WIDTH > 1
+        && TypeId::of::<C::Hasher>() == TypeId::of::<PoseidonHash>()
+    {
+        // `PoseidonPermutation::permute` is `F::poseidon`, which `poseidon_packed` matches lane by
+        // lane, so both searches accept exactly the same candidates.
+        pow_search_packed::<F, <F as Packable>::Packing>(
+            duplex_intermediate_state.as_ref(),
+            witness_input_pos,
+            <<C::Hasher as Hasher<F>>::Permutation as PlonkyPermutation<F>>::RATE,
+            min_leading_zeros,
+            first,
+        )
+    } else {
+        pow_search_scalar::<F, C::Hasher>(
+            duplex_intermediate_state,
+            witness_input_pos,
+            min_leading_zeros,
+            first,
+        )
+    }
+    .map(F::from_canonical_u64)
+    .expect("Proof of work failed. This is highly unlikely!");
+
+    // Recompute pow_response using our normal Challenger code, and make sure it matches.
+    challenger.observe_element(pow_witness);
+    let pow_response = challenger.get_challenge();
+    let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
+    assert!(leading_zeros >= min_leading_zeros);
+    pow_witness
+}
+
+/// Searches PoW witness candidates one permutation at a time. With `first`, returns the smallest
+/// accepting candidate; otherwise any accepting candidate.
+fn pow_search_scalar<F: RichField, H: Hasher<F>>(
+    duplex_intermediate_state: H::Permutation,
+    witness_input_pos: usize,
+    min_leading_zeros: u32,
+    first: bool,
+) -> Option<u64> {
     let accept = |&candidate: &u64| {
         let mut duplex_state = duplex_intermediate_state;
         duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
@@ -195,20 +239,56 @@ pub(crate) fn fri_proof_of_work<
         leading_zeros >= min_leading_zeros
     };
     let candidates = (0..=F::NEG_ONE.to_canonical_u64()).into_par_iter();
-    let pow_witness = if crate::util::stage_log::pow_deterministic() {
+    if first {
         candidates.find_first(accept)
     } else {
         candidates.find_any(accept)
     }
-        .map(F::from_canonical_u64)
-        .expect("Proof of work failed. This is highly unlikely!");
+}
 
-    // Recompute pow_response using our normal Challenger code, and make sure it matches.
-    challenger.observe_element(pow_witness);
-    let pow_response = challenger.get_challenge();
-    let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
-    assert!(leading_zeros >= min_leading_zeros);
-    pow_witness
+/// Same search and result as `pow_search_scalar` for a `PoseidonPermutation` sponge, testing
+/// `P::WIDTH` consecutive candidates per lane-parallel permutation. `state` is the duplex state
+/// before the candidate is written at `witness_input_pos`; the response is the last element of
+/// the `rate`-element squeeze.
+fn pow_search_packed<F: RichField, P: PackedField<Scalar = F>>(
+    state: &[F],
+    witness_input_pos: usize,
+    rate: usize,
+    min_leading_zeros: u32,
+    first: bool,
+) -> Option<u64> {
+    assert_eq!(state.len(), SPONGE_WIDTH);
+    assert!(witness_input_pos < rate && rate <= SPONGE_WIDTH);
+    let width = P::WIDTH as u64;
+    let base: [P; SPONGE_WIDTH] = core::array::from_fn(|i| P::from(state[i]));
+    // The smallest accepting candidate in batch `b` (candidates `b * width ..= b * width + width
+    // - 1`), so the first accepting batch holds the smallest accepting candidate overall.
+    let try_batch = |batch: u64| -> Option<u64> {
+        let start = batch * width;
+        let mut duplex_state = base;
+        for (lane, x) in duplex_state[witness_input_pos]
+            .as_slice_mut()
+            .iter_mut()
+            .enumerate()
+        {
+            *x = F::from_canonical_u64(start + lane as u64);
+        }
+        let out = F::poseidon_packed(duplex_state);
+        out[rate - 1]
+            .as_slice()
+            .iter()
+            .position(|r| r.to_canonical_u64().leading_zeros() >= min_leading_zeros)
+            .map(|lane| start + lane as u64)
+    };
+    // Whole batches only: the last candidate, `num_batches * width - 1`, stays below the order,
+    // like the scalar search's range. Neither search gets anywhere near it in practice.
+    let num_batches = F::NEG_ONE.to_canonical_u64() / width;
+    let batches = (0..num_batches).into_par_iter();
+    if first {
+        batches.find_map_first(try_batch)
+    } else {
+        batches.find_map_any(try_batch)
+    }
 }
 
 fn fri_prover_query_rounds<
@@ -264,5 +344,125 @@ fn fri_prover_query_round<
             evals_proofs: initial_proof,
         },
         steps: query_steps,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use plonky2_field::packable::Packable;
+    use plonky2_field::packed::PackedField;
+    use rand::{Rng, SeedableRng};
+    use rand_chacha::ChaCha8Rng;
+
+    use super::{pow_search_packed, pow_search_scalar};
+    use crate::field::goldilocks_field::GoldilocksField as F;
+    use crate::field::types::{Field, PrimeField64};
+    use crate::hash::hashing::PlonkyPermutation;
+    use crate::hash::poseidon::{PoseidonHash, PoseidonPermutation, SPONGE_RATE, SPONGE_WIDTH};
+    use crate::hash::poseidon_goldilocks::packed_tests::ArrayPacked;
+
+    fn random_state(rng: &mut ChaCha8Rng) -> [F; SPONGE_WIDTH] {
+        core::array::from_fn(|_| F::from_noncanonical_u64(rng.gen()))
+    }
+
+    fn accepts(
+        state: &[F; SPONGE_WIDTH],
+        pos: usize,
+        candidate: u64,
+        min_leading_zeros: u32,
+    ) -> bool {
+        let mut perm = PoseidonPermutation::new(state.iter().copied());
+        perm.set_elt(F::from_canonical_u64(candidate), pos);
+        perm.permute();
+        perm.squeeze()[SPONGE_RATE - 1]
+            .to_canonical_u64()
+            .leading_zeros()
+            >= min_leading_zeros
+    }
+
+    fn check_matches_scalar<P: PackedField<Scalar = F>>() {
+        let mut rng = ChaCha8Rng::seed_from_u64(0x9047_0001);
+        for case in 0..24 {
+            let state = random_state(&mut rng);
+            let pos = case % SPONGE_RATE;
+            let bits = [1, 4, 7, 9][case % 4];
+            let perm = PoseidonPermutation::new(state.iter().copied());
+            let scalar = pow_search_scalar::<F, PoseidonHash>(perm, pos, bits, true).unwrap();
+            let packed = pow_search_packed::<F, P>(&state, pos, SPONGE_RATE, bits, true).unwrap();
+            assert_eq!(
+                packed,
+                scalar,
+                "width {} case {case}: first accepting candidate",
+                P::WIDTH
+            );
+            let any = pow_search_packed::<F, P>(&state, pos, SPONGE_RATE, bits, false).unwrap();
+            assert!(
+                accepts(&state, pos, any, bits),
+                "width {} case {case}: any",
+                P::WIDTH
+            );
+        }
+    }
+
+    #[test]
+    fn pow_search_packed_matches_scalar_native_width() {
+        check_matches_scalar::<<F as Packable>::Packing>();
+    }
+
+    #[test]
+    fn pow_search_packed_matches_scalar_width_8() {
+        check_matches_scalar::<ArrayPacked<8>>();
+    }
+
+    #[test]
+    fn pow_search_packed_matches_scalar_width_2() {
+        check_matches_scalar::<ArrayPacked<2>>();
+    }
+
+    /// Single-thread cost per search: `RAYON_NUM_THREADS=1 cargo test --release -p plonky2 --lib
+    /// pow_search_speed -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn pow_search_speed() {
+        use std::time::Instant;
+        let mut rng = ChaCha8Rng::seed_from_u64(0x9047_0002);
+        let (mut t_scalar, mut t_packed) = (0.0, 0.0);
+        for _ in 0..32 {
+            let state = random_state(&mut rng);
+            let perm = PoseidonPermutation::new(state.iter().copied());
+            let t = Instant::now();
+            let a = pow_search_scalar::<F, PoseidonHash>(perm, 3, 16, true).unwrap();
+            t_scalar += t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            let b =
+                pow_search_packed::<F, <F as Packable>::Packing>(&state, 3, SPONGE_RATE, 16, true)
+                    .unwrap();
+            t_packed += t.elapsed().as_secs_f64();
+            assert_eq!(a, b);
+        }
+        println!(
+            "pow_bits 16, 32 searches (find_first): scalar {:.1} ms, packed (width {}) {:.1} ms",
+            1e3 * t_scalar,
+            <<F as Packable>::Packing as PackedField>::WIDTH,
+            1e3 * t_packed
+        );
+        for w in [8usize, 16] {
+            let mut rng = ChaCha8Rng::seed_from_u64(0x9047_0002);
+            let t = Instant::now();
+            for _ in 0..32 {
+                let state = random_state(&mut rng);
+                if w == 8 {
+                    pow_search_packed::<F, ArrayPacked<8>>(&state, 3, SPONGE_RATE, 16, true)
+                        .unwrap();
+                } else {
+                    pow_search_packed::<F, ArrayPacked<16>>(&state, 3, SPONGE_RATE, 16, true)
+                        .unwrap();
+                }
+            }
+            println!(
+                "  portable ArrayPacked<{w}>: {:.1} ms",
+                1e3 * t.elapsed().as_secs_f64()
+            );
+        }
     }
 }
