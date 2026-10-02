@@ -36,7 +36,7 @@ use crate::plonk::vanishing_poly::{
 };
 use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
-use crate::util::partial_products::{partial_products_and_z_gx, quotient_chunk_products};
+use crate::util::partial_products::partial_products_and_z_gx;
 use crate::util::timing::TimingTree;
 use crate::util::{log2_ceil, transpose};
 
@@ -431,39 +431,50 @@ fn wires_permutation_partial_products_and_zs<
     let subgroup = &prover_data.subgroup;
     let k_is = &common_data.k_is;
     let num_prods = common_data.num_partial_products;
-    let all_quotient_chunk_products = subgroup
-        .par_iter()
+    // The product of each chunk of `degree` quotients num_j / den_j, computed as
+    // (prod num_j) / (prod den_j): the same values with one division per chunk, and the chunk
+    // denominators of many points inverted together.
+    let num_routed = common_data.config.num_routed_wires;
+    let num_chunks = num_routed.div_ceil(degree);
+    let n = subgroup.len();
+    let mut chunk_nums = vec![F::ZERO; n * num_chunks];
+    let mut chunk_dens = vec![F::ZERO; n * num_chunks];
+    chunk_nums
+        .par_chunks_mut(num_chunks)
+        .zip(chunk_dens.par_chunks_mut(num_chunks))
+        .zip(subgroup.par_iter())
         .enumerate()
-        .map(|(i, &x)| {
+        .for_each(|(i, ((nums, dens), &x))| {
             let s_sigmas = &prover_data.sigmas[i];
-            let numerators = (0..common_data.config.num_routed_wires).map(|j| {
-                let wire_value = witness.get_wire(i, j);
-                let k_i = k_is[j];
-                let s_id = k_i * x;
-                wire_value + beta * s_id + gamma
-            });
-            let denominators = (0..common_data.config.num_routed_wires)
-                .map(|j| {
+            for (c, (num, den)) in nums.iter_mut().zip(dens.iter_mut()).enumerate() {
+                let mut np = F::ONE;
+                let mut dp = F::ONE;
+                for j in c * degree..min((c + 1) * degree, num_routed) {
                     let wire_value = witness.get_wire(i, j);
-                    let s_sigma = s_sigmas[j];
-                    wire_value + beta * s_sigma + gamma
-                })
-                .collect::<Vec<_>>();
-            let denominator_invs = F::batch_multiplicative_inverse(&denominators);
-            let quotient_values = numerators
-                .zip(denominator_invs)
-                .map(|(num, den_inv)| num * den_inv)
-                .collect::<Vec<_>>();
-
-            quotient_chunk_products(&quotient_values, degree)
-        })
-        .collect::<Vec<_>>();
+                    let s_id = k_is[j] * x;
+                    np *= wire_value + beta * s_id + gamma;
+                    dp *= wire_value + beta * s_sigmas[j] + gamma;
+                }
+                *num = np;
+                *den = dp;
+            }
+        });
+    const INVERSE_BATCH: usize = 1 << 12;
+    chunk_nums
+        .par_chunks_mut(INVERSE_BATCH)
+        .zip(chunk_dens.par_chunks(INVERSE_BATCH))
+        .for_each(|(nums, dens)| {
+            for (num, inv) in nums.iter_mut().zip(F::batch_multiplicative_inverse(dens)) {
+                *num *= inv;
+            }
+        });
+    let all_quotient_chunk_products = chunk_nums.chunks(num_chunks);
 
     let mut z_x = F::ONE;
-    let mut all_partial_products_and_zs = Vec::with_capacity(all_quotient_chunk_products.len());
+    let mut all_partial_products_and_zs = Vec::with_capacity(n);
     for quotient_chunk_products in all_quotient_chunk_products {
         let mut partial_products_and_z_gx =
-            partial_products_and_z_gx(z_x, &quotient_chunk_products);
+            partial_products_and_z_gx(z_x, quotient_chunk_products);
         // The last term is Z(gx), but we replace it with Z(x), otherwise Z would end up shifted.
         swap(&mut z_x, &mut partial_products_and_z_gx[num_prods]);
         all_partial_products_and_zs.push(partial_products_and_z_gx);

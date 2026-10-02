@@ -10,6 +10,9 @@ use crate::hash::hash_types::RichField;
 use crate::iop::ext_target::ExtensionTarget;
 use crate::plonk::circuit_builder::CircuitBuilder;
 
+/// Products of consecutive chunks of `max_degree` values. The prover computes the same products
+/// as (product of numerators) / (product of denominators); this is the reference.
+#[cfg(test)]
 pub(crate) fn quotient_chunk_products<F: Field>(
     quotient_values: &[F],
     max_degree: usize,
