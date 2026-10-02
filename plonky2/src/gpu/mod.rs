@@ -142,6 +142,7 @@ mod ffi {
         pub fn cudaMemcpyAsync(dst: *mut c_void, src: *const c_void, count: usize, kind: i32, stream: *mut c_void) -> i32;
         pub fn cudaFreeHost(ptr: *mut c_void) -> i32;
         pub fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
+        pub fn cudaSetDeviceFlags(flags: u32) -> i32;
     }
 
     pub const H2D: i32 = 1;
@@ -814,8 +815,25 @@ fn copy_stream_for_init() -> *mut c_void {
     *COPY_STREAM.get().expect("created by init_device") as *mut c_void
 }
 
+/// `PLONKY2_GPU_SYNC`: how host threads wait for the device. `spin` (CUDA's choice for this
+/// setup; burns a core while waiting), `yield`, or `block` (sleep until the work completes).
+fn sync_flags() -> u32 {
+    match std::env::var("PLONKY2_GPU_SYNC").ok().as_deref() {
+        Some("block") => 4, // cudaDeviceScheduleBlockingSync
+        Some("yield") => 2, // cudaDeviceScheduleYield
+        Some("spin") => 1,  // cudaDeviceScheduleSpin
+        _ => 0,             // cudaDeviceScheduleAuto
+    }
+}
+
 fn init_device() -> GpuResult<()> {
     use plonky2_field::types::{Field, PrimeField64};
+    let flags = sync_flags();
+    if flags != 0 {
+        // Must precede the first use of the device in this process.
+        cuda(unsafe { ffi::cudaSetDeviceFlags(flags) }, "cudaSetDeviceFlags")?;
+        log::info!("plonky2 GPU: device schedule flags {flags}");
+    }
     cuda(unsafe { ffi::cudaSetDevice(0) }, "cudaSetDevice")?;
     for lg in 2..=MAX_LG {
         zeknox(unsafe { ffi::init_twiddle_factors(0, lg) }, "init_twiddle_factors")?;
