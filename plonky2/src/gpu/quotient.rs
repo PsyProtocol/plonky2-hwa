@@ -134,7 +134,9 @@ pub(super) struct QuotientBufs {
     input: Pinned,
     out: Pinned,
     d_in: DevBuf,
-    d_lde: DevBuf,
+    d_cs: DevBuf,
+    d_wires: DevBuf,
+    d_zs: DevBuf,
     d_aux: DevBuf,
     d_gates: DevBuf,
     d_out: DevBuf,
@@ -147,7 +149,9 @@ impl QuotientBufs {
             input: Pinned::empty(),
             out: Pinned::empty(),
             d_in: DevBuf::empty(),
-            d_lde: DevBuf::empty(),
+            d_cs: DevBuf::empty(),
+            d_wires: DevBuf::empty(),
+            d_zs: DevBuf::empty(),
             d_aux: DevBuf::empty(),
             d_gates: DevBuf::empty(),
             d_out: DevBuf::empty(),
@@ -420,6 +424,32 @@ fn cached_plan<F: RichField + Extendable<D>, const D: usize>(
     p
 }
 
+/// At the start of a proof: when its quotient will run on the GPU, keep the LDEs of the wires and
+/// Z commitments on the device for it.
+pub(crate) fn begin_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
+    common: &CommonCircuitData<F, D>,
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+) {
+    if !enabled() || Q_FAILED.load(Ordering::Relaxed) || FAILED.load(Ordering::Relaxed) {
+        return;
+    }
+    let config = &common.config;
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>()
+        || D != 2
+        || config.num_challenges != NC
+        || common.num_lookup_polys != 0
+        || config.zero_knowledge
+        || log2_ceil(common.quotient_degree_factor) != config.fri_config.rate_bits
+    {
+        return;
+    }
+    let digest = crate::plonk::config::GenericHashOut::to_vec(&prover_data.circuit_digest)[0].to_canonical_u64();
+    let plan = cached_plan(common, digest);
+    if matches!(plan.as_ref(), Ok(p) if !p.disabled.load(Ordering::Relaxed)) {
+        super::begin_capture();
+    }
+}
+
 /// Evaluates the quotient on the GPU. `Err` gives the reason it stayed on the CPU.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_compute<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
@@ -528,9 +558,7 @@ fn run<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     if total_cols * big_n * 8 > max_lde_bytes() {
         return Err(format!("LDE of {} bytes", total_cols * big_n * 8));
     }
-    let all_polys: Vec<&PolynomialCoeffs<F>> =
-        cs_polys.iter().chain(&wires.polynomials).chain(&zs.polynomials).collect();
-    if all_polys.iter().any(|p| p.len() != n) {
+    if cs_polys.iter().chain(&wires.polynomials).chain(&zs.polynomials).any(|p| p.len() != n) {
         return Err("polynomial lengths".into());
     }
     let digest = crate::plonk::config::GenericHashOut::to_vec(&prover_data.circuit_digest)[0].to_canonical_u64();
@@ -614,10 +642,37 @@ fn run<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     let mut state = range("gpu:quotient_lock_wait", || b.state.lock().unwrap_or_else(|e| e.into_inner()));
     Q_LOCK_WAIT_NS.fetch_add(wait.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let exec = Instant::now();
+    // The wires and Z LDEs kept by this proof's commitments, when their shapes match.
+    let kept = super::resident();
+    let kept_lde = |i: usize, cols: usize| {
+        kept.get(i).filter(|r| r.cols == cols && r.lg_rows == lg_lde).map(|r| r.ptr as *const u64)
+    };
+    let wires_lde = kept_lde(0, cols[1]).map_or(Lde::Upload(&wires.polynomials), Lde::Device);
+    let zs_lde = kept_lde(1, cols[2]).map_or(Lde::Upload(&zs.polynomials), Lde::Device);
+    if matches!((&wires_lde, &zs_lde), (Lde::Device(_), Lde::Device(_))) && debug_point.is_none() {
+        Q_RESIDENT_USED.fetch_add(1, Ordering::Relaxed);
+    }
     let result = range("gpu:quotient", || {
-        device_run(&mut state.q, &mut args, &all_polys, cols, n, total_cols, big_n, lg_n, rate_bits, &aux, &plan.gates)
+        device_run(
+            &mut state.q,
+            &mut args,
+            digest,
+            cs_polys,
+            wires_lde,
+            zs_lde,
+            n,
+            big_n,
+            lg_n,
+            rate_bits,
+            &aux,
+            &plan.gates,
+        )
     });
     drop(state);
+    if debug_point.is_none() {
+        // The commitments' LDEs are not needed after the quotient.
+        super::release_resident();
+    }
     match result {
         Ok(out) => {
             if debug_point.is_none() {
@@ -635,14 +690,134 @@ fn run<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     }
 }
 
+/// A batch's LDE: already on the device, or to be uploaded and extended.
+enum Lde<'a, F: RichField> {
+    Device(*const u64),
+    Upload(&'a [PolynomialCoeffs<F>]),
+}
+
+/// Packs `polys` (canonical, column after column), uploads them and extends them into `dst`.
+#[allow(clippy::too_many_arguments)]
+fn upload_lde<F: RichField>(
+    input: &mut Pinned,
+    d_in: &mut DevBuf,
+    polys: &[PolynomialCoeffs<F>],
+    n: usize,
+    lg_n: usize,
+    rate_bits: usize,
+    dst: *mut c_void,
+    lap: &mut impl FnMut(&'static str),
+) -> GpuResult<()> {
+    let cols = polys.len();
+    let host = input.ensure(cols * n)?;
+    range("gpu:quotient_pack", || {
+        host.par_chunks_mut(n).zip(polys.par_iter()).for_each(|(dst, p)| {
+            for (d, c) in dst.iter_mut().zip(&p.coeffs) {
+                *d = c.to_canonical_u64();
+            }
+        })
+    });
+    lap("q_pack");
+    let d_in = d_in.ensure(cols * n)?;
+    cuda(unsafe { ffi::cudaMemcpy(d_in, host.as_ptr() as *const c_void, cols * n * 8, ffi::H2D) }, "quotient H2D")?;
+    lap("q_h2d");
+    let cfg = ffi::NttConfig {
+        batches: cols as u32,
+        order: ffi::Order::NN,
+        ntt_type: ffi::NttType::Standard,
+        extension_rate_bits: rate_bits as u32,
+        are_inputs_on_device: true,
+        are_outputs_on_device: true,
+        with_coset: true,
+        is_multi_gpu: false,
+        salt_size: 0,
+    };
+    range("gpu:quotient_lde", || {
+        zeknox(unsafe { ffi::compute_batched_lde(0, dst, d_in, lg_n as u32, ffi::Direction::Forward, cfg) }, "quotient lde")
+    })?;
+    sync("quotient lde")?;
+    lap("q_lde");
+    Ok(())
+}
+
+/// Per-circuit constants/sigmas LDEs kept on the device (least recently used evicted), at most
+/// `PLONKY2_GPU_CONST_CACHE_BYTES` (default 2 GiB). Only used under the GPU lock.
+struct ConstCache {
+    entries: HashMap<u64, (usize, usize, u64)>, // digest -> (ptr, bytes, last use)
+    bytes: usize,
+    tick: u64,
+}
+
+fn const_budget() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("PLONKY2_GPU_CONST_CACHE_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(2 << 30)
+    })
+}
+
+static CONST_CACHE: OnceLock<Mutex<ConstCache>> = OnceLock::new();
+static Q_CONST_HITS: AtomicU64 = AtomicU64::new(0);
+static Q_RESIDENT_USED: AtomicU64 = AtomicU64::new(0);
+
+/// (constants cache hits, wires+Z LDEs taken from the commitments).
+pub fn reuse_stats() -> (u64, u64) {
+    (Q_CONST_HITS.load(Ordering::Relaxed), Q_RESIDENT_USED.load(Ordering::Relaxed))
+}
+
+/// The constants/sigmas LDE of circuit `digest`: cached, or extended now (into the cache when it
+/// fits, else into `fallback`).
+#[allow(clippy::too_many_arguments)]
+fn constants_lde<F: RichField>(
+    q: &mut QuotientBufs,
+    digest: u64,
+    polys: &[PolynomialCoeffs<F>],
+    n: usize,
+    big_n: usize,
+    lg_n: usize,
+    rate_bits: usize,
+    lap: &mut impl FnMut(&'static str),
+) -> GpuResult<*const u64> {
+    let cache = CONST_CACHE.get_or_init(|| Mutex::new(ConstCache { entries: HashMap::new(), bytes: 0, tick: 0 }));
+    let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
+    c.tick += 1;
+    let tick = c.tick;
+    if let Some(e) = c.entries.get_mut(&digest) {
+        e.2 = tick;
+        Q_CONST_HITS.fetch_add(1, Ordering::Relaxed);
+        return Ok(e.0 as *const u64);
+    }
+    let bytes = polys.len() * big_n * 8;
+    if bytes > const_budget() {
+        let dst = q.d_cs.ensure(polys.len() * big_n)?;
+        upload_lde(&mut q.input, &mut q.d_in, polys, n, lg_n, rate_bits, dst, lap)?;
+        return Ok(dst as *const u64);
+    }
+    while c.bytes + bytes > const_budget() {
+        let (&old, &(ptr, b, _)) = c.entries.iter().min_by_key(|(_, e)| e.2).expect("over budget implies entries");
+        unsafe { ffi::cudaFree(ptr as *mut c_void) };
+        c.entries.remove(&old);
+        c.bytes -= b;
+    }
+    let mut p = core::ptr::null_mut();
+    cuda(unsafe { ffi::cudaMalloc(&mut p, bytes) }, "cudaMalloc (constants cache)")?;
+    if let Err(e) = upload_lde(&mut q.input, &mut q.d_in, polys, n, lg_n, rate_bits, p, lap) {
+        unsafe { ffi::cudaFree(p) };
+        return Err(e);
+    }
+    c.entries.insert(digest, (p as usize, bytes, tick));
+    c.bytes += bytes;
+    Ok(p as *const u64)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn device_run<F: RichField>(
     q: &mut QuotientBufs,
     args: &mut QuotientArgs,
-    polys: &[&PolynomialCoeffs<F>],
-    cols: [usize; 3],
+    digest: u64,
+    cs: &[PolynomialCoeffs<F>],
+    wires: Lde<F>,
+    zs: Lde<F>,
     n: usize,
-    total_cols: usize,
     big_n: usize,
     lg_n: usize,
     rate_bits: usize,
@@ -655,36 +830,23 @@ fn device_run<F: RichField>(
         stage_log::detail(name, t.elapsed().as_secs_f64());
         t = Instant::now();
     };
-    // Canonical coefficients, column after column, then one upload.
-    let input = q.input.ensure(total_cols * n)?;
-    range("gpu:quotient_pack", || {
-        input.par_chunks_mut(n).zip(polys.par_iter()).for_each(|(dst, p)| {
-            for (d, c) in dst.iter_mut().zip(&p.coeffs) {
-                *d = c.to_canonical_u64();
-            }
-        })
-    });
-    lap("q_pack");
-    let d_in = q.d_in.ensure(total_cols * n)?;
-    cuda(unsafe { ffi::cudaMemcpy(d_in, input.as_ptr() as *const c_void, total_cols * n * 8, ffi::H2D) }, "quotient H2D")?;
-    lap("q_h2d");
-    let d_lde = q.d_lde.ensure(total_cols * big_n)?;
-    let cfg = ffi::NttConfig {
-        batches: total_cols as u32,
-        order: ffi::Order::NN,
-        ntt_type: ffi::NttType::Standard,
-        extension_rate_bits: rate_bits as u32,
-        are_inputs_on_device: true,
-        are_outputs_on_device: true,
-        with_coset: true,
-        is_multi_gpu: false,
-        salt_size: 0,
+    args.cs = constants_lde(q, digest, cs, n, big_n, lg_n, rate_bits, &mut lap)?;
+    args.wires = match wires {
+        Lde::Device(p) => p,
+        Lde::Upload(polys) => {
+            let dst = q.d_wires.ensure(polys.len() * big_n)?;
+            upload_lde(&mut q.input, &mut q.d_in, polys, n, lg_n, rate_bits, dst, &mut lap)?;
+            dst as *const u64
+        }
     };
-    range("gpu:quotient_lde", || {
-        zeknox(unsafe { ffi::compute_batched_lde(0, d_lde, d_in, lg_n as u32, ffi::Direction::Forward, cfg) }, "quotient lde")
-    })?;
-    sync("quotient lde")?;
-    lap("q_lde");
+    args.zs = match zs {
+        Lde::Device(p) => p,
+        Lde::Upload(polys) => {
+            let dst = q.d_zs.ensure(polys.len() * big_n)?;
+            upload_lde(&mut q.input, &mut q.d_in, polys, n, lg_n, rate_bits, dst, &mut lap)?;
+            dst as *const u64
+        }
+    };
 
     let d_aux = q.d_aux.ensure(aux.len())?;
     cuda(unsafe { ffi::cudaMemcpy(d_aux, aux.as_ptr() as *const c_void, aux.len() * 8, ffi::H2D) }, "quotient aux")?;
@@ -694,12 +856,6 @@ fn device_run<F: RichField>(
     let d_out = q.d_out.ensure(NC * big_n)?;
     let debug_len = gates.len() * args.debug_stride as usize;
     let d_debug = if args.debug_point >= 0 { q.d_debug.ensure(debug_len)? } else { core::ptr::null_mut() };
-
-    // Column offsets of the three batches inside the LDE buffer.
-    let col = |c: usize| unsafe { (d_lde as *const u64).add(c * big_n) };
-    args.cs = col(0);
-    args.wires = col(cols[0]);
-    args.zs = col(cols[0] + cols[1]);
     args.aux = d_aux as *const u64;
     args.gates = d_gates as *const GateDesc;
     args.out = d_out as *mut u64;
@@ -810,9 +966,14 @@ mod tests {
         plan(&outer.common).map_err(anyhow::Error::msg)?;
 
         let before = Q_GPU.load(Ordering::Relaxed);
+        let reused_before = Q_RESIDENT_USED.load(Ordering::Relaxed);
         let proof = outer.prove(pw)?;
         outer.verify(proof)?;
         assert!(Q_GPU.load(Ordering::Relaxed) > before, "the outer proof's quotient did not run on the GPU");
+        // With every commitment on the GPU, the quotient reads the commitments' kept LDEs.
+        if backend().is_some_and(|b| b.min_lde_rows <= 1 << 10) {
+            assert!(Q_RESIDENT_USED.load(Ordering::Relaxed) > reused_before, "kept LDEs were not used");
+        }
         Ok(())
     }
 

@@ -187,15 +187,19 @@ struct QuotientArgs {
     int debug_point;   // -1: off
 };
 
+// LDE values from the NTT are reduced, but canonicalise on load anyway: the field functions above
+// assume canonical inputs.
+__device__ __forceinline__ u64 gcanon(u64 x) { return x >= GL_P ? x - GL_P : x; }
+
 struct Point {
     const QuotientArgs& a;
     u32 N, i;
-    __device__ __forceinline__ u64 wire(u32 j) const { return a.wires[(size_t)j * N + i]; }
+    __device__ __forceinline__ u64 wire(u32 j) const { return gcanon(a.wires[(size_t)j * N + i]); }
     __device__ __forceinline__ E2 wire_ext(u32 j) const { return {wire(j), wire(j + 1)}; }
-    __device__ __forceinline__ u64 cons(u32 c) const { return a.cs[(size_t)(a.const_prefix + c) * N + i]; }
-    __device__ __forceinline__ u64 selector(u32 s) const { return a.cs[(size_t)s * N + i]; }
-    __device__ __forceinline__ u64 sigma(u32 j) const { return a.cs[(size_t)(a.num_constants + j) * N + i]; }
-    __device__ __forceinline__ u64 z(u32 col, u32 idx) const { return a.zs[(size_t)col * N + idx]; }
+    __device__ __forceinline__ u64 cons(u32 c) const { return gcanon(a.cs[(size_t)(a.const_prefix + c) * N + i]); }
+    __device__ __forceinline__ u64 selector(u32 s) const { return gcanon(a.cs[(size_t)s * N + i]); }
+    __device__ __forceinline__ u64 sigma(u32 j) const { return gcanon(a.cs[(size_t)(a.num_constants + j) * N + i]); }
+    __device__ __forceinline__ u64 z(u32 col, u32 idx) const { return gcanon(a.zs[(size_t)col * N + idx]); }
 };
 
 // Accumulates sum_m term_m * alpha_k^m for each challenge k.

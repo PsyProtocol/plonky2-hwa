@@ -158,6 +158,8 @@ where
 
     #[cfg(feature = "cuda")]
     let _proof_scope = crate::gpu::proof_scope();
+    #[cfg(feature = "cuda")]
+    crate::gpu::quotient::begin_proof::<F, C, D>(common_data, prover_data);
     let mut stage_log = crate::util::stage_log::StageLog::start(
         common_data,
         crate::plonk::config::GenericHashOut::to_vec(&prover_data.circuit_digest)[0]

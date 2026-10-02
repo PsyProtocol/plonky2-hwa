@@ -410,8 +410,111 @@ pub fn proof_scope() -> ProofScope {
 
 impl Drop for ProofScope {
     fn drop(&mut self) {
-        IN_PROOF.with(|d| d.set(d.get().saturating_sub(1)));
+        let depth = IN_PROOF.with(|d| {
+            let v = d.get().saturating_sub(1);
+            d.set(v);
+            v
+        });
+        if depth == 0 {
+            CAPTURE_LEFT.with(|c| c.set(0));
+            release_resident();
+        }
     }
+}
+
+std::thread_local! {
+    /// Commitments of the current proof whose LDE is still to be kept on the device for the
+    /// quotient (the wires and Z batches, the proof's first two commitments).
+    static CAPTURE_LEFT: core::cell::Cell<u8> = const { core::cell::Cell::new(0) };
+    /// LDEs kept on the device for the current proof, in commitment order.
+    static RESIDENT: core::cell::RefCell<Vec<Resident>> = const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// A commitment's LDE (column-major, natural order) kept on the device for the quotient.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Resident {
+    pub ptr: usize,
+    pub bytes: usize,
+    pub cols: usize,
+    pub lg_rows: usize,
+}
+
+/// Keep the LDEs of this proof's next two commitments (wires, Z) on the device.
+pub(crate) fn begin_capture() {
+    release_resident();
+    CAPTURE_LEFT.with(|c| c.set(2));
+}
+
+pub(crate) fn resident() -> Vec<Resident> {
+    RESIDENT.with(|r| r.borrow().clone())
+}
+
+/// Returns this thread's kept LDEs to the pool.
+pub(crate) fn release_resident() {
+    let kept: Vec<Resident> = RESIDENT.with(|r| r.borrow_mut().drain(..).collect());
+    for r in kept {
+        RESIDENT_POOL.give(r.ptr, r.bytes);
+    }
+}
+
+/// Device buffers for kept LDEs, reused by size; at most `PLONKY2_GPU_RESIDENT_BYTES` (default
+/// 4 GiB) allocated. Taking needs the GPU lock (it may cudaMalloc / cudaFree); giving does not.
+struct DevPool {
+    free: Mutex<Vec<(usize, usize)>>,
+    held: AtomicU64,
+    refused: AtomicU64,
+    taken: AtomicU64,
+}
+
+static RESIDENT_POOL: DevPool =
+    DevPool { free: Mutex::new(Vec::new()), held: AtomicU64::new(0), refused: AtomicU64::new(0), taken: AtomicU64::new(0) };
+
+fn resident_budget() -> u64 {
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("PLONKY2_GPU_RESIDENT_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(4 << 30)
+    })
+}
+
+impl DevPool {
+    fn take(&self, bytes: usize) -> Option<*mut c_void> {
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = free.iter().position(|&(b, _)| b == bytes) {
+            self.taken.fetch_add(1, Ordering::Relaxed);
+            return Some(free.swap_remove(i).1 as *mut c_void);
+        }
+        while self.held.load(Ordering::Relaxed) + bytes as u64 > resident_budget() {
+            let Some((b, ptr)) = free.pop() else { break };
+            unsafe { ffi::cudaFree(ptr as *mut c_void) };
+            self.held.fetch_sub(b as u64, Ordering::Relaxed);
+        }
+        if self.held.load(Ordering::Relaxed) + bytes as u64 > resident_budget() {
+            self.refused.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let mut p = core::ptr::null_mut();
+        if unsafe { ffi::cudaMalloc(&mut p, bytes) } != 0 {
+            unsafe { ffi::cudaGetLastError() };
+            self.refused.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        self.held.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.taken.fetch_add(1, Ordering::Relaxed);
+        Some(p)
+    }
+
+    fn give(&self, ptr: usize, bytes: usize) {
+        self.free.lock().unwrap_or_else(|e| e.into_inner()).push((bytes, ptr));
+    }
+}
+
+/// (kept-LDE buffers handed out, refused for the budget, bytes allocated).
+pub fn resident_stats() -> (u64, u64, u64) {
+    (
+        RESIDENT_POOL.taken.load(Ordering::Relaxed),
+        RESIDENT_POOL.refused.load(Ordering::Relaxed),
+        RESIDENT_POOL.held.load(Ordering::Relaxed),
+    )
 }
 
 fn in_proof() -> bool {
@@ -533,6 +636,13 @@ pub struct GpuStats {
     pub quotient_mismatch: u64,
     pub quotient_exec_ns: u64,
     pub quotient_lock_wait_ns: u64,
+    /// Quotients that read the commitments' kept wires and Z LDEs; constants cache hits; kept-LDE
+    /// buffers handed out, refused for the budget, and bytes allocated.
+    pub quotient_reused_lde: u64,
+    pub quotient_const_hits: u64,
+    pub kept_lde_taken: u64,
+    pub kept_lde_refused: u64,
+    pub kept_lde_bytes: u64,
 }
 
 pub fn stats() -> GpuStats {
@@ -566,6 +676,11 @@ pub fn stats() -> GpuStats {
         quotient_mismatch: quotient::quotient_stats().2,
         quotient_exec_ns: quotient::quotient_stats().3,
         quotient_lock_wait_ns: quotient::quotient_stats().4,
+        quotient_reused_lde: quotient::reuse_stats().1,
+        quotient_const_hits: quotient::reuse_stats().0,
+        kept_lde_taken: resident_stats().0,
+        kept_lde_refused: resident_stats().1,
+        kept_lde_bytes: resident_stats().2,
     }
 }
 
@@ -872,7 +987,19 @@ fn run<F: RichField>(
         }
     };
     let d_in = dev(WS_IN, cols * n)?;
-    let d_lde = dev(WS_LDE, cols * rows)?;
+    // The wires and Z commitments of a proof whose quotient runs on the GPU extend straight into
+    // a kept buffer, which the quotient reads instead of recomputing the LDE.
+    let capture = in_proof()
+        && CAPTURE_LEFT.with(|c| {
+            let v = c.get();
+            c.set(v.saturating_sub(1));
+            v > 0
+        });
+    let kept = if capture { RESIDENT_POOL.take(cols * rows * 8) } else { None };
+    let d_lde = match kept {
+        Some(p) => p,
+        None => dev(WS_LDE, cols * rows)?,
+    };
     let d_leaves = dev(WS_LEAVES, cols * rows)?;
     let d_digests = dev(WS_DIGESTS, num_digests * HASH_U64)?;
     let d_cap = dev(WS_CAP, caps * HASH_U64)?;
@@ -946,6 +1073,9 @@ fn run<F: RichField>(
     sync("download")?;
     drop(_d2h);
     range("gpu:free", || drop(owned));
+    if let Some(p) = kept {
+        RESIDENT.with(|r| r.borrow_mut().push(Resident { ptr: p as usize, bytes: cols * rows * 8, cols, lg_rows }));
+    }
     Ok((cols * rows, num_digests * HASH_U64, caps * HASH_U64, t.elapsed().as_secs_f64()))
 }
 
