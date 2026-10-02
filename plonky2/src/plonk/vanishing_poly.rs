@@ -8,6 +8,7 @@ use super::circuit_builder::{LookupChallenges, NUM_COINS_LOOKUP};
 use super::vars::EvaluationVarsBase;
 use crate::field::batch_util::batch_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
+use crate::field::packed::PackedField;
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 use crate::gates::lookup::LookupGate;
@@ -327,6 +328,129 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         vanishing_all_lookup_terms.clear();
     }
     res_batch
+}
+
+/// Columns of a batch of evaluation points in structure-of-arrays layout: column `c` of point
+/// `k` is at `[c * n + k]`, with `n` the batch size.
+pub(crate) struct VanishingColumnsBatch<'a, F> {
+    /// `num_challenges` columns: `Z(x)` per challenge.
+    pub local_zs: &'a [F],
+    /// `num_challenges` columns: `Z(g x)` per challenge.
+    pub next_zs: &'a [F],
+    /// `num_challenges * num_partial_products` columns, challenge-major.
+    pub partial_products: &'a [F],
+    /// `num_routed_wires` columns.
+    pub s_sigmas: &'a [F],
+}
+
+/// `eval_vanishing_poly_base_batch` for circuits without lookups, on `P::WIDTH` points at a time.
+/// Returns the same field values; `res[k][i]` is the value for point `k` and challenge `i`. The
+/// batch size must be a multiple of `P::WIDTH`.
+pub(crate) fn eval_vanishing_poly_base_batch_packed<
+    F: RichField + Extendable<D>,
+    P: PackedField<Scalar = F>,
+    const D: usize,
+>(
+    common_data: &CommonCircuitData<F, D>,
+    indices_batch: &[usize],
+    xs_batch: &[F],
+    vars_batch: EvaluationVarsBaseBatch<F>,
+    columns: VanishingColumnsBatch<F>,
+    betas: &[F],
+    gammas: &[F],
+    alphas: &[F],
+    z_h_on_coset: &ZeroPolyOnCoset<F>,
+) -> Vec<Vec<F>> {
+    assert_eq!(
+        common_data.num_lookup_polys, 0,
+        "lookups need the scalar path"
+    );
+    let n = indices_batch.len();
+    let width = P::WIDTH;
+    assert_eq!(
+        n % width,
+        0,
+        "batch size must be a multiple of the packing width"
+    );
+    assert_eq!(xs_batch.len(), n);
+    assert_eq!(vars_batch.len(), n);
+
+    let num_challenges = common_data.config.num_challenges;
+    let num_routed_wires = common_data.config.num_routed_wires;
+    let num_prods = common_data.num_partial_products;
+    let max_degree = common_data.quotient_degree_factor;
+    let num_chunks = num_routed_wires.div_ceil(max_degree);
+    debug_assert_eq!(num_chunks, num_prods + 1);
+    let num_gate_constraints = common_data.num_gate_constraints;
+    assert_eq!(columns.local_zs.len(), num_challenges * n);
+    assert_eq!(columns.next_zs.len(), num_challenges * n);
+    assert_eq!(
+        columns.partial_products.len(),
+        num_challenges * num_prods * n
+    );
+    assert_eq!(columns.s_sigmas.len(), num_routed_wires * n);
+    let local_wires = vars_batch.local_wires;
+
+    let constraint_terms_batch =
+        evaluate_gate_constraints_base_batch::<F, D>(common_data, vars_batch);
+    debug_assert!(constraint_terms_batch.len() == n * num_gate_constraints);
+    let l_0_batch = z_h_on_coset.eval_l_0_batch(indices_batch, xs_batch);
+
+    let load = |column: &[F], c: usize, k0: usize| *P::from_slice(&column[c * n + k0..][..width]);
+    let mut s_ids = vec![P::ZEROS; num_routed_wires];
+    // The same terms, in the same order, as `eval_vanishing_poly_base_batch`: the `L_0(x) (Z(x) -
+    // 1)` terms, the partial product checks (challenge-major), then the gate constraints.
+    let mut terms = Vec::with_capacity(num_challenges * (1 + num_chunks));
+    let mut res = vec![F::ZERO; num_challenges * n];
+    for k0 in (0..n).step_by(width) {
+        let x = *P::from_slice(&xs_batch[k0..k0 + width]);
+        let l_0_x = *P::from_slice(&l_0_batch[k0..k0 + width]);
+        for (s_id, &k_i) in s_ids.iter_mut().zip(&common_data.k_is) {
+            *s_id = x * k_i;
+        }
+
+        terms.clear();
+        for i in 0..num_challenges {
+            terms.push(l_0_x * (load(columns.local_zs, i, k0) - P::ONES));
+        }
+        for i in 0..num_challenges {
+            let (beta, gamma) = (betas[i], gammas[i]);
+            // Accumulators: Z(x), the partial products, then Z(g x).
+            let mut prev_acc = load(columns.local_zs, i, k0);
+            for chunk in 0..num_chunks {
+                let mut num_chunk_product = P::ONES;
+                let mut den_chunk_product = P::ONES;
+                for j in chunk * max_degree..min((chunk + 1) * max_degree, num_routed_wires) {
+                    let wire_value = load(local_wires, j, k0);
+                    num_chunk_product *= wire_value + s_ids[j] * beta + gamma;
+                    den_chunk_product *= wire_value + load(columns.s_sigmas, j, k0) * beta + gamma;
+                }
+                let next_acc = if chunk < num_prods {
+                    load(columns.partial_products, i * num_prods + chunk, k0)
+                } else {
+                    load(columns.next_zs, i, k0)
+                };
+                terms.push(prev_acc * num_chunk_product - next_acc * den_chunk_product);
+                prev_acc = next_acc;
+            }
+        }
+
+        // `reduce_with_powers_multi`: Horner from the last term.
+        for (i, &alpha) in alphas.iter().enumerate() {
+            let mut acc = P::ZEROS;
+            for c in (0..num_gate_constraints).rev() {
+                acc = acc * alpha + load(&constraint_terms_batch, c, k0);
+            }
+            for &term in terms.iter().rev() {
+                acc = acc * alpha + term;
+            }
+            res[i * n + k0..][..width].copy_from_slice(acc.as_slice());
+        }
+    }
+
+    (0..n)
+        .map(|k| (0..alphas.len()).map(|i| res[i * n + k]).collect())
+        .collect()
 }
 
 /// Evaluates all lookup constraints, based on the logarithmic derivatives paper (<https://eprint.iacr.org/2022/1530.pdf>),
