@@ -803,22 +803,37 @@ __device__ __forceinline__ u64 reduce160(const Acc160& a) {
     return t2 >= GL_P ? t2 - GL_P : t2;
 }
 
-// Row `row` of the MDS layer: the circulant and diagonal entries are small, so the products are
-// summed in 128 bits and reduced once.
-__device__ __forceinline__ u64 mds_row_fast(const u64* s, u32 row) {
-    u64 lo = 0, hi = 0;
+// plonky2's Goldilocks Poseidon MDS matrix (MDS_MATRIX_CIRC; MDS_MATRIX_DIAG is MDS_DIAG0 at index
+// 0 and zero elsewhere), compiled in so the products become 32-bit multiplications by immediates.
+// `plonky2_quotient_init` rejects constants that disagree.
+#define MDS_CIRC_VALUES {17, 15, 41, 16, 2, 28, 13, 13, 39, 18, 34, 20}
+#define MDS_DIAG0 8u
+
+// Row ROW of the MDS layer: each element split into 32-bit halves, the products by the small
+// entries summed per half (both below 2^42), combined and reduced once.
+template <u32 ROW>
+__device__ __forceinline__ u64 mds_row(const u64* s) {
+    constexpr u32 C[SPONGE_WIDTH] = MDS_CIRC_VALUES;
+    u64 lo_sum = 0, hi_sum = 0;
 #pragma unroll
-    for (int k = 0; k < SPONGE_WIDTH; k++) {
-        u64 c = c_pos[POS_CIRC + k] + (k == 0 ? c_pos[POS_DIAG + row] : 0ull);
-        u64 v = s[(k + row) % SPONGE_WIDTH];
-        u64 plo = v * c, phi = __umul64hi(v, c);
-        lo += plo;
-        hi += phi + (lo < plo);
+    for (u32 k = 0; k < SPONGE_WIDTH; k++) {
+        const u32 c = C[k] + (k == 0 && ROW == 0 ? MDS_DIAG0 : 0u);
+        const u64 v = s[(k + ROW) % SPONGE_WIDTH];
+        lo_sum += (u64)(u32)v * c;
+        hi_sum += (v >> 32) * c;
     }
-    u64 h = hi * GL_EPS;  // hi < 2^12
+    const u64 lo = lo_sum + (hi_sum << 32);
+    const u64 hi = (hi_sum >> 32) + (lo < lo_sum);  // < 2^11
+    const u64 h = (hi << 32) - hi;                  // hi 2^64 = hi EPS (mod p)
     u64 r = lo + h;
     if (r < h) r += GL_EPS;
     return r >= GL_P ? r - GL_P : r;
+}
+
+template <u32 ROW>
+__device__ __forceinline__ void mds_rows(const u64* s, u64* t) {
+    t[ROW] = mds_row<ROW>(s);
+    if constexpr (ROW + 1 < SPONGE_WIDTH) mds_rows<ROW + 1>(s, t);
 }
 
 // `Poseidon::poseidon`: full rounds, fast partial rounds, full rounds. Same values as plonky2;
@@ -830,8 +845,7 @@ __device__ void poseidon_permute(u64* st) {
 #pragma unroll
         for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = gsbox(gadd(st[k], c_pos[POS_RC + k + SPONGE_WIDTH * round_ctr]));
         u64 t[SPONGE_WIDTH];
-#pragma unroll
-        for (u32 row = 0; row < SPONGE_WIDTH; row++) t[row] = mds_row_fast(st, row);
+        mds_rows<0>(st, t);
 #pragma unroll
         for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = t[k];
         round_ctr++;
@@ -851,7 +865,8 @@ __device__ void poseidon_permute(u64* st) {
 #pragma unroll
         for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = r0[k];
     }
-    const u64 mds0to0 = c_pos[POS_CIRC] + c_pos[POS_DIAG];
+    constexpr u32 C[SPONGE_WIDTH] = MDS_CIRC_VALUES;
+    const u64 mds0to0 = C[0] + MDS_DIAG0;
 #pragma unroll
     for (u32 r = 0; r < N_PARTIAL_ROUNDS; r++) {
         st[0] = gadd(gsbox(st[0]), c_pos[POS_FAST_RC + r]);
@@ -870,8 +885,7 @@ __device__ void poseidon_permute(u64* st) {
 #pragma unroll
         for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = gsbox(gadd(st[k], c_pos[POS_RC + k + SPONGE_WIDTH * round_ctr]));
         u64 t[SPONGE_WIDTH];
-#pragma unroll
-        for (u32 row = 0; row < SPONGE_WIDTH; row++) t[row] = mds_row_fast(st, row);
+        mds_rows<0>(st, t);
 #pragma unroll
         for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = t[k];
         round_ctr++;
@@ -1022,6 +1036,10 @@ extern "C" int plonky2_digest_layout(u64* dst, const u64* src, u32 per_subtree, 
 
 extern "C" int plonky2_quotient_init(const u64* poseidon_constants, u32 len) {
     if (len != POS_LEN) return -1;
+    constexpr u32 C[SPONGE_WIDTH] = MDS_CIRC_VALUES;
+    for (u32 k = 0; k < SPONGE_WIDTH; k++) {
+        if (poseidon_constants[POS_CIRC + k] != C[k] || poseidon_constants[POS_DIAG + k] != (k == 0 ? MDS_DIAG0 : 0u)) return -2;
+    }
     return (int)cudaMemcpyToSymbol(c_pos, poseidon_constants, sizeof(u64) * POS_LEN);
 }
 
