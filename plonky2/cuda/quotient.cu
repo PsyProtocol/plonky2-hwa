@@ -903,17 +903,20 @@ __device__ __forceinline__ u32 subtree_digest_index(u32 layer, u32 index) {
 // `hash_n_to_hash_no_pad` of each row-major leaf (cols > 4): zero state, overwrite RATE elements
 // per permutation, first 4 elements out. Leaves of subtree s go to its layer 0, or straight to
 // the cap when subtrees are single leaves.
+// COL_MAJOR: leaf element (r, k) at leaves[k * rows + r] (a commitment's column-major LDE in leaf
+// order) instead of leaves[r * cols + k].
+template <bool COL_MAJOR>
 __global__ void __launch_bounds__(128) merkle_leaves_kernel(u64* digests, u64* cap, const u64* leaves, u32 rows, u32 cols,
                                                           u32 lg_subtree_leaves, u32 per_subtree) {
     const u32 r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= rows) return;
-    const u64* leaf = leaves + (size_t)r * cols;
     u64 st[SPONGE_WIDTH];
 #pragma unroll
     for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = 0;
     for (u32 start = 0; start < cols; start += 8) {
         const u32 len = min(8u, cols - start);
-        for (u32 k = 0; k < len; k++) st[k] = gcanon(leaf[start + k]);
+        for (u32 k = 0; k < len; k++)
+            st[k] = gcanon(COL_MAJOR ? leaves[(size_t)(start + k) * rows + r] : leaves[(size_t)r * cols + start + k]);
         poseidon_permute(st);
     }
     u64* out;
@@ -953,18 +956,33 @@ __global__ void __launch_bounds__(128) merkle_layer_kernel(u64* digests, u64* ca
     out[3] = st[3];
 }
 
-// Merkle tree of `rows` row-major leaves with 2^cap_height subtrees, digests in plonky2's
-// layout (2 * (subtree leaves - 1) per subtree) and the cap, on `stream`.
-extern "C" int plonky2_merkle(u64* digests, u64* cap, const u64* leaves, u32 lg_rows, u32 cols, u32 cap_height,
-                              cudaStream_t stream) {
+static int merkle(u64* digests, u64* cap, const u64* leaves, u32 lg_rows, u32 cols, u32 cap_height, bool col_major,
+                  cudaStream_t stream) {
     const u32 rows = 1u << lg_rows, lg_sub = lg_rows - cap_height, subtrees = 1u << cap_height;
     const u32 per_subtree = lg_sub == 0 ? 0 : 2 * ((1u << lg_sub) - 1);
-    merkle_leaves_kernel<<<(rows + 127) / 128, 128, 0, stream>>>(digests, cap, leaves, rows, cols, lg_sub, per_subtree);
+    if (col_major)
+        merkle_leaves_kernel<true><<<(rows + 127) / 128, 128, 0, stream>>>(digests, cap, leaves, rows, cols, lg_sub, per_subtree);
+    else
+        merkle_leaves_kernel<false><<<(rows + 127) / 128, 128, 0, stream>>>(digests, cap, leaves, rows, cols, lg_sub, per_subtree);
     for (u32 layer = 1; layer <= lg_sub; layer++) {
         const u32 n = (1u << (lg_sub - layer)) * subtrees;
         merkle_layer_kernel<<<(n + 127) / 128, 128, 0, stream>>>(digests, cap, layer, lg_sub, per_subtree, subtrees);
     }
     return (int)cudaGetLastError();
+}
+
+// Merkle tree of `rows` row-major leaves with 2^cap_height subtrees, digests in plonky2's
+// layout (2 * (subtree leaves - 1) per subtree) and the cap, on `stream`.
+extern "C" int plonky2_merkle(u64* digests, u64* cap, const u64* leaves, u32 lg_rows, u32 cols, u32 cap_height,
+                              cudaStream_t stream) {
+    return merkle(digests, cap, leaves, lg_rows, cols, cap_height, false, stream);
+}
+
+// The same tree from column-major leaves (`cols` columns of 2^lg_rows, as the coset LDE leaves
+// them): no transpose needed.
+extern "C" int plonky2_merkle_cols(u64* digests, u64* cap, const u64* leaves, u32 lg_rows, u32 cols, u32 cap_height,
+                                   cudaStream_t stream) {
+    return merkle(digests, cap, leaves, lg_rows, cols, cap_height, true, stream);
 }
 
 struct PowArgs {

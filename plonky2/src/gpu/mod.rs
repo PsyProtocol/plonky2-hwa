@@ -137,6 +137,7 @@ mod ffi {
         pub fn cudaMalloc(ptr: *mut *mut c_void, size: usize) -> i32;
         pub fn cudaFree(ptr: *mut c_void) -> i32;
         pub fn cudaMemcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: i32) -> i32;
+        pub fn cudaMemcpy2D(dst: *mut c_void, dpitch: usize, src: *const c_void, spitch: usize, width: usize, height: usize, kind: i32) -> i32;
         pub fn cudaDeviceSynchronize() -> i32;
         pub fn cudaGetLastError() -> i32;
         pub fn cudaGetErrorString(err: i32) -> *const c_char;
@@ -206,6 +207,7 @@ pub(crate) fn coset_lde(dst: *mut c_void, src: *mut c_void, lg_n: usize, rate_bi
 
 extern "C" {
     fn plonky2_merkle(digests: *mut u64, cap: *mut u64, leaves: *const u64, lg_rows: u32, cols: u32, cap_height: u32, stream: *mut c_void) -> i32;
+    fn plonky2_merkle_cols(digests: *mut u64, cap: *mut u64, leaves: *const u64, lg_rows: u32, cols: u32, cap_height: u32, stream: *mut c_void) -> i32;
     fn plonky2_digest_layout(dst: *mut u64, src: *const u64, per_subtree: u32, lg_leaves: u32, num_subtrees: u32) -> i32;
     fn plonky2_coset_lde(dst: *mut u64, src: *const u64, lg_n: u32, rate_bits: u32, cols: u32, omega: u64, shift: u64, stream: *mut c_void) -> i32;
     fn plonky2_transpose(dst: *mut u64, src: *const u64, rows: u32, cols: u32, stream: *mut c_void) -> i32;
@@ -216,6 +218,16 @@ extern "C" {
 /// values and interpolate them on the device (`plonky2_intt`), instead of an IFFT per column on
 /// the CPU; the coefficients come back with the tree.
 static INTT_COMMITS: AtomicU64 = AtomicU64::new(0);
+static DEVICE_LEAF_COMMITS: AtomicU64 = AtomicU64::new(0);
+
+/// `PLONKY2_GPU_DEVICE_LEAVES=1`: a commitment whose LDE is kept on the device for the proof
+/// leaves its Merkle leaves there too. The tree hashes the column-major LDE directly (no
+/// transpose), nothing is downloaded, and the leaves are rows of the kept LDE copied out when
+/// read (the FRI queries read a few dozen; a CPU fallback reading many copies them all once).
+pub(crate) fn device_leaves_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLONKY2_GPU_DEVICE_LEAVES").ok().as_deref() == Some("1"))
+}
 
 pub(crate) fn intt_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -517,6 +529,8 @@ std::thread_local! {
     static COMMIT_SEQ: core::cell::Cell<u8> = const { core::cell::Cell::new(0) };
     /// LDEs kept on the device for the current proof.
     static RESIDENT: core::cell::RefCell<Vec<Resident>> = const { core::cell::RefCell::new(Vec::new()) };
+    /// Validity of the device leaves backed by those LDEs, cleared when the LDEs are released.
+    static LEAF_VIEWS: core::cell::RefCell<Vec<std::sync::Arc<AtomicBool>>> = const { core::cell::RefCell::new(Vec::new()) };
 }
 
 /// A proof's commitments in order (`prove`): wires, Z and partial products, quotient. A kept LDE
@@ -570,6 +584,9 @@ pub(crate) fn kept(role: u8, cols: usize, lg_rows: usize, leaf_order: bool) -> O
 
 /// Returns this thread's kept LDEs to the pool.
 pub(crate) fn release_resident() {
+    for v in LEAF_VIEWS.with(|v| v.borrow_mut().drain(..).collect::<Vec<_>>()) {
+        v.store(false, Ordering::SeqCst);
+    }
     let kept: Vec<Resident> = RESIDENT.with(|r| r.borrow_mut().drain(..).collect());
     for r in kept {
         RESIDENT_POOL.give(r.ptr, r.bytes);
@@ -832,6 +849,8 @@ pub struct GpuStats {
     pub fri_ns: u64,
     /// Commitments from values interpolated on the device (PLONKY2_GPU_INTT=1).
     pub intt_commits: u64,
+    /// Commitments whose leaves stayed on the device (PLONKY2_GPU_DEVICE_LEAVES=1).
+    pub device_leaf_commits: u64,
     /// Proofs whose permutation partial products ran on the GPU (PLONKY2_GPU_PP=1).
     pub pp_gpu: u64,
     /// Opening sets computed on the GPU (PLONKY2_GPU_OPEN=1).
@@ -884,6 +903,7 @@ pub fn stats() -> GpuStats {
         fri_mismatch: fri::fri_stats().2,
         fri_ns: fri::fri_stats().3,
         intt_commits: INTT_COMMITS.load(Ordering::Relaxed),
+        device_leaf_commits: DEVICE_LEAF_COMMITS.load(Ordering::Relaxed),
         pp_gpu: perm::pp_count(),
         open_gpu: open::open_count(),
     }
@@ -1105,7 +1125,13 @@ fn commit_columns<F: RichField, H: Hasher<F>>(
     let b: &'static Backend = backend().expect("checked by cpu_reason");
 
     // 0. Lease leaf storage (non-blocking; None -> leaves are copied out of the output set).
-    let mut lease = if in_proof() { b.leaf_pool.as_ref().and_then(|p| p.try_lease(cols * (n << rate_bits) * 8)) } else { None };
+    // Leaves that will stay on the device need no host storage.
+    let device_leaves_likely = capture_role.is_some() && device_leaves_enabled() && own_lde(lg_n, rate_bits) && !zeknox_merkle();
+    let mut lease = if in_proof() && !device_leaves_likely {
+        b.leaf_pool.as_ref().and_then(|p| p.try_lease(cols * (n << rate_bits) * 8))
+    } else {
+        None
+    };
     let lease_ptr = lease.as_mut().map(|l| l.as_mut_ptr() as *mut u64);
 
     // 1. Claim an exclusive output set (bounded pool).
@@ -1152,12 +1178,12 @@ fn commit_columns<F: RichField, H: Hasher<F>>(
     drop(state);
 
     match result {
-        Ok((leaves_flat_len, digests_len, cap_len, exec_s)) => {
+        Ok((leaves_flat_len, digests_len, cap_len, exec_s, device)) => {
             // 4. Rebuild outside the GPU lock; the set returns to the pool when `out` drops.
             let rebuild = Instant::now();
             let leased = lease.is_some();
             let tree = range("gpu:rebuild", || {
-                rebuild_tree::<F, H>(out.set.as_ref().expect("claimed"), lease, cols, lg_n + rate_bits, cap_height, leaves_flat_len, digests_len, cap_len)
+                rebuild_tree::<F, H>(out.set.as_ref().expect("claimed"), lease, cols, lg_n + rate_bits, cap_height, leaves_flat_len, digests_len, cap_len, device)
             });
             // The interpolated coefficients were downloaded into the set's staging.
             let coeffs = values_in.then(|| {
@@ -1266,7 +1292,7 @@ fn run<F: RichField>(
     rate_bits: usize,
     cap_height: usize,
     capture_role: Option<u8>,
-) -> GpuResult<(usize, usize, usize, f64)> {
+) -> GpuResult<(usize, usize, usize, f64, Option<DeviceLeafView>)> {
     let t = Instant::now();
     let cols = columns.len();
     let n = 1usize << lg_n;
@@ -1280,12 +1306,34 @@ fn run<F: RichField>(
         return Err("injected run_error".into());
     }
 
+    // The commitments of a proof whose quotient (and FRI) run on the GPU extend straight into a
+    // kept buffer, which those read instead of recomputing the LDE.
+    let kept = if capture_role.is_some() { RESIDENT_POOL.take(cols * rows * 8) } else { None };
+    // Returns the kept buffer to the pool if this run fails before it is recorded.
+    struct KeptGuard(Option<(usize, usize)>);
+    impl Drop for KeptGuard {
+        fn drop(&mut self) {
+            if let Some((p, b)) = self.0.take() {
+                RESIDENT_POOL.give(p, b);
+            }
+        }
+    }
+    let mut kept_guard = KeptGuard(kept.map(|p| (p as usize, cols * rows * 8)));
+    let leaf_order = own_lde(lg_n, rate_bits);
+    let own_merkle = !zeknox_merkle();
+    // The tree's leaves stay in the kept LDE (`PLONKY2_GPU_DEVICE_LEAVES=1`).
+    let device_leaves = kept.is_some() && leaf_order && own_merkle && device_leaves_enabled();
+
     // Grow the pinned outputs first: cudaMallocHost may synchronise and must not split the
     // overlapped download from the Merkle kernels below.
-    let leaves: &mut [u64] = match lease_ptr {
-        // SAFETY: the lease holds at least `cols * rows` u64 and is exclusively ours.
-        Some(p) => unsafe { core::slice::from_raw_parts_mut(p, cols * rows) },
-        None => out.leaves.ensure(cols * rows)?,
+    let mut leaves: Option<&mut [u64]> = if device_leaves {
+        None
+    } else {
+        Some(match lease_ptr {
+            // SAFETY: the lease holds at least `cols * rows` u64 and is exclusively ours.
+            Some(p) => unsafe { core::slice::from_raw_parts_mut(p, cols * rows) },
+            None => out.leaves.ensure(cols * rows)?,
+        })
     };
     let digests = out.digests.ensure((num_digests + caps) * HASH_U64)?;
     // Interpolated coefficients go to the set's staging (after the values left it).
@@ -1316,24 +1364,12 @@ fn run<F: RichField>(
         }
     };
     let d_in = dev(WS_IN, cols * n)?;
-    // The commitments of a proof whose quotient (and FRI) run on the GPU extend straight into a
-    // kept buffer, which those read instead of recomputing the LDE.
-    let kept = if capture_role.is_some() { RESIDENT_POOL.take(cols * rows * 8) } else { None };
-    // Returns the kept buffer to the pool if this run fails before it is recorded.
-    struct KeptGuard(Option<(usize, usize)>);
-    impl Drop for KeptGuard {
-        fn drop(&mut self) {
-            if let Some((p, b)) = self.0.take() {
-                RESIDENT_POOL.give(p, b);
-            }
-        }
-    }
-    let mut kept_guard = KeptGuard(kept.map(|p| (p as usize, cols * rows * 8)));
+
     let d_lde = match kept {
         Some(p) => p,
         None => dev(WS_LDE, cols * rows)?,
     };
-    let d_leaves = dev(WS_LEAVES, cols * rows)?;
+    let d_leaves = if device_leaves { core::ptr::null_mut() } else { dev(WS_LEAVES, cols * rows)? };
     let d_digests = dev(WS_DIGESTS, num_digests * HASH_U64)?;
     let d_cap = dev(WS_CAP, caps * HASH_U64)?;
     // Values are uploaded beside the coefficient buffer and interpolated into it. The wires'
@@ -1358,13 +1394,14 @@ fn run<F: RichField>(
         })?;
     }
 
-    let leaf_order = own_lde(lg_n, rate_bits);
     range("gpu:lde", || coset_lde(d_lde, d_in, lg_n, rate_bits, cols))?;
     if let Some(host) = coeffs_host {
         // The LDE synchronised the device, so the coefficients are complete.
         range("gpu:d2h_coeffs", || cuda(unsafe { ffi::cudaMemcpy(host as *mut c_void, d_in, cols * n * 8, ffi::D2H) }, "D2H coefficients"))?;
     }
-    if leaf_order {
+    if device_leaves {
+        // The tree hashes the column-major LDE; no row-major copy is needed.
+    } else if leaf_order {
         // Already in leaf order: a plain transpose to row-major leaves.
         range("gpu:transpose", || {
             cuda(unsafe { plonky2_transpose(d_leaves as *mut u64, d_lde as *const u64, rows as u32, cols as u32, core::ptr::null_mut()) }, "transpose")?;
@@ -1380,7 +1417,7 @@ fn run<F: RichField>(
         range("gpu:transpose:sync", || sync("transpose"))?;
     }
 
-    if overlap {
+    if let (true, Some(leaves)) = (overlap, leaves.as_deref_mut()) {
         // Starts now on the non-blocking stream; the device sync after the Merkle kernels waits
         // for it as well.
         cuda(
@@ -1395,8 +1432,17 @@ fn run<F: RichField>(
             return Err("injected failure with the leaf download in flight".into());
         }
     }
-    let own_merkle = !zeknox_merkle();
-    if own_merkle {
+    if device_leaves {
+        quotient::init_once()?;
+        range("gpu:merkle:submit", || {
+            cuda(
+                unsafe {
+                    plonky2_merkle_cols(d_digests as *mut u64, d_cap as *mut u64, d_lde as *const u64, lg_rows as u32, cols as u32, cap_height as u32, core::ptr::null_mut())
+                },
+                "merkle (columns)",
+            )
+        })?;
+    } else if own_merkle {
         // Digests straight into plonky2's layout (cuda/quotient.cu); needs the Poseidon constants.
         quotient::init_once()?;
         range("gpu:merkle:submit", || {
@@ -1427,7 +1473,7 @@ fn run<F: RichField>(
     range(if overlap { "gpu:merkle+d2h_leaves:sync" } else { "gpu:merkle:sync" }, || sync("merkle"))?;
 
     let _d2h = NvtxScope::new("gpu:d2h");
-    if !overlap {
+    if let (false, Some(leaves)) = (overlap, leaves) {
         cuda(unsafe { ffi::cudaMemcpy(leaves.as_mut_ptr() as *mut c_void, d_leaves, cols * rows * 8, ffi::D2H) }, "D2H leaves")?;
     }
     let (dg, cp) = digests.split_at_mut(num_digests * HASH_U64);
@@ -1447,15 +1493,22 @@ fn run<F: RichField>(
     sync("download")?;
     drop(_d2h);
     range("gpu:free", || drop(owned));
+    let mut view = None;
     if let Some((p, bytes)) = kept_guard.0.take() {
         let role = capture_role.expect("kept only with a role");
         RESIDENT.with(|r| r.borrow_mut().push(Resident { ptr: p, bytes, cols, lg_rows, leaf_order, role }));
+        if device_leaves {
+            let alive = std::sync::Arc::new(AtomicBool::new(true));
+            LEAF_VIEWS.with(|v| v.borrow_mut().push(alive.clone()));
+            DEVICE_LEAF_COMMITS.fetch_add(1, Ordering::Relaxed);
+            view = Some(DeviceLeafView { ptr: p, alive });
+        }
     }
     if let Some((p, bytes)) = values_guard.0.take() {
         // Canonical subgroup values, column-major; `lg_rows` is the subgroup's size here.
         RESIDENT.with(|r| r.borrow_mut().push(Resident { ptr: p, bytes, cols, lg_rows: lg_n, leaf_order: false, role: ROLE_WIRE_VALUES }));
     }
-    Ok((cols * rows, num_digests * HASH_U64, caps * HASH_U64, t.elapsed().as_secs_f64()))
+    Ok((if view.is_some() { 0 } else { cols * rows }, num_digests * HASH_U64, caps * HASH_U64, t.elapsed().as_secs_f64(), view))
 }
 
 /// NVTX range for the rest of the enclosing scope.
@@ -1484,6 +1537,52 @@ impl Drop for NvtxScope {
 /// digest layout (per cap subtree, node k has children 2k+2 and 2k+3) converted to plonky2's
 /// recursive layout, and the cap.
 #[allow(clippy::too_many_arguments)]
+/// A commitment's leaves left on the device: its kept LDE (column-major, leaf order) and whether
+/// that buffer still belongs to the proof.
+pub(crate) struct DeviceLeafView {
+    ptr: usize,
+    alive: std::sync::Arc<AtomicBool>,
+}
+
+/// Leaves read from a kept LDE: row `r` is element `r` of every column.
+fn device_leaves<F: RichField>(view: DeviceLeafView, cols: usize, rows: usize) -> crate::hash::leaf_matrix::DeviceLeaves<F> {
+    let (ptr, alive) = (view.ptr, view.alive);
+    let alive2 = alive.clone();
+    let check = move |a: &AtomicBool| {
+        assert!(a.load(Ordering::SeqCst), "device leaves read after the proof released its kept LDEs");
+    };
+    let fetch_row = move |r: usize| -> Vec<F> {
+        check(&alive);
+        let mut v = vec![0u64; cols];
+        // One element per column: source pitch is a column, destination pitch one element.
+        let rc = unsafe {
+            ffi::cudaMemcpy2D(v.as_mut_ptr() as *mut c_void, 8, (ptr + r * 8) as *const c_void, rows * 8, 8, cols, ffi::D2H)
+        };
+        assert_eq!(rc, 0, "device leaves: row copy failed ({rc})");
+        v.into_iter().map(F::from_canonical_u64).collect()
+    };
+    let fetch_all = move || -> Vec<F> {
+        check(&alive2);
+        let mut col_major = vec![0u64; cols * rows];
+        let rc = unsafe { ffi::cudaMemcpy(col_major.as_mut_ptr() as *mut c_void, ptr as *const c_void, cols * rows * 8, ffi::D2H) };
+        assert_eq!(rc, 0, "device leaves: copy failed ({rc})");
+        let mut out = vec![F::ZERO; cols * rows];
+        out.par_chunks_mut(cols).enumerate().for_each(|(r, row)| {
+            for (c, x) in row.iter_mut().enumerate() {
+                *x = F::from_canonical_u64(col_major[c * rows + r]);
+            }
+        });
+        out
+    };
+    crate::hash::leaf_matrix::DeviceLeaves::new(rows, cols, Box::new(fetch_row), Box::new(fetch_all))
+}
+
+/// Device leaf commitments (`PLONKY2_GPU_DEVICE_LEAVES=1`).
+pub fn device_leaf_commits() -> u64 {
+    DEVICE_LEAF_COMMITS.load(Ordering::Relaxed)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn rebuild_tree<F: RichField, H: Hasher<F>>(
     state: &OutputSet,
     lease: Option<leaf_pool::Lease>,
@@ -1493,9 +1592,22 @@ fn rebuild_tree<F: RichField, H: Hasher<F>>(
     leaves_len: usize,
     digests_len: usize,
     cap_len: usize,
+    device: Option<DeviceLeafView>,
 ) -> MerkleTree<F, H> {
     debug_assert_eq!(TypeId::of::<F>(), TypeId::of::<GoldilocksField>());
     debug_assert_eq!(TypeId::of::<H>(), TypeId::of::<PoseidonHash>());
+    if let Some(view) = device {
+        let digest_flat = unsafe { core::slice::from_raw_parts(state.digests.ptr, digests_len + cap_len) };
+        let (digests, cap) = rebuild_digests(digest_flat, digests_len, lg_rows, cap_height);
+        // SAFETY: F == GoldilocksField and H == PoseidonHash (checked by `cpu_reason`).
+        return unsafe {
+            MerkleTree {
+                leaves: crate::hash::leaf_matrix::LeafMatrix::from_device(device_leaves::<F>(view, cols, 1 << lg_rows)),
+                digests: cast_vec::<HashOut<GoldilocksField>, H::Hash>(digests),
+                cap: MerkleCap(cast_vec::<HashOut<GoldilocksField>, H::Hash>(cap)),
+            }
+        };
+    }
     #[cfg(feature = "gpu-fault-injection")]
     if inject("rebuild_panic") {
         panic!("injected rebuild_panic");

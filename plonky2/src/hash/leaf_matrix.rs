@@ -42,6 +42,78 @@ impl<F> ExternalLeaves<F> {
     }
 }
 
+/// Leaves that stay where they were computed (the GPU): a row is copied out when it is read, and
+/// once many rows are read (a CPU fallback walking every row) all of them are copied out once.
+/// Rows handed out are never moved or dropped while the leaves live.
+#[cfg(feature = "std")]
+pub struct DeviceLeaves<F> {
+    rows: usize,
+    width: usize,
+    fetch_row: Box<dyn Fn(usize) -> Vec<F> + Send + Sync>,
+    fetch_all: Box<dyn Fn() -> Vec<F> + Send + Sync>,
+    cache: std::sync::Mutex<std::collections::HashMap<usize, Box<[F]>>>,
+    all: std::sync::OnceLock<Vec<F>>,
+}
+
+/// Rows read one at a time before all rows are copied out instead.
+#[cfg(feature = "std")]
+const DEVICE_ROWS_BEFORE_ALL: usize = 64;
+
+#[cfg(feature = "std")]
+impl<F> DeviceLeaves<F> {
+    /// `fetch_row(r)` returns row `r` (`width` elements); `fetch_all()` returns every row,
+    /// row-major (`rows * width` elements).
+    pub fn new(
+        rows: usize,
+        width: usize,
+        fetch_row: Box<dyn Fn(usize) -> Vec<F> + Send + Sync>,
+        fetch_all: Box<dyn Fn() -> Vec<F> + Send + Sync>,
+    ) -> Self {
+        Self { rows, width, fetch_row, fetch_all, cache: Default::default(), all: Default::default() }
+    }
+
+    fn all(&self) -> &[F] {
+        self.all.get_or_init(|| {
+            let v = (self.fetch_all)();
+            assert_eq!(v.len(), self.rows * self.width, "device leaves: fetch_all returned the wrong length");
+            v
+        })
+    }
+
+    fn row(&self, i: usize) -> Option<&[F]> {
+        if i >= self.rows {
+            return None;
+        }
+        let w = self.width;
+        if let Some(all) = self.all.get() {
+            return Some(&all[i * w..(i + 1) * w]);
+        }
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let row = match cache.get(&i) {
+            Some(r) => r,
+            None if cache.len() >= DEVICE_ROWS_BEFORE_ALL => {
+                drop(cache);
+                return Some(&self.all()[i * w..(i + 1) * w]);
+            }
+            None => {
+                let r = (self.fetch_row)(i).into_boxed_slice();
+                assert_eq!(r.len(), w, "device leaves: fetch_row returned the wrong length");
+                cache.entry(i).or_insert(r)
+            }
+        };
+        // SAFETY: the boxed row is never removed or replaced while `self` lives, and moving the
+        // box inside the map does not move its contents.
+        Some(unsafe { core::slice::from_raw_parts(row.as_ptr(), row.len()) })
+    }
+}
+
+#[cfg(feature = "std")]
+impl<F> core::fmt::Debug for DeviceLeaves<F> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "DeviceLeaves {{ rows: {}, width: {} }}", self.rows, self.width)
+    }
+}
+
 #[derive(Debug)]
 pub enum LeafMatrix<F> {
     /// `rows * width` elements, row `i` at `data[i * width..(i + 1) * width]`; `width > 0`.
@@ -49,6 +121,9 @@ pub enum LeafMatrix<F> {
     Nested(Vec<Vec<F>>),
     /// Contiguous like `Flat`, but the storage belongs to `leaves`' owner.
     External { leaves: ExternalLeaves<F>, width: usize },
+    /// Rows copied out of the device when read.
+    #[cfg(feature = "std")]
+    Device(DeviceLeaves<F>),
 }
 
 impl<F: Clone> Clone for LeafMatrix<F> {
@@ -58,6 +133,8 @@ impl<F: Clone> Clone for LeafMatrix<F> {
             Self::Nested(v) => Self::Nested(v.clone()),
             // A clone never shares the external owner: copy into a flat matrix.
             Self::External { leaves, width } => Self::Flat { data: leaves.as_slice().to_vec(), width: *width },
+            #[cfg(feature = "std")]
+            Self::Device(d) => Self::Flat { data: d.all().to_vec(), width: d.width },
         }
     }
 }
@@ -89,7 +166,20 @@ impl<F> LeafMatrix<F> {
             Self::Flat { data, width } => data.len() / width,
             Self::Nested(v) => v.len(),
             Self::External { leaves, width } => leaves.len / width,
+            #[cfg(feature = "std")]
+            Self::Device(d) => d.rows,
         }
+    }
+
+    #[cfg(feature = "std")]
+    pub fn from_device(leaves: DeviceLeaves<F>) -> Self {
+        assert!(leaves.width > 0, "device leaves need a non-zero width");
+        Self::Device(leaves)
+    }
+
+    #[cfg(feature = "std")]
+    pub const fn is_device(&self) -> bool {
+        matches!(self, Self::Device(_))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -101,6 +191,8 @@ impl<F> LeafMatrix<F> {
             Self::Flat { data, width } => data.get(i * width..(i + 1) * width),
             Self::Nested(v) => v.get(i).map(|r| r.as_slice()),
             Self::External { leaves, width } => leaves.as_slice().get(i * width..(i + 1) * width),
+            #[cfg(feature = "std")]
+            Self::Device(d) => d.row(i),
         }
     }
 
@@ -139,6 +231,8 @@ impl<F> Index<usize> for LeafMatrix<F> {
             Self::Flat { data, width } => &data[i * width..(i + 1) * width],
             Self::Nested(v) => &v[i],
             Self::External { leaves, width } => &leaves.as_slice()[i * width..(i + 1) * width],
+            #[cfg(feature = "std")]
+            Self::Device(d) => d.row(i).expect("leaf index out of range"),
         }
     }
 }
@@ -213,7 +307,7 @@ impl<C: speedy::Context, F: speedy::Writable<C> + Clone> speedy::Writable<C> for
     fn write_to<T: ?Sized + speedy::Writer<C>>(&self, writer: &mut T) -> Result<(), C::Error> {
         match self {
             Self::Nested(v) => v.write_to(writer),
-            Self::Flat { .. } | Self::External { .. } => self.to_nested().write_to(writer),
+            _ => self.to_nested().write_to(writer),
         }
     }
 }
@@ -256,6 +350,42 @@ mod tests {
         drop(m);
         assert_eq!(dropped.load(Ordering::SeqCst), 1, "owner dropped with the matrix");
         assert!(c == nested, "clone owns its data");
+    }
+
+    #[test]
+    fn device_leaves_fetch_rows_then_everything() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let rows = 200usize;
+        let nested: Vec<Vec<u64>> = (0..rows as u64).map(|i| vec![i, i * 3, i * 7]).collect();
+        let (row_calls, all_calls) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (src1, src2, rc, ac) = (nested.clone(), nested.clone(), row_calls.clone(), all_calls.clone());
+        let m = LeafMatrix::from_device(DeviceLeaves::new(
+            rows,
+            3,
+            Box::new(move |r| {
+                rc.fetch_add(1, Ordering::SeqCst);
+                src1[r].clone()
+            }),
+            Box::new(move || {
+                ac.fetch_add(1, Ordering::SeqCst);
+                src2.concat()
+            }),
+        ));
+        assert!(m.is_device() && m.len() == rows);
+        // A few rows are fetched one at a time and served from the cache afterwards.
+        let r5 = &m[5];
+        assert_eq!(r5, &nested[5][..]);
+        assert_eq!(m.get(5), Some(&nested[5][..]));
+        assert_eq!(row_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(m.get(rows), None);
+        // Walking every row switches to one copy of everything.
+        assert!(m == nested);
+        assert_eq!(all_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(row_calls.load(Ordering::SeqCst), DEVICE_ROWS_BEFORE_ALL);
+        assert_eq!(r5, &nested[5][..], "rows handed out earlier stay valid");
+        let c = m.clone();
+        assert!(!c.is_device() && c == nested);
     }
 
     #[cfg(feature = "serialize_speedy")]

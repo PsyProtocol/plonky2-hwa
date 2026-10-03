@@ -432,10 +432,10 @@ fn cached_plan<F: RichField + Extendable<D>, const D: usize>(
 
 /// At the start of a proof: when its quotient will run on the GPU, keep the LDEs of the wires and
 /// Z commitments on the device for it.
-/// The openings or FRI read the proof's LDEs on the device: keep the quotient commitment's too,
-/// and all of them until the proof ends.
+/// The openings, FRI or device-resident leaves read the proof's LDEs on the device: keep the
+/// quotient commitment's too, and all of them until the proof ends.
 fn keep_all() -> bool {
-    super::fri::enabled() || super::open::enabled()
+    super::fri::enabled() || super::open::enabled() || super::device_leaves_enabled()
 }
 
 pub(crate) fn begin_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
@@ -1263,11 +1263,16 @@ mod tests {
         let pp_before = super::perm::pp_count();
         let pp_kept_before = super::perm::kept_values_count();
         let open_before = super::open::open_count();
+        let leaves_before = super::device_leaf_commits();
         let proof = outer.prove(pw.clone())?;
         outer.verify(proof)?;
         if shortages() != shortages_before {
             eprintln!("device memory was short during the test: path assertions skipped");
             return Ok(());
+        }
+        if super::device_leaves_enabled() && backend().is_some_and(|b| b.min_lde_rows <= 1 << 10) {
+            // The proof verified with its leaves read from the kept LDEs.
+            assert!(super::device_leaf_commits() >= leaves_before + 2, "commitments did not keep their leaves on the device");
         }
         if super::open::enabled() && backend().is_some_and(|b| b.min_lde_rows <= 1 << 10) {
             // Compared with OpeningSet::new in prove() under cfg(test).
