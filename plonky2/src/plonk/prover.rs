@@ -239,7 +239,18 @@ where
     let mut partial_products_and_zs = timed!(
         timing,
         "compute partial products",
-        crate::util::stage_log::range("prove:partial_products", || all_wires_permutation_partial_products(&witness, &betas, &gammas, prover_data, common_data))
+        crate::util::stage_log::range("prove:partial_products", || {
+            #[cfg(feature = "cuda")]
+            if let Some(v) = crate::gpu::perm::partial_products(&witness, &betas, &gammas, prover_data, common_data) {
+                #[cfg(test)]
+                assert!(
+                    v == all_wires_permutation_partial_products(&witness, &betas, &gammas, prover_data, common_data),
+                    "GPU partial products differ from the CPU"
+                );
+                return v;
+            }
+            all_wires_permutation_partial_products(&witness, &betas, &gammas, prover_data, common_data)
+        })
     );
 
     if let Some(l) = stage_log.as_mut() {

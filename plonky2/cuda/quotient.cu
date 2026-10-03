@@ -1448,3 +1448,128 @@ extern "C" int plonky2_fri_values_launch(const FriArgs* args, cudaStream_t strea
     fri_values_kernel<<<(N + 127) / 128, 128, 0, stream>>>(*args);
     return (int)cudaGetLastError();
 }
+// ---- Permutation partial products --------------------------------------------------------------
+
+// `wires_permutation_partial_products_and_zs` for both challenges. Row i (x = w_n^i) splits the
+// routed wires into chunks of `degree`; chunk k's quotient is
+//   q_k(i) = prod_j (w_j(i) + beta k_j x + gamma) / prod_j (w_j(i) + beta sigma_j(i) + gamma).
+// Z(0) = 1 and Z(i + 1) = Z(i) prod_k q_k(i); the partial products are Z(i) prod_{t <= k} q_t(i)
+// for k < num_prods. Field arithmetic is exact, so the values equal the CPU's.
+struct PpArgs {
+    const u64* wires;   // [num_routed][n] subgroup values
+    const u64* sigmas;  // [n][num_routed]
+    const u64* k_is;    // [num_routed]
+    u64* q;             // scratch [NC][num_chunks][n]: chunk quotients
+    u64* row;           // scratch [NC][n]: row products, then Z
+    u64* block;         // scratch [NC][blocks]: per-block products for the scan
+    u64* out;           // [NC + NC num_prods][n]: Z per challenge, then partial products by challenge
+    u64 beta[2], gamma[2];
+    u64 omega;          // primitive n-th root of unity
+    u32 lg_n, num_routed, degree, num_chunks, num_prods;
+};
+
+#define PP_MAX_CHUNKS 32
+
+__global__ void __launch_bounds__(128) pp_quotients_kernel(const PpArgs a) {
+    const u32 n = 1u << a.lg_n;
+    const u32 i = blockIdx.x * blockDim.x + threadIdx.x, c = blockIdx.y;
+    if (i >= n) return;
+    const u64 x = gpow(a.omega, i);
+    const u64 beta = a.beta[c], gamma = a.gamma[c];
+    const u64* sig = a.sigmas + (size_t)i * a.num_routed;
+    u64 num[PP_MAX_CHUNKS], den[PP_MAX_CHUNKS];
+    for (u32 k = 0; k < a.num_chunks; k++) {
+        u64 np = 1, dp = 1;
+        const u32 hi = min((k + 1) * a.degree, a.num_routed);
+        for (u32 j = k * a.degree; j < hi; j++) {
+            const u64 w = gcanon(a.wires[(size_t)j * n + i]);
+            np = gmul(np, gadd(gadd(w, gmul(beta, gmul(a.k_is[j], x))), gamma));
+            dp = gmul(dp, gadd(gadd(w, gmul(beta, gcanon(sig[j]))), gamma));
+        }
+        num[k] = np;
+        den[k] = dp;
+    }
+    // Montgomery's trick: one inversion for the row's denominators.
+    u64 pre[PP_MAX_CHUNKS];
+    u64 acc = 1;
+    for (u32 k = 0; k < a.num_chunks; k++) {
+        pre[k] = acc;
+        acc = gmul(acc, den[k]);
+    }
+    u64 inv = ginv(acc);
+    u64 r = 1;
+    for (u32 k = a.num_chunks; k-- > 0;) {
+        const u64 qk = gmul(num[k], gmul(inv, pre[k]));
+        inv = gmul(inv, den[k]);
+        a.q[((size_t)c * a.num_chunks + k) * n + i] = qk;
+        r = gmul(r, qk);
+    }
+    a.row[(size_t)c * n + i] = r;
+}
+
+// Exclusive prefix product of row[c][0..n) in blocks of PP_SCAN elements: each block scans its
+// slice in place (exclusive) and records its total; the totals are scanned by one block; then each
+// block multiplies its slice by its prefix.
+#define PP_SCAN 1024
+__device__ void block_exclusive_scan(u64* s, u32 len) {
+    // Hillis-Steele inclusive scan in shared memory, then shifted.
+    for (u32 off = 1; off < len; off <<= 1) {
+        u64 v = 1;
+        if (threadIdx.x < len && threadIdx.x >= off) v = s[threadIdx.x - off];
+        __syncthreads();
+        if (threadIdx.x < len && threadIdx.x >= off) s[threadIdx.x] = gmul(s[threadIdx.x], v);
+        __syncthreads();
+    }
+}
+
+__global__ void __launch_bounds__(PP_SCAN) pp_scan_blocks(u64* row, u64* block, u32 lg_n, u32 blocks) {
+    __shared__ u64 s[PP_SCAN];
+    const u32 n = 1u << lg_n, c = blockIdx.y, b = blockIdx.x;
+    const u32 len = min((u32)PP_SCAN, n);
+    u64* r = row + (size_t)c * n + (size_t)b * PP_SCAN;
+    if (threadIdx.x < len) s[threadIdx.x] = r[threadIdx.x];
+    __syncthreads();
+    block_exclusive_scan(s, len);  // inclusive
+    if (threadIdx.x < len) r[threadIdx.x] = threadIdx.x == 0 ? 1 : s[threadIdx.x - 1];
+    if (threadIdx.x == len - 1) block[(size_t)c * blocks + b] = s[len - 1];
+}
+
+__global__ void __launch_bounds__(PP_SCAN) pp_scan_totals(u64* block, u32 blocks) {
+    __shared__ u64 s[PP_SCAN];
+    const u32 c = blockIdx.x;
+    u64* t = block + (size_t)c * blocks;
+    if (threadIdx.x < blocks) s[threadIdx.x] = t[threadIdx.x];
+    __syncthreads();
+    block_exclusive_scan(s, blocks);
+    if (threadIdx.x < blocks) t[threadIdx.x] = threadIdx.x == 0 ? 1 : s[threadIdx.x - 1];
+}
+
+// Z(i) = block prefix * in-block exclusive prefix; partial products from Z and the quotients.
+__global__ void __launch_bounds__(128) pp_outputs_kernel(const PpArgs a, u32 blocks) {
+    const u32 n = 1u << a.lg_n;
+    const u32 i = blockIdx.x * blockDim.x + threadIdx.x, c = blockIdx.y;
+    if (i >= n) return;
+    u64 z = a.row[(size_t)c * n + i];
+    if (blocks > 1) z = gmul(z, a.block[(size_t)c * blocks + i / PP_SCAN]);
+    a.out[(size_t)c * n + i] = z;
+    u64 acc = z;
+    for (u32 k = 0; k < a.num_prods; k++) {
+        acc = gmul(acc, a.q[((size_t)c * a.num_chunks + k) * n + i]);
+        a.out[((size_t)2 + (size_t)c * a.num_prods + k) * n + i] = acc;
+    }
+}
+
+// Runs the kernels on `stream`; scratch pointers in `args` must hold the sizes noted there, with
+// `block` holding NC * ceil(n / PP_SCAN) values. n / PP_SCAN must be at most PP_SCAN (n <= 2^20).
+extern "C" int plonky2_partial_products(const PpArgs* args, cudaStream_t stream) {
+    const PpArgs& a = *args;
+    if (a.num_chunks > PP_MAX_CHUNKS || a.num_chunks == 0 || a.num_prods + 1 != a.num_chunks || a.lg_n < 1) return -1;
+    const u32 n = 1u << a.lg_n;
+    const u32 blocks = (n + PP_SCAN - 1) / PP_SCAN;
+    if (blocks > PP_SCAN) return -1;
+    pp_quotients_kernel<<<dim3((n + 127) / 128, 2), 128, 0, stream>>>(a);
+    pp_scan_blocks<<<dim3(blocks, 2), PP_SCAN, 0, stream>>>(a.row, a.block, a.lg_n, blocks);
+    if (blocks > 1) pp_scan_totals<<<2, PP_SCAN, 0, stream>>>(a.block, blocks);
+    pp_outputs_kernel<<<dim3((n + 127) / 128, 2), 128, 0, stream>>>(a, blocks);
+    return (int)cudaGetLastError();
+}

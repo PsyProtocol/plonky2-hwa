@@ -1152,8 +1152,13 @@ mod tests {
         let before = Q_GPU.load(Ordering::Relaxed);
         let reused_before = Q_RESIDENT_USED.load(Ordering::Relaxed);
         let intt_before = super::stats().intt_commits;
+        let pp_before = super::perm::pp_count();
         let proof = outer.prove(pw.clone())?;
         outer.verify(proof)?;
+        if super::perm::enabled() {
+            // Compared with the CPU in prove() under cfg(test).
+            assert!(super::perm::pp_count() > pp_before, "partial products did not run on the GPU");
+        }
         if super::intt_enabled() && backend().is_some_and(|b| b.min_lde_rows <= 1 << 10) {
             // Wires and Z come from values: both interpolated on the device.
             assert!(super::stats().intt_commits >= intt_before + 2, "values commitments did not use the device interpolation");

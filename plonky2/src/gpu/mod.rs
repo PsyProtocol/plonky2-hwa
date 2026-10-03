@@ -40,6 +40,7 @@ use crate::util::stage_log;
 
 pub(crate) mod fri;
 mod leaf_pool;
+pub(crate) mod perm;
 pub(crate) mod pow;
 pub(crate) mod quotient;
 
@@ -804,6 +805,8 @@ pub struct GpuStats {
     pub fri_ns: u64,
     /// Commitments from values interpolated on the device (PLONKY2_GPU_INTT=1).
     pub intt_commits: u64,
+    /// Proofs whose permutation partial products ran on the GPU (PLONKY2_GPU_PP=1).
+    pub pp_gpu: u64,
 }
 
 pub fn stats() -> GpuStats {
@@ -852,6 +855,7 @@ pub fn stats() -> GpuStats {
         fri_mismatch: fri::fri_stats().2,
         fri_ns: fri::fri_stats().3,
         intt_commits: INTT_COMMITS.load(Ordering::Relaxed),
+        pp_gpu: perm::pp_count(),
     }
 }
 
