@@ -159,14 +159,15 @@ fn zeknox_merkle() -> bool {
     *V.get_or_init(|| std::env::var("PLONKY2_GPU_MERKLE").ok().as_deref() == Some("zeknox"))
 }
 
-/// Coset LDEs with `plonky2_coset_lde` (column-major, in leaf order; 4-6x faster than zeknox's LDE
-/// plus `compute_transpose_rev` together) for `lg_n <= 13`, unless `PLONKY2_GPU_LDE=zeknox`.
-/// Larger LDEs, and all with the switch, use zeknox (column-major, natural order). Every LDE of a
-/// circuit has the same `lg_n`, so a quotient's inputs all share one layout.
+/// Coset LDEs with `plonky2_coset_lde` (column-major, in leaf order; with the transpose 3.5-4x
+/// faster than zeknox's LDE plus `compute_transpose_rev`) for `lg_n <= 18`, unless
+/// `PLONKY2_GPU_LDE=zeknox`. Larger LDEs, and all with the switch, use zeknox (column-major,
+/// natural order). Every LDE of a circuit has the same `lg_n`, so a quotient's inputs all share
+/// one layout.
 pub(crate) fn own_lde(lg_n: usize, rate_bits: usize) -> bool {
     static ZEKNOX: OnceLock<bool> = OnceLock::new();
     let zeknox = *ZEKNOX.get_or_init(|| std::env::var("PLONKY2_GPU_LDE").ok().as_deref() == Some("zeknox"));
-    !zeknox && (1..=13).contains(&lg_n) && rate_bits <= 4
+    !zeknox && (1..=18).contains(&lg_n) && rate_bits <= 4
 }
 
 /// Extends `cols` canonical coefficient columns (column-major, `2^lg_n` each, on the device) into

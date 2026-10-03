@@ -22,7 +22,8 @@ typedef unsigned int u32;
 #define GL_P 0xFFFFFFFF00000001ull
 #define GL_EPS 0xFFFFFFFFull
 #define EXT_W 7ull  // GoldilocksField quadratic extension: X^2 = 7
-#define LDE_MAX_LG_N 13  // coset LDE: one column's coset (8 << lg_n bytes) in shared memory
+#define LDE_SMEM_LG 13   // coset LDE: NTT blocks of up to 2^13 elements (64 KiB) in shared memory
+#define LDE_MAX_LG_N 18
 #define LDE_MAX_RATE_BITS 4
 #ifndef LDE_THREADS
 #define LDE_THREADS 512
@@ -1043,8 +1044,23 @@ extern "C" int plonky2_quotient_launch(const QuotientArgs* args, cudaStream_t st
 // bitrev_{rate_bits}(j) n .. + n in order. The output is column-major in leaf order:
 // column c at leaf r is dst[c N + r].
 
-// Host Goldilocks arithmetic for the tables.
-static u64 hmul(u64 a, u64 b) { return (u64)((unsigned __int128)a * b % GL_P); }
+// Larger n (up to 2^18) take two passes over the same in-place DIF: the first lg_n - 13 stages
+// combine elements 2^13 or more apart, so each offset o < 2^13 runs them in registers over
+// o + k 2^13; every stage after that stays inside one contiguous block of 2^13, which finishes in
+// shared memory.
+
+// Host Goldilocks multiplication for the tables (same reduction as `gmul`).
+static u64 hmul(u64 a, u64 b) {
+    const unsigned __int128 p = (unsigned __int128)a * b;
+    const u64 lo = (u64)p, hi = (u64)(p >> 64);
+    const u64 hi_hi = hi >> 32, hi_lo = hi & GL_EPS;
+    u64 t0 = lo - hi_hi;
+    if (lo < hi_hi) t0 -= GL_EPS;
+    const u64 t1 = hi_lo * GL_EPS;
+    u64 t2 = t0 + t1;
+    if (t2 < t0) t2 += GL_EPS;
+    return t2 >= GL_P ? t2 - GL_P : t2;
+}
 
 // Per (lg_n, rate_bits): scale[j][k] = (s w_N^j)^k for j < R, k < n; tw[k] = w_n^k for k < n / 2.
 struct LdeTables {
@@ -1056,12 +1072,14 @@ static std::mutex lde_tables_mu;
 static LdeTables lde_tables[LDE_MAX_LG_N + 1][LDE_MAX_RATE_BITS + 1];
 
 __global__ void coset_lde_kernel(u64*, const u64*, const u64*, const u64*, u32, u32);
+__global__ void coset_lde_pass2(u64*, const u64*, u32);
 
 static int lde_tables_get(u32 lg_n, u32 rate_bits, u64 omega_big, u64 shift, LdeTables* out) {
     std::lock_guard<std::mutex> g(lde_tables_mu);
     static bool smem_attr = false;
     if (!smem_attr) {
-        int e = (int)cudaFuncSetAttribute(coset_lde_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 << LDE_MAX_LG_N);
+        int e = (int)cudaFuncSetAttribute(coset_lde_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 << LDE_SMEM_LG);
+        if (!e) e = (int)cudaFuncSetAttribute(coset_lde_pass2, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 << LDE_SMEM_LG);
         if (e) return e;
         smem_attr = true;
     }
@@ -1101,19 +1119,13 @@ static int lde_tables_get(u32 lg_n, u32 rate_bits, u64 omega_big, u64 shift, Lde
     return 0;
 }
 
-// One block per (coset j, column): scale, size-n DIF NTT in shared memory, store.
-__global__ void __launch_bounds__(LDE_THREADS) coset_lde_kernel(u64* dst, const u64* src, const u64* scale,
-                                                               const u64* tw, u32 lg_n, u32 rate_bits) {
-    extern __shared__ u64 x[];
-    const u32 n = 1u << lg_n, j = blockIdx.x, col = blockIdx.y;
-    const u64* c = src + (size_t)col * n;
-    const u64* sc = scale + (size_t)j * n;
-    for (u32 k = threadIdx.x; k < n; k += blockDim.x) x[k] = gmul(gcanon(c[k]), sc[k]);
-    __syncthreads();
-    // Stage with half-size h = n/2 .. 1: (u, v) -> (u + v, (u - v) w_{2h}^lo), w_{2h} = w_n^(n / 2h).
-    for (u32 lg_h = lg_n; lg_h-- > 0;) {
+// DIF stages with half-size h = 2^(lg_size - 1) .. 1 on `x` (2^lg_size elements in shared memory)
+// of a size-2^lg_n NTT: (u, v) -> (u + v, (u - v) w_{2h}^lo) with w_{2h} = w_n^(n / 2h).
+__device__ __forceinline__ void dif_stages(u64* x, u32 lg_size, u32 lg_n, const u64* tw) {
+    const u32 half = 1u << (lg_size - 1);
+    for (u32 lg_h = lg_size; lg_h-- > 0;) {
         const u32 h = 1u << lg_h, shift = lg_n - 1 - lg_h;
-        for (u32 b = threadIdx.x; b < n / 2; b += blockDim.x) {
+        for (u32 b = threadIdx.x; b < half; b += blockDim.x) {
             const u32 lo = b & (h - 1);
             const u32 i = ((b >> lg_h) << (lg_h + 1)) | lo;
             const u64 u = x[i], v = x[i + h];
@@ -1122,21 +1134,94 @@ __global__ void __launch_bounds__(LDE_THREADS) coset_lde_kernel(u64* dst, const 
         }
         __syncthreads();
     }
+}
+
+__device__ __forceinline__ u64* lde_coset_out(u64* dst, u32 col, u32 j, u32 lg_n, u32 rate_bits) {
     const u32 jr = rate_bits == 0 ? 0 : __brev(j) >> (32 - rate_bits);
-    u64* out = dst + ((size_t)col << (lg_n + rate_bits)) + (size_t)jr * n;
+    return dst + ((size_t)col << (lg_n + rate_bits)) + ((size_t)jr << lg_n);
+}
+
+// lg_n <= 13. One block per (coset j, column): scale, size-n DIF NTT in shared memory, store.
+__global__ void __launch_bounds__(LDE_THREADS) coset_lde_kernel(u64* dst, const u64* src, const u64* scale,
+                                                               const u64* tw, u32 lg_n, u32 rate_bits) {
+    extern __shared__ u64 x[];
+    const u32 n = 1u << lg_n, j = blockIdx.x, col = blockIdx.y;
+    const u64* c = src + (size_t)col * n;
+    const u64* sc = scale + (size_t)j * n;
+    for (u32 k = threadIdx.x; k < n; k += blockDim.x) x[k] = gmul(gcanon(c[k]), sc[k]);
+    __syncthreads();
+    dif_stages(x, lg_n, lg_n, tw);
+    u64* out = lde_coset_out(dst, col, j, lg_n, rate_bits);
     for (u32 p = threadIdx.x; p < n; p += blockDim.x) out[p] = x[p];
+}
+
+// lg_n > 13, pass 1: scale, then the first L1 = lg_n - 13 stages in registers. One thread per
+// (offset o < 2^13, coset j, column) over the elements o + k 2^13, k < 2^L1; written in place of
+// the coset's output.
+template <u32 L1>
+__global__ void __launch_bounds__(256) coset_lde_pass1(u64* dst, const u64* src, const u64* scale, const u64* tw,
+                                                      u32 rate_bits) {
+    constexpr u32 SUB = 1u << LDE_SMEM_LG, K = 1u << L1, LG_N = LDE_SMEM_LG + L1;
+    const u32 o = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y, col = blockIdx.z;
+    const u64* c = src + ((size_t)col << LG_N);
+    const u64* sc = scale + ((size_t)j << LG_N);
+    u64 v[K];
+#pragma unroll
+    for (u32 k = 0; k < K; k++) v[k] = gmul(gcanon(c[o + k * SUB]), sc[o + k * SUB]);
+#pragma unroll
+    for (int st = L1 - 1; st >= 0; st--) {
+        // lg_h = 13 + st; element o + k SUB has lo = (o + k SUB) mod h = o + (k mod 2^st) SUB.
+        const u32 shift = LG_N - 1 - (LDE_SMEM_LG + st);
+#pragma unroll
+        for (u32 k = 0; k < K; k++) {
+            if (k & (1u << st)) continue;
+            const u32 lo = o + (k & ((1u << st) - 1)) * SUB;
+            const u64 u = v[k], w = v[k + (1u << st)];
+            v[k] = gadd(u, w);
+            v[k + (1u << st)] = gmul(gsub(u, w), tw[lo << shift]);
+        }
+    }
+    u64* out = lde_coset_out(dst, col, j, LG_N, rate_bits);
+#pragma unroll
+    for (u32 k = 0; k < K; k++) out[o + k * SUB] = v[k];
+}
+
+// lg_n > 13, pass 2: the remaining 13 stages of every contiguous block of 2^13, in place.
+__global__ void __launch_bounds__(LDE_THREADS) coset_lde_pass2(u64* dst, const u64* tw, u32 lg_n) {
+    extern __shared__ u64 x[];
+    constexpr u32 SUB = 1u << LDE_SMEM_LG;
+    u64* blk = dst + (size_t)blockIdx.x * SUB;
+    for (u32 k = threadIdx.x; k < SUB; k += blockDim.x) x[k] = blk[k];
+    __syncthreads();
+    dif_stages(x, LDE_SMEM_LG, lg_n, tw);
+    for (u32 k = threadIdx.x; k < SUB; k += blockDim.x) blk[k] = x[k];
 }
 
 // Coset LDE of `cols` canonical coefficient columns (column-major, n each) into `dst` (column-major,
 // leaf order, N each). `omega_big` is the primitive N-th root of unity and `shift` the coset shift.
 extern "C" int plonky2_coset_lde(u64* dst, const u64* src, u32 lg_n, u32 rate_bits, u32 cols, u64 omega_big, u64 shift,
                                  cudaStream_t stream) {
-    if (lg_n < 1 || lg_n > LDE_MAX_LG_N || rate_bits > LDE_MAX_RATE_BITS) return -1;
+    if (lg_n < 1 || lg_n > LDE_MAX_LG_N || rate_bits > LDE_MAX_RATE_BITS || cols == 0 || cols > 65535) return -1;
     LdeTables t;
     int e = lde_tables_get(lg_n, rate_bits, omega_big, shift, &t);
     if (e) return e;
-    const size_t smem = (size_t)8 << lg_n;
-    coset_lde_kernel<<<dim3(1u << rate_bits, cols), LDE_THREADS, smem, stream>>>(dst, src, t.scale, t.tw, lg_n, rate_bits);
+    const u32 R = 1u << rate_bits;
+    if (lg_n <= LDE_SMEM_LG) {
+        coset_lde_kernel<<<dim3(R, cols), LDE_THREADS, (size_t)8 << lg_n, stream>>>(dst, src, t.scale, t.tw, lg_n, rate_bits);
+        return (int)cudaGetLastError();
+    }
+    const dim3 g1((1u << LDE_SMEM_LG) / 256, R, cols);
+    switch (lg_n - LDE_SMEM_LG) {
+        case 1: coset_lde_pass1<1><<<g1, 256, 0, stream>>>(dst, src, t.scale, t.tw, rate_bits); break;
+        case 2: coset_lde_pass1<2><<<g1, 256, 0, stream>>>(dst, src, t.scale, t.tw, rate_bits); break;
+        case 3: coset_lde_pass1<3><<<g1, 256, 0, stream>>>(dst, src, t.scale, t.tw, rate_bits); break;
+        case 4: coset_lde_pass1<4><<<g1, 256, 0, stream>>>(dst, src, t.scale, t.tw, rate_bits); break;
+        case 5: coset_lde_pass1<5><<<g1, 256, 0, stream>>>(dst, src, t.scale, t.tw, rate_bits); break;
+        default: return -1;
+    }
+    // Every column's N = R n outputs are consecutive, so the blocks of all columns are one range.
+    const size_t blocks = ((size_t)cols << (lg_n + rate_bits)) >> LDE_SMEM_LG;
+    coset_lde_pass2<<<dim3((u32)blocks), LDE_THREADS, (size_t)8 << LDE_SMEM_LG, stream>>>(dst, t.tw, lg_n);
     return (int)cudaGetLastError();
 }
 
