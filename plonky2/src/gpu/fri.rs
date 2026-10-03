@@ -24,7 +24,8 @@ use crate::fri::structure::{FriInstanceInfo, FriOpenings};
 use crate::plonk::config::GenericConfig;
 
 /// The FRI final polynomial from the GPU: LDE coefficients, values in leaf order (index bits
-/// reversed), and the first commit-phase layer's tree when it was built.
+/// reversed; empty when the first commit-phase layer's tree was built, unless checking), and
+/// that tree.
 pub(crate) struct GpuFinal<F: RichField + Extendable<D>, H: Hasher<F>, const D: usize> {
     pub coeffs: PolynomialCoeffs<F::Extension>,
     pub leaf_values: Vec<F::Extension>,
@@ -71,10 +72,15 @@ pub(crate) fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var("PLONKY2_GPU_FRI").ok().as_deref() == Some("1"))
 }
 
-/// `PLONKY2_GPU_FRI_CHECK=1` (always in tests): also compute the CPU result and compare.
+/// `PLONKY2_GPU_FRI_CHECK=1` (the default in tests; `=0` turns it off there too): also compute
+/// the CPU result and compare.
 pub(crate) fn check_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    cfg!(test) || *ON.get_or_init(|| std::env::var("PLONKY2_GPU_FRI_CHECK").ok().as_deref() == Some("1"))
+    *ON.get_or_init(|| match std::env::var("PLONKY2_GPU_FRI_CHECK").ok().as_deref() {
+        Some("1") => true,
+        Some("0") => false,
+        _ => cfg!(test),
+    })
 }
 
 pub(crate) fn record_mismatch() {
@@ -258,10 +264,13 @@ pub(crate) fn final_poly<F: RichField + Extendable<D>, C: GenericConfig<D, F = F
     let ext = |k: usize| {
         F::Extension::from_basefield_array(core::array::from_fn(|d| F::from_canonical_u64(out[2 * k + d])))
     };
-    let leaf_values: Vec<F::Extension> = (0..big_n).into_par_iter().map(ext).collect();
+    // With the first tree built here the commit phase needs no values (checks still compare
+    // them), so only the first coset is converted.
+    let all_values = tree_shape.is_none() || check_enabled();
+    let leaf_values: Vec<F::Extension> = if all_values { (0..big_n).into_par_iter().map(ext).collect() } else { Vec::new() };
     // Leaf positions 0..n are the first coset, x = shift w_n^m at position bitrev(m): it
     // determines the polynomial (degree < n), so its inverse FFT gives the coefficients.
-    let mut coset0 = leaf_values[..n].to_vec();
+    let mut coset0: Vec<F::Extension> = if all_values { leaf_values[..n].to_vec() } else { (0..n).map(ext).collect() };
     reverse_index_bits_in_place(&mut coset0);
     let coeffs = PolynomialValues::new(coset0).coset_ifft(F::coset_shift().into());
     let first_tree = tree_shape.map(|(lg_rows, row_len, cap_height)| {

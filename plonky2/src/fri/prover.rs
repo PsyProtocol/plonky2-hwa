@@ -54,15 +54,18 @@ pub(crate) enum FriValues<F: RichField + Extendable<D>, H: Hasher<F>, const D: u
     /// Natural order.
     Natural(PolynomialValues<F::Extension>),
     /// Index bits reversed (the first commit-phase layer's order), with that layer's Merkle tree
-    /// when it is already built.
+    /// when it is already built (the values may then be empty: the commit phase does not read
+    /// them).
     LeafOrder(Vec<F::Extension>, Option<MerkleTree<F, H>>),
 }
 
 impl<F: RichField + Extendable<D>, H: Hasher<F>, const D: usize> FriValues<F, H, D> {
-    fn len(&self) -> usize {
+    /// The number of values, or `None` when they were not materialised (the first tree is built).
+    fn len(&self) -> Option<usize> {
         match self {
-            Self::Natural(v) => v.len(),
-            Self::LeafOrder(v, _) => v.len(),
+            Self::Natural(v) => Some(v.len()),
+            Self::LeafOrder(v, Some(_)) if v.is_empty() => None,
+            Self::LeafOrder(v, _) => Some(v.len()),
         }
     }
 }
@@ -79,8 +82,10 @@ pub(crate) fn fri_proof_with<F: RichField + Extendable<D>, C: GenericConfig<D, F
     max_num_query_steps: Option<usize>,
     timing: &mut TimingTree,
 ) -> FriProof<F, C::Hasher, D> {
-    let n = lde_polynomial_values.len();
-    assert_eq!(lde_polynomial_coeffs.len(), n);
+    let n = lde_polynomial_coeffs.len();
+    if let Some(len) = lde_polynomial_values.len() {
+        assert_eq!(len, n);
+    }
 
     // Commit phase
     let (trees, final_coeffs) = timed!(
