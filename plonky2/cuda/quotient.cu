@@ -1262,3 +1262,57 @@ extern "C" int plonky2_transpose(u64* dst, const u64* src, u32 rows, u32 cols, c
     transpose_kernel<<<dim3((rows + 31) / 32, (cols + 31) / 32), dim3(32, 8), 0, stream>>>(dst, src, rows, cols);
     return (int)cudaGetLastError();
 }
+
+// ---- FRI final polynomial ---------------------------------------------------------------------
+
+// plonky2's `prove_openings` reduces the opened polynomials of each batch b with powers of alpha
+// (C_b = sum_j alpha^j p_j), divides by X - z_b and sums the batches, earlier ones scaled by
+// alpha^(L_b) (L_b: polynomials in later batches). At every LDE point this is
+//   V(x) = sum_b alpha^(L_b) (C_b(x) - C_b(z_b)) / (x - z_b),
+// evaluated here from the LDE columns (leaf order) with C_b(z_b) from the opening values. One
+// thread per leaf position t (point i = bitrev(t)); the output is in leaf order, (a, b) per value.
+struct FriArgs {
+    const u64* const* cols;  // each term's LDE column
+    const u64* coef;         // each term's alpha^j, (a, b)
+    u64* out;                // [N][2]
+    u64 shift;               // coset shift
+    u64 omega;               // primitive N-th root of unity
+    u64 z[2][2];             // opening point of each batch
+    u64 cz[2][2];            // C_b(z_b)
+    u64 scale[2][2];         // alpha^(L_b)
+    u32 start[3];            // terms of batch b: start[b] .. start[b + 1]
+    u32 lg_lde;
+    u32 num_batches;
+};
+
+__global__ void __launch_bounds__(128) fri_values_kernel(const FriArgs a) {
+    const u32 N = 1u << a.lg_lde;
+    const u32 t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= N) return;
+    const u32 i = __brev(t) >> (32 - a.lg_lde);
+    const u64 x = gmul(a.shift, gpow(a.omega, i));
+    E2 v = {0, 0};
+    for (u32 b = 0; b < a.num_batches; b++) {
+        Acc160 sa{0, 0, 0}, sb{0, 0, 0};
+        for (u32 k = a.start[b]; k < a.start[b + 1]; k++) {
+            const u64 p = gcanon(a.cols[k][t]);
+            acc_mul(sa, p, a.coef[2 * k]);
+            acc_mul(sb, p, a.coef[2 * k + 1]);
+        }
+        const E2 num = esub(E2{reduce160(sa), reduce160(sb)}, E2{a.cz[b][0], a.cz[b][1]});
+        // 1 / (c + d X) = (c - d X) / (c^2 - 7 d^2); d = -z.b != 0 (checked by the host).
+        const E2 den = {gsub(x, a.z[b][0]), gsub(0, a.z[b][1])};
+        const u64 ninv = ginv(gsub(gmul(den.a, den.a), gmul(EXT_W, gmul(den.b, den.b))));
+        const E2 inv = {gmul(den.a, ninv), gmul(gsub(0, den.b), ninv)};
+        v = eadd(v, emul(emul(num, inv), E2{a.scale[b][0], a.scale[b][1]}));
+    }
+    a.out[2 * (size_t)t] = v.a;
+    a.out[2 * (size_t)t + 1] = v.b;
+}
+
+extern "C" int plonky2_fri_values_launch(const FriArgs* args, cudaStream_t stream) {
+    if (args->num_batches > 2 || args->lg_lde < 1) return -1;
+    const u32 N = 1u << args->lg_lde;
+    fri_values_kernel<<<(N + 127) / 128, 128, 0, stream>>>(*args);
+    return (int)cudaGetLastError();
+}

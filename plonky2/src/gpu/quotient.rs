@@ -449,7 +449,7 @@ pub(crate) fn begin_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = 
     let digest = crate::plonk::config::GenericHashOut::to_vec(&prover_data.circuit_digest)[0].to_canonical_u64();
     let plan = cached_plan(common, digest);
     if matches!(plan.as_ref(), Ok(p) if !p.disabled.load(Ordering::Relaxed)) {
-        super::begin_capture();
+        super::begin_capture(if super::fri::enabled() { 3 } else { 2 });
     }
 }
 
@@ -647,11 +647,8 @@ fn run<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     // Fast path: the kept wires and Z LDEs and a cached constants LDE are all on the device, so
     // nothing needs the GPU lock; the kernel runs on a pooled stream alongside the commitments.
     if debug_point.is_none() {
-        let kept = super::resident();
-        let kept_lde = |i: usize, c: usize| {
-            kept.get(i).filter(|r| r.cols == c && r.lg_rows == lg_lde && r.leaf_order == leaf_order).map(|r| r.ptr as *const u64)
-        };
-        if let (Some(w), Some(z)) = (kept_lde(0, cols[1]), kept_lde(1, cols[2])) {
+        let kept_lde = |role: u8, c: usize| super::kept(role, c, lg_lde, leaf_order).map(|r| r.ptr as *const u64);
+        if let (Some(w), Some(z)) = (kept_lde(super::ROLE_WIRES, cols[1]), kept_lde(super::ROLE_ZS, cols[2])) {
             if let Some(pin) = ConstPin::get(digest) {
                 let exec = Instant::now();
                 args.cs = pin.ptr;
@@ -660,7 +657,9 @@ fn run<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 Q_RESIDENT_USED.fetch_add(1, Ordering::Relaxed);
                 let result = range("gpu:quotient_unlocked", || run_unlocked(&mut args, &aux, &plan.gates, big_n));
                 drop(pin);
-                super::release_resident();
+                if !super::fri::enabled() {
+                    super::release_resident();
+                }
                 return match result {
                     Ok(out) => {
                         Q_GPU.fetch_add(1, Ordering::Relaxed);
@@ -688,12 +687,9 @@ fn run<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     Q_LOCK_WAIT_NS.fetch_add(wait.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let exec = Instant::now();
     // The wires and Z LDEs kept by this proof's commitments, when their shapes match.
-    let kept = super::resident();
-    let kept_lde = |i: usize, cols: usize| {
-        kept.get(i).filter(|r| r.cols == cols && r.lg_rows == lg_lde && r.leaf_order == leaf_order).map(|r| r.ptr as *const u64)
-    };
-    let wires_lde = kept_lde(0, cols[1]).map_or(Lde::Upload(&wires.polynomials), Lde::Device);
-    let zs_lde = kept_lde(1, cols[2]).map_or(Lde::Upload(&zs.polynomials), Lde::Device);
+    let kept_lde = |role: u8, c: usize| super::kept(role, c, lg_lde, leaf_order).map(|r| r.ptr as *const u64);
+    let wires_lde = kept_lde(super::ROLE_WIRES, cols[1]).map_or(Lde::Upload(&wires.polynomials), Lde::Device);
+    let zs_lde = kept_lde(super::ROLE_ZS, cols[2]).map_or(Lde::Upload(&zs.polynomials), Lde::Device);
     if matches!((&wires_lde, &zs_lde), (Lde::Device(_), Lde::Device(_))) && debug_point.is_none() {
         Q_RESIDENT_USED.fetch_add(1, Ordering::Relaxed);
     }
@@ -722,8 +718,8 @@ fn run<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         result = Err("oom".into());
     }
     drop(state);
-    if debug_point.is_none() {
-        // The commitments' LDEs are not needed after the quotient.
+    if debug_point.is_none() && !super::fri::enabled() {
+        // The commitments' LDEs are not needed after the quotient (FRI reads them otherwise).
         super::release_resident();
     }
     match result {
@@ -877,6 +873,28 @@ fn constants_lde<F: RichField>(
     c.entries.insert(digest, (p as usize, bytes, tick, 0));
     c.bytes += bytes;
     Ok(p as *const u64)
+}
+
+/// Runs `f` with circuit `digest`'s constants/sigmas LDE on the device (layout as `own_lde`): a
+/// pinned cache entry, without the GPU lock; otherwise under the lock, extended now if needed (into
+/// the cache, or the quotient's scratch buffer, which the lock keeps ours until `f` returns).
+pub(super) fn with_constants<F: RichField, R>(
+    digest: u64,
+    polys: &[PolynomialCoeffs<F>],
+    lg_n: usize,
+    rate_bits: usize,
+    f: impl FnOnce(*const u64) -> GpuResult<R>,
+) -> GpuResult<R> {
+    if let Some(pin) = ConstPin::get(digest) {
+        let r = f(pin.ptr);
+        drop(pin);
+        return r;
+    }
+    let b = backend().ok_or("GPU backend unavailable")?;
+    let mut state = range("gpu:fri_lock_wait", || b.state.lock().unwrap_or_else(|e| e.into_inner()));
+    let n = 1usize << lg_n;
+    let ptr = constants_lde(&mut state.q, digest, polys, n, n << rate_bits, lg_n, rate_bits, &mut |_| {})?;
+    f(ptr)
 }
 
 /// Frees the least recently used constants LDE that no quotient is reading; false when none can
@@ -1141,9 +1159,17 @@ mod tests {
         if backend().is_some_and(|b| b.min_lde_rows <= 1 << 10) {
             assert!(Q_RESIDENT_USED.load(Ordering::Relaxed) > reused_before, "kept LDEs were not used");
             let unlocked_before = Q_UNLOCKED.load(Ordering::Relaxed);
+            let (fri_before, _, _, _) = super::super::fri::fri_stats();
             let proof = outer.prove(pw)?;
             outer.verify(proof)?;
             assert!(Q_UNLOCKED.load(Ordering::Relaxed) > unlocked_before, "the second quotient took the locked path");
+            // With PLONKY2_GPU_FRI=1 the final polynomial comes from the kept LDEs, and (in tests)
+            // equals the CPU's.
+            let (fri, _, fri_mismatch, _) = super::super::fri::fri_stats();
+            if super::super::fri::enabled() {
+                assert!(fri > fri_before, "the FRI final polynomial did not run on the GPU");
+            }
+            assert_eq!(fri_mismatch, 0, "GPU FRI final polynomial differs from the CPU");
         }
         Ok(())
     }

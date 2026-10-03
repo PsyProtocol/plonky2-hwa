@@ -148,9 +148,66 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         timing: &mut TimingTree,
     ) -> FriProof<F, C::Hasher, D> {
         assert!(D > 1, "Not implemented for D=1.");
-        let alpha = challenger.get_extension_challenge::<D>();
-        let mut alpha = ReducingFactor::new(alpha);
+        let alpha_value = challenger.get_extension_challenge::<D>();
+        let mut alpha = ReducingFactor::new(alpha_value);
 
+        #[cfg(feature = "cuda")]
+        let gpu = crate::util::stage_log::acc("fri_gpu_final", || {
+            crate::gpu::fri::final_poly::<F, C, D>(instance, oracles, alpha_value, fri_params.config.rate_bits)
+        });
+        #[cfg(not(feature = "cuda"))]
+        let gpu: Option<(PolynomialCoeffs<F::Extension>, PolynomialValues<F::Extension>)> = None;
+        #[cfg(feature = "cuda")]
+        let check = gpu.is_some() && crate::gpu::fri::check_enabled();
+        #[cfg(not(feature = "cuda"))]
+        let check = false;
+        let (lde_final_poly, lde_final_values) = match gpu {
+            Some(g) if !check => g,
+            gpu => {
+                #[cfg(not(feature = "cuda"))]
+                let _ = gpu;
+                #[cfg(feature = "cuda")]
+                if gpu.is_none() {
+                    crate::gpu::fri::record_cpu();
+                }
+                let cpu = Self::final_poly_cpu(instance, oracles, &mut alpha, fri_params, timing);
+                #[cfg(feature = "cuda")]
+                if let Some(g) = gpu {
+                    if g.0.coeffs != cpu.0.coeffs || g.1.values != cpu.1.values {
+                        crate::gpu::fri::record_mismatch();
+                    }
+                }
+                cpu
+            }
+        };
+
+        let fri_proof = fri_proof::<F, C, D>(
+            &oracles
+                .par_iter()
+                .map(|c| &c.merkle_tree)
+                .collect::<Vec<_>>(),
+            lde_final_poly,
+            lde_final_values,
+            challenger,
+            fri_params,
+            final_poly_coeff_len,
+            max_num_query_steps,
+            timing,
+        );
+
+        fri_proof
+    }
+
+    /// The final polynomial's LDE coefficients and values: every opened polynomial reduced with
+    /// powers of alpha, divided by `X - z` per batch, summed and extended.
+    #[allow(clippy::type_complexity)]
+    fn final_poly_cpu(
+        instance: &FriInstanceInfo<F, D>,
+        oracles: &[&Self],
+        alpha: &mut ReducingFactor<F::Extension>,
+        fri_params: &FriParams,
+        timing: &mut TimingTree,
+    ) -> (PolynomialCoeffs<F::Extension>, PolynomialValues<F::Extension>) {
         let final_poly = crate::util::stage_log::acc("fri_reduce_polys", || {
             let mut final_poly = PolynomialCoeffs::empty();
             for FriBatchInfo { point, polynomials } in &instance.batches {
@@ -177,21 +234,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             crate::util::stage_log::acc("fri_final_fft", || lde_final_poly
                 .coset_fft(F::coset_shift().into()))
         );
-
-        let fri_proof = fri_proof::<F, C, D>(
-            &oracles
-                .par_iter()
-                .map(|c| &c.merkle_tree)
-                .collect::<Vec<_>>(),
-            lde_final_poly,
-            lde_final_values,
-            challenger,
-            fri_params,
-            final_poly_coeff_len,
-            max_num_query_steps,
-            timing,
-        );
-
-        fri_proof
+        (lde_final_poly, lde_final_values)
     }
 }

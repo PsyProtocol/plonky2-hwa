@@ -347,8 +347,14 @@ where
     if let Some(l) = stage_log.as_mut() {
         l.mark("openings");
     }
-    challenger.observe_openings(&openings.to_fri_openings());
+    let fri_openings = openings.to_fri_openings();
+    challenger.observe_openings(&fri_openings);
     let instance = common_data.get_fri_instance(zeta);
+    #[cfg(feature = "cuda")]
+    crate::gpu::fri::set_context(
+        crate::plonk::config::GenericHashOut::to_vec(&prover_data.circuit_digest)[0].to_canonical_u64(),
+        &fri_openings,
+    );
 
     let opening_proof = timed!(
         timing,

@@ -38,6 +38,7 @@ use crate::hash::poseidon::PoseidonHash;
 use crate::plonk::config::Hasher;
 use crate::util::stage_log;
 
+pub(crate) mod fri;
 mod leaf_pool;
 pub(crate) mod pow;
 pub(crate) mod quotient;
@@ -487,22 +488,31 @@ impl Drop for ProofScope {
             v
         });
         if depth == 0 {
-            CAPTURE_LEFT.with(|c| c.set(0));
+            CAPTURE_ROLES.with(|c| c.set(0));
             release_resident();
         }
     }
 }
 
 std::thread_local! {
-    /// Commitments of the current proof whose LDE is still to be kept on the device for the
-    /// quotient (the wires and Z batches, the proof's first two commitments).
-    static CAPTURE_LEFT: core::cell::Cell<u8> = const { core::cell::Cell::new(0) };
-    /// LDEs kept on the device for the current proof, in commitment order.
+    /// How many of the current proof's commitments, counted from its first, keep their LDE on
+    /// the device (0: none).
+    static CAPTURE_ROLES: core::cell::Cell<u8> = const { core::cell::Cell::new(0) };
+    /// Commitments the current proof has made so far (on the GPU or not).
+    static COMMIT_SEQ: core::cell::Cell<u8> = const { core::cell::Cell::new(0) };
+    /// LDEs kept on the device for the current proof.
     static RESIDENT: core::cell::RefCell<Vec<Resident>> = const { core::cell::RefCell::new(Vec::new()) };
 }
 
+/// A proof's commitments in order (`prove`): wires, Z and partial products, quotient. A kept LDE
+/// is tagged with its commitment's position, so one that stayed on the CPU cannot shift the
+/// others into the wrong role.
+pub(crate) const ROLE_WIRES: u8 = 0;
+pub(crate) const ROLE_ZS: u8 = 1;
+pub(crate) const ROLE_QUOTIENT: u8 = 2;
+
 /// A commitment's LDE (column-major; in leaf order when `leaf_order`, else natural order) kept on
-/// the device for the quotient.
+/// the device for the quotient and FRI.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Resident {
     pub ptr: usize,
@@ -510,16 +520,34 @@ pub(crate) struct Resident {
     pub cols: usize,
     pub lg_rows: usize,
     pub leaf_order: bool,
+    pub role: u8,
 }
 
-/// Keep the LDEs of this proof's next two commitments (wires, Z) on the device.
-pub(crate) fn begin_capture() {
+/// Keep the LDEs of this proof's first `roles` commitments on the device.
+pub(crate) fn begin_capture(roles: u8) {
     release_resident();
-    CAPTURE_LEFT.with(|c| c.set(2));
+    CAPTURE_ROLES.with(|c| c.set(roles));
+    COMMIT_SEQ.with(|c| c.set(0));
 }
 
-pub(crate) fn resident() -> Vec<Resident> {
-    RESIDENT.with(|r| r.borrow().clone())
+/// The role of the commitment starting now, if its LDE is to be kept.
+fn next_capture_role() -> Option<u8> {
+    if !in_proof() {
+        return None;
+    }
+    let seq = COMMIT_SEQ.with(|c| {
+        let v = c.get();
+        c.set(v.saturating_add(1));
+        v
+    });
+    (seq < CAPTURE_ROLES.with(|c| c.get())).then_some(seq)
+}
+
+/// The kept LDE of `role`, if it has the expected shape and layout.
+pub(crate) fn kept(role: u8, cols: usize, lg_rows: usize, leaf_order: bool) -> Option<Resident> {
+    RESIDENT.with(|r| {
+        r.borrow().iter().copied().find(|k| k.role == role && k.cols == cols && k.lg_rows == lg_rows && k.leaf_order == leaf_order)
+    })
 }
 
 /// Returns this thread's kept LDEs to the pool.
@@ -944,6 +972,8 @@ pub(crate) fn try_commit<F: RichField, H: Hasher<F>>(
         return Err("irregular_input");
     }
     let lg_n = n.trailing_zeros() as usize;
+    // Counted before any CPU decision, so the proof's commitment positions stay aligned.
+    let capture_role = next_capture_role();
     let reason = cpu_reason::<F, H>(lg_n, rate_bits, cols, blinding);
     if !reason.is_empty() {
         return Err(reason);
@@ -985,7 +1015,7 @@ pub(crate) fn try_commit<F: RichField, H: Hasher<F>>(
     let mut state = range("gpu:lock_wait", || b.state.lock().unwrap_or_else(|e| e.into_inner()));
     let lock_wait = wait.elapsed().as_secs_f64();
     let mut result = range("gpu:device", || {
-        run(&mut state, out.set.as_mut().expect("claimed"), pre_canon, lease_ptr, polynomials, lg_n, rate_bits, cap_height)
+        run(&mut state, out.set.as_mut().expect("claimed"), pre_canon, lease_ptr, polynomials, lg_n, rate_bits, cap_height, capture_role)
     });
     // Out of device memory while growing buffers (nothing was launched yet): drop the quotient's
     // caches and try once more.
@@ -994,7 +1024,7 @@ pub(crate) fn try_commit<F: RichField, H: Hasher<F>>(
         quotient::release_device_caches(&mut state.q);
         OOM_RETRIES.fetch_add(1, Ordering::Relaxed);
         result = range("gpu:device", || {
-            run(&mut state, out.set.as_mut().expect("claimed"), pre_canon, lease_ptr, polynomials, lg_n, rate_bits, cap_height)
+            run(&mut state, out.set.as_mut().expect("claimed"), pre_canon, lease_ptr, polynomials, lg_n, rate_bits, cap_height, capture_role)
         });
     }
     // 3. Device work is complete (synchronous copies + device sync); the set is ours alone.
@@ -1093,6 +1123,7 @@ fn run<F: RichField>(
     lg_n: usize,
     rate_bits: usize,
     cap_height: usize,
+    capture_role: Option<u8>,
 ) -> GpuResult<(usize, usize, usize, f64)> {
     let t = Instant::now();
     let cols = polynomials.len();
@@ -1141,15 +1172,9 @@ fn run<F: RichField>(
         }
     };
     let d_in = dev(WS_IN, cols * n)?;
-    // The wires and Z commitments of a proof whose quotient runs on the GPU extend straight into
-    // a kept buffer, which the quotient reads instead of recomputing the LDE.
-    let capture = in_proof()
-        && CAPTURE_LEFT.with(|c| {
-            let v = c.get();
-            c.set(v.saturating_sub(1));
-            v > 0
-        });
-    let kept = if capture { RESIDENT_POOL.take(cols * rows * 8) } else { None };
+    // The commitments of a proof whose quotient (and FRI) run on the GPU extend straight into a
+    // kept buffer, which those read instead of recomputing the LDE.
+    let kept = if capture_role.is_some() { RESIDENT_POOL.take(cols * rows * 8) } else { None };
     // Returns the kept buffer to the pool if this run fails before it is recorded.
     struct KeptGuard(Option<(usize, usize)>);
     impl Drop for KeptGuard {
@@ -1255,7 +1280,8 @@ fn run<F: RichField>(
     drop(_d2h);
     range("gpu:free", || drop(owned));
     if let Some((p, bytes)) = kept_guard.0.take() {
-        RESIDENT.with(|r| r.borrow_mut().push(Resident { ptr: p, bytes, cols, lg_rows, leaf_order }));
+        let role = capture_role.expect("kept only with a role");
+        RESIDENT.with(|r| r.borrow_mut().push(Resident { ptr: p, bytes, cols, lg_rows, leaf_order, role }));
     }
     Ok((cols * rows, num_digests * HASH_U64, caps * HASH_U64, t.elapsed().as_secs_f64()))
 }
