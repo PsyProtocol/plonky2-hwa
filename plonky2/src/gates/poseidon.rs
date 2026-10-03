@@ -638,9 +638,11 @@ impl<F: RichField + Extendable<D> + Poseidon, const D: usize> SimpleGenerator<F,
 
         let mut state: [F; SPONGE_WIDTH] = state.try_into().unwrap();
         let mut round_ctr = 0;
+        // The state is in the base field, so the base-field layers apply (the `_field` variants
+        // are for extension elements and multiply in full width); the values are the same.
 
         for r in 0..poseidon::HALF_N_FULL_ROUNDS {
-            <F as Poseidon>::constant_layer_field(&mut state, round_ctr);
+            <F as Poseidon>::constant_layer(&mut state, round_ctr);
             if r != 0 {
                 for i in 0..SPONGE_WIDTH {
                     out_buffer.set_wire(
@@ -649,8 +651,8 @@ impl<F: RichField + Extendable<D> + Poseidon, const D: usize> SimpleGenerator<F,
                     )?;
                 }
             }
-            <F as Poseidon>::sbox_layer_field(&mut state);
-            state = <F as Poseidon>::mds_layer_field(&state);
+            <F as Poseidon>::sbox_layer(&mut state);
+            state = <F as Poseidon>::mds_layer(&state);
             round_ctr += 1;
         }
 
@@ -663,7 +665,7 @@ impl<F: RichField + Extendable<D> + Poseidon, const D: usize> SimpleGenerator<F,
             )?;
             state[0] = <F as Poseidon>::sbox_monomial(state[0]);
             state[0] += F::from_canonical_u64(<F as Poseidon>::FAST_PARTIAL_ROUND_CONSTANTS[r]);
-            state = <F as Poseidon>::mds_partial_layer_fast_field(&state, r);
+            state = <F as Poseidon>::mds_partial_layer_fast(&state, r);
         }
         out_buffer.set_wire(
             local_wire(PoseidonGate::<F, D>::wire_partial_sbox(
@@ -673,19 +675,19 @@ impl<F: RichField + Extendable<D> + Poseidon, const D: usize> SimpleGenerator<F,
         )?;
         state[0] = <F as Poseidon>::sbox_monomial(state[0]);
         state =
-            <F as Poseidon>::mds_partial_layer_fast_field(&state, poseidon::N_PARTIAL_ROUNDS - 1);
+            <F as Poseidon>::mds_partial_layer_fast(&state, poseidon::N_PARTIAL_ROUNDS - 1);
         round_ctr += poseidon::N_PARTIAL_ROUNDS;
 
         for r in 0..poseidon::HALF_N_FULL_ROUNDS {
-            <F as Poseidon>::constant_layer_field(&mut state, round_ctr);
+            <F as Poseidon>::constant_layer(&mut state, round_ctr);
             for i in 0..SPONGE_WIDTH {
                 out_buffer.set_wire(
                     local_wire(PoseidonGate::<F, D>::wire_full_sbox_1(r, i)),
                     state[i],
                 )?;
             }
-            <F as Poseidon>::sbox_layer_field(&mut state);
-            state = <F as Poseidon>::mds_layer_field(&state);
+            <F as Poseidon>::sbox_layer(&mut state);
+            state = <F as Poseidon>::mds_layer(&state);
             round_ctr += 1;
         }
 
