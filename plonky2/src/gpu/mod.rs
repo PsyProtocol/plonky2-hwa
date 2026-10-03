@@ -152,7 +152,15 @@ mod ffi {
 
 type GpuResult<T> = Result<T, String>;
 
+/// `PLONKY2_GPU_MERKLE=zeknox`: build commitment Merkle trees with zeknox's kernels (heap layout,
+/// reordered afterwards) instead of `plonky2_merkle` (about 1.9x faster, same digests).
+fn zeknox_merkle() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("PLONKY2_GPU_MERKLE").ok().as_deref() == Some("zeknox"))
+}
+
 extern "C" {
+    fn plonky2_merkle(digests: *mut u64, cap: *mut u64, leaves: *const u64, lg_rows: u32, cols: u32, cap_height: u32, stream: *mut c_void) -> i32;
     fn plonky2_digest_layout(dst: *mut u64, src: *const u64, per_subtree: u32, lg_leaves: u32, num_subtrees: u32) -> i32;
 }
 
@@ -1154,7 +1162,20 @@ fn run<F: RichField>(
             return Err("injected failure with the leaf download in flight".into());
         }
     }
-    range("gpu:merkle:submit", || unsafe {
+    let own_merkle = !zeknox_merkle();
+    if own_merkle {
+        // Digests straight into plonky2's layout (cuda/quotient.cu); needs the Poseidon constants.
+        quotient::init_once()?;
+        range("gpu:merkle:submit", || {
+            cuda(
+                unsafe {
+                    plonky2_merkle(d_digests as *mut u64, d_cap as *mut u64, d_leaves as *const u64, lg_rows as u32, cols as u32, cap_height as u32, core::ptr::null_mut())
+                },
+                "merkle",
+            )
+        })?;
+    } else {
+        range("gpu:merkle:submit", || unsafe {
             ffi::fill_digests_buf_linear_gpu_with_gpu_ptr(
                 d_digests,
                 d_cap,
@@ -1167,7 +1188,8 @@ fn run<F: RichField>(
                 0,
                 0,
             )
-    });
+        });
+    }
     // Waits for the Merkle kernels (and the overlapped leaf download, if any).
     range(if overlap { "gpu:merkle+d2h_leaves:sync" } else { "gpu:merkle:sync" }, || sync("merkle"))?;
 
@@ -1176,8 +1198,10 @@ fn run<F: RichField>(
         cuda(unsafe { ffi::cudaMemcpy(leaves.as_mut_ptr() as *mut c_void, d_leaves, cols * rows * 8, ffi::D2H) }, "D2H leaves")?;
     }
     let (dg, cp) = digests.split_at_mut(num_digests * HASH_U64);
-    if num_digests > 0 {
-        // Reorder the digests into plonky2's layout on the device; the host then only copies them.
+    if num_digests > 0 && own_merkle {
+        cuda(unsafe { ffi::cudaMemcpy(dg.as_mut_ptr() as *mut c_void, d_digests, num_digests * HASH_U64 * 8, ffi::D2H) }, "D2H digests")?;
+    } else if num_digests > 0 {
+        // Reorder zeknox's digests into plonky2's layout on the device; the host then only copies.
         let d_plonky2 = dev(WS_DIGESTS_PLONKY2, num_digests * HASH_U64)?;
         let per_subtree = num_digests / caps;
         cuda(

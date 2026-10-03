@@ -755,39 +755,187 @@ __global__ void __launch_bounds__(QK_THREADS, QK_MIN_BLOCKS) quotient_kernel(con
 
 // ---- Poseidon permutation and the FRI proof-of-work search ------------------------------------
 
-// `Poseidon::poseidon`: full rounds, fast partial rounds, full rounds.
+// 160-bit accumulator lo + mid 2^64 + hi 2^128, for sums of 64x64-bit products reduced once.
+struct Acc160 {
+    u64 lo, mid;
+    u32 hi;
+};
+
+__device__ __forceinline__ void acc_mul(Acc160& a, u64 x, u64 y) {
+    u64 plo = x * y, phi = __umul64hi(x, y);
+    u64 t = a.lo + plo;
+    u64 c = t < plo;
+    a.lo = t;
+    u64 m = a.mid + phi;
+    u32 c2 = m < phi;
+    u64 m2 = m + c;
+    c2 += m2 < c;
+    a.mid = m2;
+    a.hi += c2;
+}
+
+// Canonical (mid + hi 2^64) 2^64 + lo mod p, with 2^64 = EPS (mod p).
+__device__ __forceinline__ u64 reduce160(const Acc160& a) {
+    u64 h = (u64)a.hi * GL_EPS;  // hi < 2^32
+    u64 t = a.mid + h;
+    if (t < h) t += GL_EPS;
+    u64 hi_hi = t >> 32, hi_lo = t & GL_EPS;
+    u64 t0 = a.lo - hi_hi;
+    if (a.lo < hi_hi) t0 -= GL_EPS;
+    u64 t1 = hi_lo * GL_EPS;
+    u64 t2 = t0 + t1;
+    if (t2 < t0) t2 += GL_EPS;
+    return t2 >= GL_P ? t2 - GL_P : t2;
+}
+
+// Row `row` of the MDS layer: the circulant and diagonal entries are small, so the products are
+// summed in 128 bits and reduced once.
+__device__ __forceinline__ u64 mds_row_fast(const u64* s, u32 row) {
+    u64 lo = 0, hi = 0;
+#pragma unroll
+    for (int k = 0; k < SPONGE_WIDTH; k++) {
+        u64 c = c_pos[POS_CIRC + k] + (k == 0 ? c_pos[POS_DIAG + row] : 0ull);
+        u64 v = s[(k + row) % SPONGE_WIDTH];
+        u64 plo = v * c, phi = __umul64hi(v, c);
+        lo += plo;
+        hi += phi + (lo < plo);
+    }
+    u64 h = hi * GL_EPS;  // hi < 2^12
+    u64 r = lo + h;
+    if (r < h) r += GL_EPS;
+    return r >= GL_P ? r - GL_P : r;
+}
+
+// `Poseidon::poseidon`: full rounds, fast partial rounds, full rounds. Same values as plonky2;
+// sums of products are accumulated wide and reduced once.
 __device__ void poseidon_permute(u64* st) {
     u32 round_ctr = 0;
+#pragma unroll
     for (u32 r = 0; r < HALF_N_FULL_ROUNDS; r++) {
+#pragma unroll
         for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = gsbox(gadd(st[k], c_pos[POS_RC + k + SPONGE_WIDTH * round_ctr]));
-        pos_mds(st);
+        u64 t[SPONGE_WIDTH];
+#pragma unroll
+        for (u32 row = 0; row < SPONGE_WIDTH; row++) t[row] = mds_row_fast(st, row);
+#pragma unroll
+        for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = t[k];
         round_ctr++;
     }
+#pragma unroll
     for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = gadd(st[k], c_pos[POS_FIRST + k]);
     {
         u64 r0[SPONGE_WIDTH];
         r0[0] = st[0];
-        for (u32 c = 1; c < SPONGE_WIDTH; c++) r0[c] = 0;
-        for (u32 r = 1; r < SPONGE_WIDTH; r++)
-            for (u32 c = 1; c < SPONGE_WIDTH; c++)
-                r0[c] = gadd(r0[c], gmul(st[r], c_pos[POS_INIT + (r - 1) * 11 + (c - 1)]));
+#pragma unroll
+        for (u32 c = 1; c < SPONGE_WIDTH; c++) {
+            Acc160 a{0, 0, 0};
+#pragma unroll
+            for (u32 r = 1; r < SPONGE_WIDTH; r++) acc_mul(a, st[r], c_pos[POS_INIT + (r - 1) * 11 + (c - 1)]);
+            r0[c] = reduce160(a);
+        }
+#pragma unroll
         for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = r0[k];
     }
     const u64 mds0to0 = c_pos[POS_CIRC] + c_pos[POS_DIAG];
+#pragma unroll
     for (u32 r = 0; r < N_PARTIAL_ROUNDS; r++) {
         st[0] = gadd(gsbox(st[0]), c_pos[POS_FAST_RC + r]);
-        u64 d = gmul(st[0], mds0to0);
-        for (u32 k = 1; k < SPONGE_WIDTH; k++) d = gadd(d, gmul(st[k], c_pos[POS_WHATS + r * 11 + (k - 1)]));
+        Acc160 a{0, 0, 0};
+        acc_mul(a, st[0], mds0to0);
+#pragma unroll
+        for (u32 k = 1; k < SPONGE_WIDTH; k++) acc_mul(a, st[k], c_pos[POS_WHATS + r * 11 + (k - 1)]);
         u64 s0 = st[0];
-        st[0] = d;
+        st[0] = reduce160(a);
+#pragma unroll
         for (u32 k = 1; k < SPONGE_WIDTH; k++) st[k] = gadd(gmul(s0, c_pos[POS_VS + r * 11 + (k - 1)]), st[k]);
     }
     round_ctr += N_PARTIAL_ROUNDS;
+#pragma unroll
     for (u32 r = 0; r < HALF_N_FULL_ROUNDS; r++) {
+#pragma unroll
         for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = gsbox(gadd(st[k], c_pos[POS_RC + k + SPONGE_WIDTH * round_ctr]));
-        pos_mds(st);
+        u64 t[SPONGE_WIDTH];
+#pragma unroll
+        for (u32 row = 0; row < SPONGE_WIDTH; row++) t[row] = mds_row_fast(st, row);
+#pragma unroll
+        for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = t[k];
         round_ctr++;
     }
+}
+
+// ---- Merkle trees in plonky2's layout ---------------------------------------------------------
+
+// Index in a subtree's digest buffer of node `index` on `layer` (0 = leaf digests); see
+// `subtree_digest_index` in merkle_tree.rs.
+__device__ __forceinline__ u32 subtree_digest_index(u32 layer, u32 index) {
+    return 2 * (((index >> 1) << (layer + 1)) + (1u << layer) - 1) + (index & 1);
+}
+
+// `hash_n_to_hash_no_pad` of each row-major leaf (cols > 4): zero state, overwrite RATE elements
+// per permutation, first 4 elements out. Leaves of subtree s go to its layer 0, or straight to
+// the cap when subtrees are single leaves.
+__global__ void __launch_bounds__(128) merkle_leaves_kernel(u64* digests, u64* cap, const u64* leaves, u32 rows, u32 cols,
+                                                          u32 lg_subtree_leaves, u32 per_subtree) {
+    const u32 r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const u64* leaf = leaves + (size_t)r * cols;
+    u64 st[SPONGE_WIDTH];
+#pragma unroll
+    for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = 0;
+    for (u32 start = 0; start < cols; start += 8) {
+        const u32 len = min(8u, cols - start);
+        for (u32 k = 0; k < len; k++) st[k] = gcanon(leaf[start + k]);
+        poseidon_permute(st);
+    }
+    u64* out;
+    if (per_subtree == 0) {
+        out = cap + (size_t)r * 4;
+    } else {
+        const u32 s = r >> lg_subtree_leaves, idx = r & ((1u << lg_subtree_leaves) - 1);
+        out = digests + ((size_t)s * per_subtree + subtree_digest_index(0, idx)) * 4;
+    }
+    out[0] = st[0];
+    out[1] = st[1];
+    out[2] = st[2];
+    out[3] = st[3];
+}
+
+// `compress` (two_to_one) of the children of every node on `layer` (>= 1) of every subtree; the
+// subtree roots (layer == lg_subtree_leaves) go to the cap.
+__global__ void __launch_bounds__(128) merkle_layer_kernel(u64* digests, u64* cap, u32 layer, u32 lg_subtree_leaves,
+                                                         u32 per_subtree, u32 num_subtrees) {
+    const u32 nodes = 1u << (lg_subtree_leaves - layer);
+    const u32 t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= nodes * num_subtrees) return;
+    const u32 s = t / nodes, idx = t % nodes;
+    const u64* base = digests + (size_t)s * per_subtree * 4;
+    const u64* l = base + (size_t)subtree_digest_index(layer - 1, 2 * idx) * 4;  // right sibling follows
+    u64 st[SPONGE_WIDTH];
+#pragma unroll
+    for (u32 k = 0; k < 8; k++) st[k] = l[k];
+#pragma unroll
+    for (u32 k = 8; k < SPONGE_WIDTH; k++) st[k] = 0;
+    poseidon_permute(st);
+    u64* out = layer == lg_subtree_leaves ? cap + (size_t)s * 4
+                                          : digests + ((size_t)s * per_subtree + subtree_digest_index(layer, idx)) * 4;
+    out[0] = st[0];
+    out[1] = st[1];
+    out[2] = st[2];
+    out[3] = st[3];
+}
+
+// Merkle tree of `rows` row-major leaves with 2^cap_height subtrees, digests in plonky2's
+// layout (2 * (subtree leaves - 1) per subtree) and the cap, on `stream`.
+extern "C" int plonky2_merkle(u64* digests, u64* cap, const u64* leaves, u32 lg_rows, u32 cols, u32 cap_height,
+                              cudaStream_t stream) {
+    const u32 rows = 1u << lg_rows, lg_sub = lg_rows - cap_height, subtrees = 1u << cap_height;
+    const u32 per_subtree = lg_sub == 0 ? 0 : 2 * ((1u << lg_sub) - 1);
+    merkle_leaves_kernel<<<(rows + 127) / 128, 128, 0, stream>>>(digests, cap, leaves, rows, cols, lg_sub, per_subtree);
+    for (u32 layer = 1; layer <= lg_sub; layer++) {
+        const u32 n = (1u << (lg_sub - layer)) * subtrees;
+        merkle_layer_kernel<<<(n + 127) / 128, 128, 0, stream>>>(digests, cap, layer, lg_sub, per_subtree, subtrees);
+    }
+    return (int)cudaGetLastError();
 }
 
 struct PowArgs {

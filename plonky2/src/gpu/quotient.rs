@@ -1187,6 +1187,15 @@ mod tests {
         Ok(())
     }
 
+    /// Writes the device Poseidon constants to `$PLONKY2_DUMP_POSEIDON` (for the gpu-lab benches).
+    #[test]
+    #[ignore]
+    fn dump_poseidon_constants() {
+        let path = std::env::var("PLONKY2_DUMP_POSEIDON").expect("set PLONKY2_DUMP_POSEIDON");
+        let bytes: Vec<u8> = poseidon_constants().iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(path, bytes).unwrap();
+    }
+
     #[test]
     fn psy_u32_gate_ids_parse() {
         let cmp = "ComparisonGate { num_bits: 32, num_chunks: 16, _phantom: PhantomData<plonky2_field::goldilocks_field::GoldilocksField> }<D=2>";
