@@ -345,15 +345,43 @@ where
     let openings = timed!(
         timing,
         "construct the opening set, including lookups",
-        crate::util::stage_log::range("prove:openings", || OpeningSet::new(
-            zeta,
-            g,
-            &prover_data.constants_sigmas_commitment,
-            &wires_commitment,
-            &partial_products_zs_and_lookup_commitment,
-            &quotient_polys_commitment,
-            common_data
-        ))
+        crate::util::stage_log::range("prove:openings", || {
+            #[cfg(feature = "cuda")]
+            if let Some(o) = crate::gpu::open::openings::<F, C, D>(
+                zeta,
+                g,
+                &prover_data.constants_sigmas_commitment,
+                &wires_commitment,
+                &partial_products_zs_and_lookup_commitment,
+                &quotient_polys_commitment,
+                common_data,
+                crate::plonk::config::GenericHashOut::to_vec(&prover_data.circuit_digest)[0].to_canonical_u64(),
+            ) {
+                #[cfg(test)]
+                assert!(
+                    o == OpeningSet::new(
+                        zeta,
+                        g,
+                        &prover_data.constants_sigmas_commitment,
+                        &wires_commitment,
+                        &partial_products_zs_and_lookup_commitment,
+                        &quotient_polys_commitment,
+                        common_data
+                    ),
+                    "GPU openings differ from the CPU"
+                );
+                return o;
+            }
+            OpeningSet::new(
+                zeta,
+                g,
+                &prover_data.constants_sigmas_commitment,
+                &wires_commitment,
+                &partial_products_zs_and_lookup_commitment,
+                &quotient_polys_commitment,
+                common_data,
+            )
+        })
     );
     if let Some(l) = stage_log.as_mut() {
         l.mark("openings");

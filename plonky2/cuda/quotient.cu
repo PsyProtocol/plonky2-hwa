@@ -1573,3 +1573,72 @@ extern "C" int plonky2_partial_products(const PpArgs* args, cudaStream_t stream)
     pp_outputs_kernel<<<dim3((n + 127) / 128, 2), 128, 0, stream>>>(a, blocks);
     return (int)cudaGetLastError();
 }
+// ---- Openings from the LDE's first coset -------------------------------------------------------
+
+// A polynomial p of degree < n is determined by its values on the coset sH, which are the first n
+// leaf positions of its leaf-order LDE: position t holds p(x_t), x_t = s w_n^bitrev(t). Lagrange
+// interpolation on sH gives
+//   p(z) = sum_t p(x_t) W_t,   W_t = (z^n - s^n) / (n s^n) * x_t / (z - x_t),
+// exact for z outside sH (the host checks z is not in the base field). The weights depend only on
+// z, so each polynomial costs one dot product.
+struct OpenArgs {
+    const u64* const* cols;  // each term's LDE column (leaf order)
+    const u32* point;        // each term's point index (0 or 1)
+    u64* weights;            // [2][n][2]
+    u64* out;                // [terms][2]
+    u64 z[2][2];             // the points
+    u64 c[2][2];             // (z^n - s^n) / (n s^n) per point
+    u64 shift, omega;        // coset shift, primitive n-th root of unity
+    u32 lg_n, num_points, num_terms;
+};
+
+__global__ void __launch_bounds__(256) open_weights_kernel(const OpenArgs a) {
+    const u32 n = 1u << a.lg_n;
+    const u32 t = blockIdx.x * blockDim.x + threadIdx.x, p = blockIdx.y;
+    if (t >= n) return;
+    const u64 x = gmul(a.shift, gpow(a.omega, __brev(t) >> (32 - a.lg_n)));
+    const E2 den = {gsub(a.z[p][0], x), a.z[p][1]};
+    const u64 ninv = ginv(gsub(gmul(den.a, den.a), gmul(EXT_W, gmul(den.b, den.b))));
+    const E2 inv = {gmul(den.a, ninv), gmul(gsub(0, den.b), ninv)};
+    const E2 w = escal(emul(inv, E2{a.c[p][0], a.c[p][1]}), x);
+    u64* o = a.weights + ((size_t)p * n + t) * 2;
+    o[0] = w.a;
+    o[1] = w.b;
+}
+
+// One block per term: sum_t col[t] W_t, products summed in 160 bits per component per thread.
+__global__ void __launch_bounds__(256) open_dot_kernel(const OpenArgs a) {
+    __shared__ u64 sa[256], sb[256];
+    const u32 n = 1u << a.lg_n, k = blockIdx.x;
+    const u64* col = a.cols[k];
+    const u64* w = a.weights + (size_t)a.point[k] * n * 2;
+    Acc160 xa{0, 0, 0}, xb{0, 0, 0};
+    for (u32 t = threadIdx.x; t < n; t += blockDim.x) {
+        const u64 v = gcanon(col[t]);
+        acc_mul(xa, v, w[2 * t]);
+        acc_mul(xb, v, w[2 * t + 1]);
+    }
+    sa[threadIdx.x] = reduce160(xa);
+    sb[threadIdx.x] = reduce160(xb);
+    __syncthreads();
+    for (u32 s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            sa[threadIdx.x] = gadd(sa[threadIdx.x], sa[threadIdx.x + s]);
+            sb[threadIdx.x] = gadd(sb[threadIdx.x], sb[threadIdx.x + s]);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        a.out[2 * k] = sa[0];
+        a.out[2 * k + 1] = sb[0];
+    }
+}
+
+extern "C" int plonky2_openings(const OpenArgs* args, cudaStream_t stream) {
+    const OpenArgs& a = *args;
+    if (a.num_points < 1 || a.num_points > 2 || a.lg_n < 1 || a.num_terms == 0) return -1;
+    const u32 n = 1u << a.lg_n;
+    open_weights_kernel<<<dim3((n + 255) / 256, a.num_points), 256, 0, stream>>>(a);
+    open_dot_kernel<<<a.num_terms, 256, 0, stream>>>(a);
+    return (int)cudaGetLastError();
+}

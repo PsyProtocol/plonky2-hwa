@@ -429,6 +429,12 @@ fn cached_plan<F: RichField + Extendable<D>, const D: usize>(
 
 /// At the start of a proof: when its quotient will run on the GPU, keep the LDEs of the wires and
 /// Z commitments on the device for it.
+/// The openings or FRI read the proof's LDEs on the device: keep the quotient commitment's too,
+/// and all of them until the proof ends.
+fn keep_all() -> bool {
+    super::fri::enabled() || super::open::enabled()
+}
+
 pub(crate) fn begin_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     common: &CommonCircuitData<F, D>,
     prover_data: &ProverOnlyCircuitData<F, C, D>,
@@ -449,7 +455,7 @@ pub(crate) fn begin_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = 
     let digest = crate::plonk::config::GenericHashOut::to_vec(&prover_data.circuit_digest)[0].to_canonical_u64();
     let plan = cached_plan(common, digest);
     if matches!(plan.as_ref(), Ok(p) if !p.disabled.load(Ordering::Relaxed)) {
-        super::begin_capture(if super::fri::enabled() { 3 } else { 2 });
+        super::begin_capture(if keep_all() { 3 } else { 2 });
     }
 }
 
@@ -657,7 +663,7 @@ fn run<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 Q_RESIDENT_USED.fetch_add(1, Ordering::Relaxed);
                 let result = range("gpu:quotient_unlocked", || run_unlocked(&mut args, &aux, &plan.gates, big_n));
                 drop(pin);
-                if !super::fri::enabled() {
+                if !keep_all() {
                     super::release_resident();
                 }
                 return match result {
@@ -718,8 +724,9 @@ fn run<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         result = Err("oom".into());
     }
     drop(state);
-    if debug_point.is_none() && !super::fri::enabled() {
-        // The commitments' LDEs are not needed after the quotient (FRI reads them otherwise).
+    if debug_point.is_none() && !keep_all() {
+        // The commitments' LDEs are not needed after the quotient (openings and FRI read them
+        // otherwise).
         super::release_resident();
     }
     match result {
@@ -826,6 +833,8 @@ fn const_budget() -> usize {
 
 static CONST_CACHE: OnceLock<Mutex<ConstCache>> = OnceLock::new();
 static Q_CONST_HITS: AtomicU64 = AtomicU64::new(0);
+/// Constants LDEs that did not fit in the cache (extended into scratch instead).
+static Q_CONST_NO_ROOM: AtomicU64 = AtomicU64::new(0);
 static Q_RESIDENT_USED: AtomicU64 = AtomicU64::new(0);
 
 /// (constants cache hits, wires+Z LDEs taken from the commitments, quotients run outside the GPU
@@ -860,6 +869,7 @@ fn constants_lde<F: RichField>(
     while c.bytes + bytes <= const_budget() && !super::device_room(bytes) && evict_lru(&mut c) {}
     while c.bytes + bytes > const_budget() && evict_lru(&mut c) {}
     if c.bytes + bytes > const_budget() || !super::device_room(bytes) {
+        Q_CONST_NO_ROOM.fetch_add(1, Ordering::Relaxed);
         let dst = q.d_cs.ensure(polys.len() * big_n)?;
         upload_lde(&mut q.input, &mut q.d_in, polys, n, lg_n, rate_bits, dst, lap)?;
         return Ok(dst as *const u64);
@@ -1149,12 +1159,31 @@ mod tests {
         let outer = builder.build::<C>();
         plan(&outer.common).map_err(anyhow::Error::msg)?;
 
+        // Device memory shortages (other processes on a shared card) send paths to the CPU by
+        // design; the assertions that a path ran are skipped when one happened.
+        let shortages = || {
+            super::resident_stats().1
+                + super::perm::no_room_count()
+                + super::stats().oom_fallbacks
+                + Q_OOM.load(Ordering::Relaxed)
+                + Q_CONST_NO_ROOM.load(Ordering::Relaxed)
+        };
+        let shortages_before = shortages();
         let before = Q_GPU.load(Ordering::Relaxed);
         let reused_before = Q_RESIDENT_USED.load(Ordering::Relaxed);
         let intt_before = super::stats().intt_commits;
         let pp_before = super::perm::pp_count();
+        let open_before = super::open::open_count();
         let proof = outer.prove(pw.clone())?;
         outer.verify(proof)?;
+        if shortages() != shortages_before {
+            eprintln!("device memory was short during the test: path assertions skipped");
+            return Ok(());
+        }
+        if super::open::enabled() && backend().is_some_and(|b| b.min_lde_rows <= 1 << 10) {
+            // Compared with OpeningSet::new in prove() under cfg(test).
+            assert!(super::open::open_count() > open_before, "openings did not run on the GPU");
+        }
         if super::perm::enabled() {
             // Compared with the CPU in prove() under cfg(test).
             assert!(super::perm::pp_count() > pp_before, "partial products did not run on the GPU");
@@ -1172,6 +1201,10 @@ mod tests {
             let (fri_before, _, _, _) = super::super::fri::fri_stats();
             let proof = outer.prove(pw)?;
             outer.verify(proof)?;
+            if shortages() != shortages_before {
+                eprintln!("device memory was short during the test: path assertions skipped");
+                return Ok(());
+            }
             assert!(Q_UNLOCKED.load(Ordering::Relaxed) > unlocked_before, "the second quotient took the locked path");
             // With PLONKY2_GPU_FRI=1 the final polynomial comes from the kept LDEs, and (in tests)
             // equals the CPU's.

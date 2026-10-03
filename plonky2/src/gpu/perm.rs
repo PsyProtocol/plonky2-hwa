@@ -46,9 +46,15 @@ const PP_MAX_CHUNKS: usize = 32;
 
 static PP_FAILED: AtomicBool = AtomicBool::new(false);
 static PP_GPU: AtomicU64 = AtomicU64::new(0);
+static PP_NO_ROOM: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn pp_count() -> u64 {
     PP_GPU.load(Ordering::Relaxed)
+}
+
+/// Proofs that stayed on the CPU because the sigmas did not fit.
+pub(crate) fn no_room_count() -> u64 {
+    PP_NO_ROOM.load(Ordering::Relaxed)
 }
 
 pub(crate) fn enabled() -> bool {
@@ -80,6 +86,7 @@ fn sigmas_on_device<F: RichField>(digest: u64, sigmas: &[Vec<F>], num_routed: us
     }
     let bytes = sigmas.len() * num_routed * 8;
     if cache.bytes + bytes > sigma_budget() || !device_room(bytes) {
+        PP_NO_ROOM.fetch_add(1, Ordering::Relaxed);
         return Ok(None);
     }
     let host: Vec<u64> = sigmas.iter().flat_map(|row| row[..num_routed].iter().map(|s| s.to_canonical_u64())).collect();
