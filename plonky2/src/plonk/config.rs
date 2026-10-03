@@ -272,6 +272,13 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> anyhow::Result<PolynomialBatch<F, C, D>> {
         //println!("CPU ProverCompute::compute_from_values called");
+        #[cfg(feature = "cuda")]
+        if let Ok((merkle_tree, polynomials)) =
+            crate::gpu::try_commit_values::<F, C::Hasher>(&values, rate_bits, blinding, cap_height)
+        {
+            let degree_log = log2_strict(polynomials[0].len());
+            return Ok(PolynomialBatch { polynomials, merkle_tree, degree_log, rate_bits, blinding });
+        }
         let coeffs = timed!(
             timing,
             "IFFT",

@@ -29,7 +29,7 @@ use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
 use plonky2_field::goldilocks_field::GoldilocksField;
-use plonky2_field::polynomial::PolynomialCoeffs;
+use plonky2_field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use plonky2_maybe_rayon::*;
 
 use crate::hash::hash_types::{HashOut, RichField};
@@ -207,6 +207,17 @@ extern "C" {
     fn plonky2_digest_layout(dst: *mut u64, src: *const u64, per_subtree: u32, lg_leaves: u32, num_subtrees: u32) -> i32;
     fn plonky2_coset_lde(dst: *mut u64, src: *const u64, lg_n: u32, rate_bits: u32, cols: u32, omega: u64, shift: u64, stream: *mut c_void) -> i32;
     fn plonky2_transpose(dst: *mut u64, src: *const u64, rows: u32, cols: u32, stream: *mut c_void) -> i32;
+    fn plonky2_intt(dst: *mut u64, src: *const u64, lg_n: u32, cols: u32, omega_n: u64, stream: *mut c_void) -> i32;
+}
+
+/// `PLONKY2_GPU_INTT=1`: commitments from values (wires, Z and partial products) upload the
+/// values and interpolate them on the device (`plonky2_intt`), instead of an IFFT per column on
+/// the CPU; the coefficients come back with the tree.
+static INTT_COMMITS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn intt_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLONKY2_GPU_INTT").ok().as_deref() == Some("1"))
 }
 
 extern "C" {
@@ -360,7 +371,7 @@ struct State {
 
 /// Growable device buffers reused across commitments (only touched under the GPU lock).
 struct Workspace {
-    bufs: [DevBuf; 6],
+    bufs: [DevBuf; 7],
 }
 
 const WS_IN: usize = 0;
@@ -369,6 +380,8 @@ const WS_LEAVES: usize = 2;
 const WS_DIGESTS: usize = 3;
 const WS_CAP: usize = 4;
 const WS_DIGESTS_PLONKY2: usize = 5;
+/// Values uploaded for an inverse NTT (commitments from values).
+const WS_VALUES: usize = 6;
 
 struct DevBuf {
     ptr: *mut c_void,
@@ -789,6 +802,8 @@ pub struct GpuStats {
     pub fri_cpu: u64,
     pub fri_mismatch: u64,
     pub fri_ns: u64,
+    /// Commitments from values interpolated on the device (PLONKY2_GPU_INTT=1).
+    pub intt_commits: u64,
 }
 
 pub fn stats() -> GpuStats {
@@ -836,6 +851,7 @@ pub fn stats() -> GpuStats {
         fri_cpu: fri::fri_stats().1,
         fri_mismatch: fri::fri_stats().2,
         fri_ns: fri::fri_stats().3,
+        intt_commits: INTT_COMMITS.load(Ordering::Relaxed),
     }
 }
 
@@ -886,7 +902,7 @@ fn backend() -> Option<&'static Backend> {
                         state: Mutex::new(State {
                             input: Pinned::empty(),
                             copy_stream: copy_stream_for_init(),
-                            ws: Workspace { bufs: [DevBuf::empty(), DevBuf::empty(), DevBuf::empty(), DevBuf::empty(), DevBuf::empty(), DevBuf::empty()] },
+                            ws: Workspace { bufs: core::array::from_fn(|_| DevBuf::empty()) },
                             q: quotient::QuotientBufs::new(),
                         }),
                         pool: Pool {
@@ -975,10 +991,61 @@ pub(crate) fn try_commit<F: RichField, H: Hasher<F>>(
     blinding: bool,
     cap_height: usize,
 ) -> Result<MerkleTree<F, H>, &'static str> {
+    let columns: Vec<&[F]> = polynomials.iter().map(|p| p.coeffs.as_slice()).collect();
+    commit_columns::<F, H>(&columns, false, rate_bits, blinding, cap_height).map(|(tree, _)| tree)
+}
+
+/// Commits to polynomials given by their values on the subgroup (`PLONKY2_GPU_INTT=1`): returns
+/// the tree and the coefficients. On `Err` nothing is counted, so the caller can interpolate on the
+/// CPU and commit the coefficients instead.
+pub(crate) fn try_commit_values<F: RichField, H: Hasher<F>>(
+    values: &[PolynomialValues<F>],
+    rate_bits: usize,
+    blinding: bool,
+    cap_height: usize,
+) -> Result<(MerkleTree<F, H>, Vec<PolynomialCoeffs<F>>), &'static str> {
+    if !intt_enabled() {
+        return Err("intt_disabled");
+    }
+    let n = values.first().map_or(0, |v| v.len());
+    if n == 0 || !n.is_power_of_two() || !own_lde(n.trailing_zeros() as usize, rate_bits) {
+        return Err("intt_unsupported_size");
+    }
+    let columns: Vec<&[F]> = values.iter().map(|v| v.values.as_slice()).collect();
+    let seq = COMMIT_SEQ.with(|c| c.get());
+    let result = commit_columns::<F, H>(&columns, true, rate_bits, blinding, cap_height);
+    match result {
+        Ok((tree, Some(coeffs))) => {
+            #[cfg(test)]
+            for (v, c) in values.iter().zip(&coeffs) {
+                assert_eq!(v.clone().ifft().coeffs, c.coeffs, "device interpolation differs from the CPU IFFT");
+            }
+            INTT_COMMITS.fetch_add(1, Ordering::Relaxed);
+            Ok((tree, coeffs))
+        }
+        Ok((_, None)) => unreachable!("values commitments return coefficients"),
+        Err(e) => {
+            // The coefficient commitment that follows counts this commitment again.
+            COMMIT_SEQ.with(|c| c.set(seq));
+            Err(e)
+        }
+    }
+}
+
+/// Commits to `columns`: coefficients, or values on the subgroup when `values_in` (interpolated on
+/// the device; their coefficients are returned too).
+#[allow(clippy::type_complexity)]
+fn commit_columns<F: RichField, H: Hasher<F>>(
+    columns: &[&[F]],
+    values_in: bool,
+    rate_bits: usize,
+    blinding: bool,
+    cap_height: usize,
+) -> Result<(MerkleTree<F, H>, Option<Vec<PolynomialCoeffs<F>>>), &'static str> {
     let total = Instant::now();
-    let cols = polynomials.len();
-    let n = polynomials.first().map_or(0, |p| p.len());
-    if n == 0 || !n.is_power_of_two() || polynomials.iter().any(|p| p.len() != n) {
+    let cols = columns.len();
+    let n = columns.first().map_or(0, |c| c.len());
+    if n == 0 || !n.is_power_of_two() || columns.iter().any(|c| c.len() != n) {
         return Err("irregular_input");
     }
     let lg_n = n.trailing_zeros() as usize;
@@ -1005,7 +1072,7 @@ pub(crate) fn try_commit<F: RichField, H: Hasher<F>>(
     // 1b. Optionally canonicalise into the set's own staging before taking the GPU lock.
     let pre_canon = if canon_outside_lock() {
         let set = out.set.as_mut().expect("claimed");
-        match canonicalize_into(&mut set.input, polynomials) {
+        match canonicalize_into(&mut set.input, columns) {
             Ok(()) => true,
             Err(e) => {
                 drop(out);
@@ -1025,7 +1092,7 @@ pub(crate) fn try_commit<F: RichField, H: Hasher<F>>(
     let mut state = range("gpu:lock_wait", || b.state.lock().unwrap_or_else(|e| e.into_inner()));
     let lock_wait = wait.elapsed().as_secs_f64();
     let mut result = range("gpu:device", || {
-        run(&mut state, out.set.as_mut().expect("claimed"), pre_canon, lease_ptr, polynomials, lg_n, rate_bits, cap_height, capture_role)
+        run(&mut state, out.set.as_mut().expect("claimed"), pre_canon, lease_ptr, columns, values_in, lg_n, rate_bits, cap_height, capture_role)
     });
     // Out of device memory while growing buffers (nothing was launched yet): drop the quotient's
     // caches and try once more.
@@ -1034,7 +1101,7 @@ pub(crate) fn try_commit<F: RichField, H: Hasher<F>>(
         quotient::release_device_caches(&mut state.q);
         OOM_RETRIES.fetch_add(1, Ordering::Relaxed);
         result = range("gpu:device", || {
-            run(&mut state, out.set.as_mut().expect("claimed"), pre_canon, lease_ptr, polynomials, lg_n, rate_bits, cap_height, capture_role)
+            run(&mut state, out.set.as_mut().expect("claimed"), pre_canon, lease_ptr, columns, values_in, lg_n, rate_bits, cap_height, capture_role)
         });
     }
     // 3. Device work is complete (synchronous copies + device sync); the set is ours alone.
@@ -1047,6 +1114,15 @@ pub(crate) fn try_commit<F: RichField, H: Hasher<F>>(
             let leased = lease.is_some();
             let tree = range("gpu:rebuild", || {
                 rebuild_tree::<F, H>(out.set.as_ref().expect("claimed"), lease, cols, lg_n + rate_bits, cap_height, leaves_flat_len, digests_len, cap_len)
+            });
+            // The interpolated coefficients were downloaded into the set's staging.
+            let coeffs = values_in.then(|| {
+                range("gpu:coeffs", || {
+                    out.set.as_ref().expect("claimed").input.as_slice()[..cols * n]
+                        .par_chunks(n)
+                        .map(|c| PolynomialCoeffs::new(c.iter().map(|&x| F::from_canonical_u64(x)).collect()))
+                        .collect::<Vec<_>>()
+                })
             });
             drop(out);
             let rebuild_s = rebuild.elapsed().as_secs_f64();
@@ -1065,7 +1141,7 @@ pub(crate) fn try_commit<F: RichField, H: Hasher<F>>(
             LOCK_WAIT_NS.fetch_add((lock_wait * 1e9) as u64, Ordering::Relaxed);
             EXEC_NS.fetch_add((exec_s * 1e9) as u64, Ordering::Relaxed);
             REBUILD_NS.fetch_add((rebuild_s * 1e9) as u64, Ordering::Relaxed);
-            Ok(tree)
+            Ok((tree, coeffs))
         }
         Err(e) if e.contains("out of memory") && confirm_device_idle_after_error() => {
             // Still no room after dropping the caches: this commitment uses the CPU; the GPU stays
@@ -1109,12 +1185,12 @@ fn confirm_device_idle_after_error() -> bool {
 /// Upload, LDE, transpose, Merkle, download into the pinned buffers. Returns the element counts
 /// written (leaves, digests, cap, in u64) and the execution time.
 /// Canonicalises the coefficients (column after column) into `staging`.
-fn canonicalize_into<F: RichField>(staging: &mut Pinned, polynomials: &[PolynomialCoeffs<F>]) -> GpuResult<()> {
-    let n = polynomials[0].len();
-    let input = staging.ensure(polynomials.len() * n)?;
+fn canonicalize_into<F: RichField>(staging: &mut Pinned, columns: &[&[F]]) -> GpuResult<()> {
+    let n = columns[0].len();
+    let input = staging.ensure(columns.len() * n)?;
     range("gpu:canonicalize", || {
-        input.par_chunks_mut(n).zip(polynomials.par_iter()).for_each(|(dst, p)| {
-            for (d, c) in dst.iter_mut().zip(&p.coeffs) {
+        input.par_chunks_mut(n).zip(columns.par_iter()).for_each(|(dst, p)| {
+            for (d, c) in dst.iter_mut().zip(p.iter()) {
                 let x = plonky2_field::types::PrimeField64::to_noncanonical_u64(c);
                 *d = if x >= P { x - P } else { x };
             }
@@ -1129,14 +1205,15 @@ fn run<F: RichField>(
     out: &mut OutputSet,
     pre_canon: bool,
     lease_ptr: Option<*mut u64>,
-    polynomials: &[PolynomialCoeffs<F>],
+    columns: &[&[F]],
+    values_in: bool,
     lg_n: usize,
     rate_bits: usize,
     cap_height: usize,
     capture_role: Option<u8>,
 ) -> GpuResult<(usize, usize, usize, f64)> {
     let t = Instant::now();
-    let cols = polynomials.len();
+    let cols = columns.len();
     let n = 1usize << lg_n;
     let lg_rows = lg_n + rate_bits;
     let rows = 1usize << lg_rows;
@@ -1156,6 +1233,8 @@ fn run<F: RichField>(
         None => out.leaves.ensure(cols * rows)?,
     };
     let digests = out.digests.ensure((num_digests + caps) * HASH_U64)?;
+    // Interpolated coefficients go to the set's staging (after the values left it).
+    let coeffs_host: Option<*mut u64> = if values_in { Some(out.input.ensure(cols * n)?.as_mut_ptr()) } else { None };
     let overlap = overlap_d2h();
 
     let copy_stream = state.copy_stream;
@@ -1163,7 +1242,7 @@ fn run<F: RichField>(
     let input: &[u64] = if pre_canon {
         &out.input.as_slice()[..cols * n]
     } else {
-        canonicalize_into(&mut state.input, polynomials)?;
+        canonicalize_into(&mut state.input, columns)?;
         &state.input.as_slice()[..cols * n]
     };
 
@@ -1202,10 +1281,26 @@ fn run<F: RichField>(
     let d_leaves = dev(WS_LEAVES, cols * rows)?;
     let d_digests = dev(WS_DIGESTS, num_digests * HASH_U64)?;
     let d_cap = dev(WS_CAP, caps * HASH_U64)?;
-    range("gpu:h2d", || cuda(unsafe { ffi::cudaMemcpy(d_in, input.as_ptr() as *const c_void, cols * n * 8, ffi::H2D) }, "H2D"))?;
+    // Values are uploaded beside the coefficient buffer and interpolated into it.
+    let d_up = if values_in { dev(WS_VALUES, cols * n)? } else { d_in };
+    range("gpu:h2d", || cuda(unsafe { ffi::cudaMemcpy(d_up, input.as_ptr() as *const c_void, cols * n * 8, ffi::H2D) }, "H2D"))?;
+    if values_in {
+        use plonky2_field::types::{Field, PrimeField64};
+        let omega_n = GoldilocksField::primitive_root_of_unity(lg_n).to_canonical_u64();
+        range("gpu:intt", || {
+            cuda(
+                unsafe { plonky2_intt(d_in as *mut u64, d_up as *const u64, lg_n as u32, cols as u32, omega_n, core::ptr::null_mut()) },
+                "intt",
+            )
+        })?;
+    }
 
     let leaf_order = own_lde(lg_n, rate_bits);
     range("gpu:lde", || coset_lde(d_lde, d_in, lg_n, rate_bits, cols))?;
+    if let Some(host) = coeffs_host {
+        // The LDE synchronised the device, so the coefficients are complete.
+        range("gpu:d2h_coeffs", || cuda(unsafe { ffi::cudaMemcpy(host as *mut c_void, d_in, cols * n * 8, ffi::D2H) }, "D2H coefficients"))?;
+    }
     if leaf_order {
         // Already in leaf order: a plain transpose to row-major leaves.
         range("gpu:transpose", || {

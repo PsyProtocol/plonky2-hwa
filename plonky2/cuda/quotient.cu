@@ -1243,6 +1243,138 @@ extern "C" int plonky2_coset_lde(u64* dst, const u64* src, u32 lg_n, u32 rate_bi
     return (int)cudaGetLastError();
 }
 
+// ---- Inverse NTT (values -> coefficients) -----------------------------------------------------
+
+// Natural-order values v_m = p(w_n^m) to natural-order coefficients c_k = n^-1 sum_m v_m w_n^-mk:
+// the coset LDE's DIF stages with inverse twiddles (natural in, bit-reversed out), then a
+// bit-reversed store scaled by n^-1. lg_n > 13 runs the stages in two passes as the LDE does.
+
+static u64 hpow(u64 b, u64 e) {
+    u64 r = 1;
+    while (e) {
+        if (e & 1) r = hmul(r, b);
+        b = hmul(b, b);
+        e >>= 1;
+    }
+    return r;
+}
+
+static std::mutex intt_mu;
+static u64* intt_tw[LDE_MAX_LG_N + 1];  // w_n^-k, k < n / 2
+
+__global__ void intt_kernel(u64*, const u64*, const u64*, u32, u64);
+
+static int intt_tables_get(u32 lg_n, u64 omega_n, u64** out) {
+    std::lock_guard<std::mutex> g(intt_mu);
+    static bool smem_attr = false;
+    if (!smem_attr) {
+        int e = (int)cudaFuncSetAttribute(intt_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 << LDE_SMEM_LG);
+        if (!e) e = (int)cudaFuncSetAttribute(coset_lde_pass2, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 << LDE_SMEM_LG);
+        if (e) return e;
+        smem_attr = true;
+    }
+    if (!intt_tw[lg_n]) {
+        const u32 n = 1u << lg_n;
+        const u64 inv = hpow(omega_n, n - 1);
+        std::vector<u64> tw(n / 2 > 0 ? n / 2 : 1);
+        u64 p = 1;
+        for (u32 k = 0; k < n / 2; k++) {
+            tw[k] = p;
+            p = hmul(p, inv);
+        }
+        u64* d = nullptr;
+        int e = (int)cudaMalloc(&d, tw.size() * 8);
+        if (!e) e = (int)cudaMemcpy(d, tw.data(), tw.size() * 8, cudaMemcpyHostToDevice);
+        if (e) {
+            cudaFree(d);
+            return e;
+        }
+        intt_tw[lg_n] = d;
+    }
+    *out = intt_tw[lg_n];
+    return 0;
+}
+
+// lg_n <= 13: one block per column.
+__global__ void __launch_bounds__(LDE_THREADS) intt_kernel(u64* dst, const u64* src, const u64* tw, u32 lg_n, u64 n_inv) {
+    extern __shared__ u64 x[];
+    const u32 n = 1u << lg_n;
+    const u64* s = src + ((size_t)blockIdx.x << lg_n);
+    for (u32 k = threadIdx.x; k < n; k += blockDim.x) x[k] = gcanon(s[k]);
+    __syncthreads();
+    dif_stages(x, lg_n, lg_n, tw);
+    u64* d = dst + ((size_t)blockIdx.x << lg_n);
+    for (u32 k = threadIdx.x; k < n; k += blockDim.x) d[k] = gmul(x[__brev(k) >> (32 - lg_n)], n_inv);
+}
+
+// lg_n > 13, pass 1: the first lg_n - 13 stages in registers, src -> dst.
+template <u32 L1>
+__global__ void __launch_bounds__(256) intt_pass1(u64* dst, const u64* src, const u64* tw) {
+    constexpr u32 SUB = 1u << LDE_SMEM_LG, K = 1u << L1, LG_N = LDE_SMEM_LG + L1;
+    const u32 o = blockIdx.x * blockDim.x + threadIdx.x, col = blockIdx.y;
+    const u64* c = src + ((size_t)col << LG_N);
+    u64 v[K];
+#pragma unroll
+    for (u32 k = 0; k < K; k++) v[k] = gcanon(c[o + k * SUB]);
+#pragma unroll
+    for (int st = L1 - 1; st >= 0; st--) {
+        const u32 shift = LG_N - 1 - (LDE_SMEM_LG + st);
+#pragma unroll
+        for (u32 k = 0; k < K; k++) {
+            if (k & (1u << st)) continue;
+            const u32 lo = o + (k & ((1u << st) - 1)) * SUB;
+            const u64 u = v[k], w = v[k + (1u << st)];
+            v[k] = gadd(u, w);
+            v[k + (1u << st)] = gmul(gsub(u, w), tw[lo << shift]);
+        }
+    }
+    u64* out = dst + ((size_t)col << LG_N);
+#pragma unroll
+    for (u32 k = 0; k < K; k++) out[o + k * SUB] = v[k];
+}
+
+// lg_n > 13, last step: in-place bit-reversal permutation (an involution: swap k with bitrev(k)
+// once) scaled by n^-1.
+__global__ void bitrev_scale_kernel(u64* d, u32 lg_n, size_t total, u64 n_inv) {
+    const size_t g = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= total) return;
+    const u32 k = (u32)(g & ((1u << lg_n) - 1));
+    const u32 r = __brev(k) >> (32 - lg_n);
+    if (k > r) return;
+    u64* col = d + (g - k);
+    const u64 a = col[k], b = col[r];
+    col[k] = gmul(b, n_inv);
+    if (k != r) col[r] = gmul(a, n_inv);
+}
+
+// Inverse NTT of `cols` columns of 2^lg_n canonical values (column-major) into `dst`; `omega_n`
+// is the primitive n-th root of unity. `dst` must not overlap `src`.
+extern "C" int plonky2_intt(u64* dst, const u64* src, u32 lg_n, u32 cols, u64 omega_n, cudaStream_t stream) {
+    if (lg_n < 1 || lg_n > LDE_MAX_LG_N || cols == 0 || cols > 65535) return -1;
+    u64* tw;
+    int e = intt_tables_get(lg_n, omega_n, &tw);
+    if (e) return e;
+    const u64 n_inv = hpow(1ull << lg_n, GL_P - 2);
+    if (lg_n <= LDE_SMEM_LG) {
+        intt_kernel<<<cols, LDE_THREADS, (size_t)8 << lg_n, stream>>>(dst, src, tw, lg_n, n_inv);
+        return (int)cudaGetLastError();
+    }
+    const dim3 g1((1u << LDE_SMEM_LG) / 256, cols);
+    switch (lg_n - LDE_SMEM_LG) {
+        case 1: intt_pass1<1><<<g1, 256, 0, stream>>>(dst, src, tw); break;
+        case 2: intt_pass1<2><<<g1, 256, 0, stream>>>(dst, src, tw); break;
+        case 3: intt_pass1<3><<<g1, 256, 0, stream>>>(dst, src, tw); break;
+        case 4: intt_pass1<4><<<g1, 256, 0, stream>>>(dst, src, tw); break;
+        case 5: intt_pass1<5><<<g1, 256, 0, stream>>>(dst, src, tw); break;
+        default: return -1;
+    }
+    const size_t blocks = ((size_t)cols << lg_n) >> LDE_SMEM_LG;
+    coset_lde_pass2<<<dim3((u32)blocks), LDE_THREADS, (size_t)8 << LDE_SMEM_LG, stream>>>(dst, tw, lg_n);
+    const size_t total = (size_t)cols << lg_n;
+    bitrev_scale_kernel<<<(unsigned)((total + 255) / 256), 256, 0, stream>>>(dst, lg_n, total, n_inv);
+    return (int)cudaGetLastError();
+}
+
 // Column-major [cols][rows] -> row-major [rows][cols], 32 x 32 tiles.
 __global__ void transpose_kernel(u64* dst, const u64* src, u32 rows, u32 cols) {
     __shared__ u64 tile[32][33];

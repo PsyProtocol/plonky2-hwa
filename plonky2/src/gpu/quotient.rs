@@ -1151,8 +1151,13 @@ mod tests {
 
         let before = Q_GPU.load(Ordering::Relaxed);
         let reused_before = Q_RESIDENT_USED.load(Ordering::Relaxed);
+        let intt_before = super::stats().intt_commits;
         let proof = outer.prove(pw.clone())?;
         outer.verify(proof)?;
+        if super::intt_enabled() && backend().is_some_and(|b| b.min_lde_rows <= 1 << 10) {
+            // Wires and Z come from values: both interpolated on the device.
+            assert!(super::stats().intt_commits >= intt_before + 2, "values commitments did not use the device interpolation");
+        }
         assert!(Q_GPU.load(Ordering::Relaxed) > before, "the outer proof's quotient did not run on the GPU");
         // With every commitment on the GPU, the quotient reads the commitments' kept LDEs; the
         // second proof also finds the constants cached and runs outside the GPU lock.
