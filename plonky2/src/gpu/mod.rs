@@ -1124,10 +1124,14 @@ fn commit_columns<F: RichField, H: Hasher<F>>(
     }
     let b: &'static Backend = backend().expect("checked by cpu_reason");
 
-    // 0. Lease leaf storage (non-blocking; None -> leaves are copied out of the output set).
-    // Leaves that will stay on the device need no host storage.
-    let device_leaves_likely = capture_role.is_some() && device_leaves_enabled() && own_lde(lg_n, rate_bits) && !zeknox_merkle();
-    let mut lease = if in_proof() && !device_leaves_likely {
+    // 0. The commitments of a proof whose quotient (and FRI) run on the GPU extend straight into a
+    // kept buffer, which those read instead of recomputing the LDE.
+    let lde_bytes = cols * (n << rate_bits) * 8;
+    let mut kept = KeptGuard(if capture_role.is_some() { RESIDENT_POOL.take(lde_bytes).map(|p| (p as usize, lde_bytes)) } else { None });
+    // Lease leaf storage (non-blocking; None -> leaves are copied out of the output set). Leaves
+    // that stay on the device in the kept buffer need no host storage.
+    let device_leaves = kept.0.is_some() && device_leaves_enabled() && own_lde(lg_n, rate_bits) && !zeknox_merkle();
+    let mut lease = if in_proof() && !device_leaves {
         b.leaf_pool.as_ref().and_then(|p| p.try_lease(cols * (n << rate_bits) * 8))
     } else {
         None
@@ -1162,7 +1166,7 @@ fn commit_columns<F: RichField, H: Hasher<F>>(
     let mut state = range("gpu:lock_wait", || b.state.lock().unwrap_or_else(|e| e.into_inner()));
     let lock_wait = wait.elapsed().as_secs_f64();
     let mut result = range("gpu:device", || {
-        run(&mut state, out.set.as_mut().expect("claimed"), pre_canon, lease_ptr, columns, values_in, lg_n, rate_bits, cap_height, capture_role)
+        run(&mut state, out.set.as_mut().expect("claimed"), &mut kept, pre_canon, lease_ptr, columns, values_in, lg_n, rate_bits, cap_height, capture_role)
     });
     // Out of device memory while growing buffers (nothing was launched yet): drop the quotient's
     // caches and try once more.
@@ -1171,7 +1175,7 @@ fn commit_columns<F: RichField, H: Hasher<F>>(
         quotient::release_device_caches(&mut state.q);
         OOM_RETRIES.fetch_add(1, Ordering::Relaxed);
         result = range("gpu:device", || {
-            run(&mut state, out.set.as_mut().expect("claimed"), pre_canon, lease_ptr, columns, values_in, lg_n, rate_bits, cap_height, capture_role)
+            run(&mut state, out.set.as_mut().expect("claimed"), &mut kept, pre_canon, lease_ptr, columns, values_in, lg_n, rate_bits, cap_height, capture_role)
         });
     }
     // 3. Device work is complete (synchronous copies + device sync); the set is ours alone.
@@ -1284,6 +1288,7 @@ fn canonicalize_into<F: RichField>(staging: &mut Pinned, columns: &[&[F]], raw: 
 fn run<F: RichField>(
     state: &mut State,
     out: &mut OutputSet,
+    kept_guard: &mut KeptGuard,
     pre_canon: bool,
     lease_ptr: Option<*mut u64>,
     columns: &[&[F]],
@@ -1306,19 +1311,7 @@ fn run<F: RichField>(
         return Err("injected run_error".into());
     }
 
-    // The commitments of a proof whose quotient (and FRI) run on the GPU extend straight into a
-    // kept buffer, which those read instead of recomputing the LDE.
-    let kept = if capture_role.is_some() { RESIDENT_POOL.take(cols * rows * 8) } else { None };
-    // Returns the kept buffer to the pool if this run fails before it is recorded.
-    struct KeptGuard(Option<(usize, usize)>);
-    impl Drop for KeptGuard {
-        fn drop(&mut self) {
-            if let Some((p, b)) = self.0.take() {
-                RESIDENT_POOL.give(p, b);
-            }
-        }
-    }
-    let mut kept_guard = KeptGuard(kept.map(|p| (p as usize, cols * rows * 8)));
+    let kept = kept_guard.0.map(|(p, _)| p as *mut c_void);
     let leaf_order = own_lde(lg_n, rate_bits);
     let own_merkle = !zeknox_merkle();
     // The tree's leaves stay in the kept LDE (`PLONKY2_GPU_DEVICE_LEAVES=1`).
@@ -1509,6 +1502,17 @@ fn run<F: RichField>(
         RESIDENT.with(|r| r.borrow_mut().push(Resident { ptr: p, bytes, cols, lg_rows: lg_n, leaf_order: false, role: ROLE_WIRE_VALUES }));
     }
     Ok((if view.is_some() { 0 } else { cols * rows }, num_digests * HASH_U64, caps * HASH_U64, t.elapsed().as_secs_f64(), view))
+}
+
+/// Returns a kept buffer to the pool if its run fails before it is recorded.
+struct KeptGuard(Option<(usize, usize)>);
+
+impl Drop for KeptGuard {
+    fn drop(&mut self) {
+        if let Some((p, b)) = self.0.take() {
+            RESIDENT_POOL.give(p, b);
+        }
+    }
 }
 
 /// NVTX range for the rest of the enclosing scope.
