@@ -796,8 +796,13 @@ fn upload_lde<F: RichField>(
     let host = input.ensure(cols * n)?;
     range("gpu:quotient_pack", || {
         host.par_chunks_mut(n).zip(polys.par_iter()).for_each(|(dst, p)| {
-            for (d, c) in dst.iter_mut().zip(&p.coeffs) {
-                *d = c.to_canonical_u64();
+            if super::own_lde(lg_n, rate_bits) && TypeId::of::<F>() == TypeId::of::<GoldilocksField>() {
+                // The own LDE canonicalises on load. SAFETY: F == GoldilocksField (repr(transparent) u64).
+                dst.copy_from_slice(unsafe { core::slice::from_raw_parts(p.coeffs.as_ptr() as *const u64, p.coeffs.len()) });
+            } else {
+                for (d, c) in dst.iter_mut().zip(&p.coeffs) {
+                    *d = c.to_canonical_u64();
+                }
             }
         })
     });
@@ -1028,8 +1033,18 @@ fn device_run<F: RichField>(
     }
     let out = out.to_vec();
     lap("q_d2h");
+    // Large LDEs (secp) leave scratch of a gigabyte or more: free it rather than hold it between
+    // quotients, where it would starve the kept LDEs and caches of room.
+    for b in [&mut q.d_in, &mut q.d_cs, &mut q.d_wires, &mut q.d_zs, &mut q.d_out, &mut q.d_coef] {
+        if b.cap_u64 * 8 > QUOTIENT_SCRATCH_KEEP {
+            b.release();
+        }
+    }
     Ok(out)
 }
+
+/// Quotient scratch buffers above this size are freed after use.
+const QUOTIENT_SCRATCH_KEEP: usize = 256 << 20;
 
 /// `PLONKY2_GPU_QIFFT=1`: the quotient's coefficients come from a coset inverse NTT on the device
 /// (downloaded with the values) and go straight to the quotient commitment, instead of a

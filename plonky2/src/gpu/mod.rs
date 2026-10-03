@@ -605,6 +605,16 @@ fn device_reserve() -> usize {
 }
 
 /// Whether `bytes` more device memory can be allocated while keeping the reserve free.
+/// The device's free memory (0 if unknown).
+fn device_free() -> usize {
+    let (mut free, mut total) = (0usize, 0usize);
+    if unsafe { ffi::cudaMemGetInfo(&mut free, &mut total) } == 0 {
+        free
+    } else {
+        0
+    }
+}
+
 pub(crate) fn device_room(bytes: usize) -> bool {
     let (mut free, mut total) = (0usize, 0usize);
     unsafe { ffi::cudaMemGetInfo(&mut free, &mut total) == 0 && free >= bytes + device_reserve() }
@@ -617,12 +627,23 @@ impl DevPool {
             self.taken.fetch_add(1, Ordering::Relaxed);
             return Some(free.swap_remove(i).1 as *mut c_void);
         }
-        // Free idle buffers of other sizes while over the budget, or while the device lacks room
-        // (idle buffers count against the device's free memory too).
-        while self.held.load(Ordering::Relaxed) + bytes as u64 > resident_budget() || !device_room(bytes) {
+        // Free idle buffers of other sizes while over the budget.
+        while self.held.load(Ordering::Relaxed) + bytes as u64 > resident_budget() {
             let Some((b, ptr)) = free.pop() else { break };
             unsafe { ffi::cudaFree(ptr as *mut c_void) };
             self.held.fetch_sub(b as u64, Ordering::Relaxed);
+        }
+        // Idle buffers count against the device's free memory too: free them for room, but only
+        // when that can make enough (otherwise keep them for reuse).
+        if !device_room(bytes) {
+            let idle: usize = free.iter().map(|&(b, _)| b).sum();
+            if device_free() + idle >= bytes + device_reserve() {
+                while !device_room(bytes) {
+                    let Some((b, ptr)) = free.pop() else { break };
+                    unsafe { ffi::cudaFree(ptr as *mut c_void) };
+                    self.held.fetch_sub(b as u64, Ordering::Relaxed);
+                }
+            }
         }
         if self.held.load(Ordering::Relaxed) + bytes as u64 > resident_budget() || !device_room(bytes) {
             self.refused.fetch_add(1, Ordering::Relaxed);
@@ -1085,7 +1106,7 @@ fn commit_columns<F: RichField, H: Hasher<F>>(
     // 1b. Optionally canonicalise into the set's own staging before taking the GPU lock.
     let pre_canon = if canon_outside_lock() {
         let set = out.set.as_mut().expect("claimed");
-        match canonicalize_into(&mut set.input, columns) {
+        match canonicalize_into(&mut set.input, columns, own_lde(lg_n, rate_bits)) {
             Ok(()) => true,
             Err(e) => {
                 drop(out);
@@ -1198,9 +1219,20 @@ fn confirm_device_idle_after_error() -> bool {
 /// Upload, LDE, transpose, Merkle, download into the pinned buffers. Returns the element counts
 /// written (leaves, digests, cap, in u64) and the execution time.
 /// Canonicalises the coefficients (column after column) into `staging`.
-fn canonicalize_into<F: RichField>(staging: &mut Pinned, columns: &[&[F]]) -> GpuResult<()> {
+/// With `raw` (the own-LDE path, whose kernels canonicalise on load) the elements are copied as
+/// they are.
+fn canonicalize_into<F: RichField>(staging: &mut Pinned, columns: &[&[F]], raw: bool) -> GpuResult<()> {
     let n = columns[0].len();
     let input = staging.ensure(columns.len() * n)?;
+    if raw && TypeId::of::<F>() == TypeId::of::<GoldilocksField>() {
+        range("gpu:stage_raw", || {
+            input.par_chunks_mut(n).zip(columns.par_iter()).for_each(|(dst, p)| {
+                // SAFETY: F == GoldilocksField, repr(transparent) over u64.
+                dst.copy_from_slice(unsafe { core::slice::from_raw_parts(p.as_ptr() as *const u64, p.len()) });
+            })
+        });
+        return Ok(());
+    }
     range("gpu:canonicalize", || {
         input.par_chunks_mut(n).zip(columns.par_iter()).for_each(|(dst, p)| {
             for (d, c) in dst.iter_mut().zip(p.iter()) {
@@ -1255,7 +1287,7 @@ fn run<F: RichField>(
     let input: &[u64] = if pre_canon {
         &out.input.as_slice()[..cols * n]
     } else {
-        canonicalize_into(&mut state.input, columns)?;
+        canonicalize_into(&mut state.input, columns, own_lde(lg_n, rate_bits))?;
         &state.input.as_slice()[..cols * n]
     };
 

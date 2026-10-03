@@ -51,6 +51,7 @@ static PP_NO_ROOM: AtomicU64 = AtomicU64::new(0);
 static PP_KEPT_VALUES: AtomicU64 = AtomicU64::new(0);
 
 /// Partial products that read the wires commitment's kept values instead of uploading them.
+#[cfg(test)]
 pub(crate) fn kept_values_count() -> u64 {
     PP_KEPT_VALUES.load(Ordering::Relaxed)
 }
@@ -245,10 +246,10 @@ impl PpCtx {
         let wire_len = if wires_dev.is_some() { 0 } else { num_routed * n };
         let host = self.staging.ensure(wire_len + num_routed)?;
         if wires_dev.is_none() {
+            // The kernel canonicalises on load. SAFETY: F == GoldilocksField (checked by the
+            // caller), repr(transparent) over u64.
             host[..wire_len].par_chunks_mut(n).zip(witness.wire_values[..num_routed].par_iter()).for_each(|(dst, w)| {
-                for (d, v) in dst.iter_mut().zip(w) {
-                    *d = v.to_canonical_u64();
-                }
+                dst.copy_from_slice(unsafe { core::slice::from_raw_parts(w.as_ptr() as *const u64, w.len()) });
             });
         }
         for (d, k) in host[wire_len..].iter_mut().zip(k_is) {
