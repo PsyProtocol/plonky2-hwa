@@ -56,6 +56,7 @@ pub(crate) enum FriValues<F: RichField + Extendable<D>, H: Hasher<F>, const D: u
     /// Index bits reversed (the first commit-phase layer's order), with that layer's Merkle tree
     /// when it is already built (the values may then be empty: the commit phase does not read
     /// them).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     LeafOrder(Vec<F::Extension>, Option<MerkleTree<F, H>>),
 }
 

@@ -1038,21 +1038,31 @@ pub(crate) fn try_commit_values<F: RichField, H: Hasher<F>>(
     blinding: bool,
     cap_height: usize,
 ) -> Result<(MerkleTree<F, H>, Vec<PolynomialCoeffs<F>>), &'static str> {
+    let columns: Vec<&[F]> = values.iter().map(|v| v.values.as_slice()).collect();
+    try_commit_value_columns::<F, H>(&columns, rate_bits, blinding, cap_height)
+}
+
+/// `try_commit_values` on borrowed columns (the prover's witness, without copying it).
+pub(crate) fn try_commit_value_columns<F: RichField, H: Hasher<F>>(
+    columns: &[&[F]],
+    rate_bits: usize,
+    blinding: bool,
+    cap_height: usize,
+) -> Result<(MerkleTree<F, H>, Vec<PolynomialCoeffs<F>>), &'static str> {
     if !intt_enabled() {
         return Err("intt_disabled");
     }
-    let n = values.first().map_or(0, |v| v.len());
+    let n = columns.first().map_or(0, |v| v.len());
     if n == 0 || !n.is_power_of_two() || !own_lde(n.trailing_zeros() as usize, rate_bits) {
         return Err("intt_unsupported_size");
     }
-    let columns: Vec<&[F]> = values.iter().map(|v| v.values.as_slice()).collect();
     let seq = COMMIT_SEQ.with(|c| c.get());
-    let result = commit_columns::<F, H>(&columns, true, rate_bits, blinding, cap_height);
+    let result = commit_columns::<F, H>(columns, true, rate_bits, blinding, cap_height);
     match result {
         Ok((tree, Some(coeffs))) => {
             #[cfg(test)]
-            for (v, c) in values.iter().zip(&coeffs) {
-                assert_eq!(v.clone().ifft().coeffs, c.coeffs, "device interpolation differs from the CPU IFFT");
+            for (v, c) in columns.iter().zip(&coeffs) {
+                assert_eq!(PolynomialValues::new(v.to_vec()).ifft().coeffs, c.coeffs, "device interpolation differs from the CPU IFFT");
             }
             INTT_COMMITS.fetch_add(1, Ordering::Relaxed);
             Ok((tree, coeffs))

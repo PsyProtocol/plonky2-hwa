@@ -176,28 +176,53 @@ where
         partition_witness.full_witness()
     );
 
-    let wires_values: Vec<PolynomialValues<F>> = timed!(
-        timing,
-        "compute wire polynomials",
-        witness
-            .wire_values
-            .par_iter()
-            .map(|column| PolynomialValues::new(column.clone()))
-            .collect()
-    );
-
-    let wires_commitment = timed!(
-        timing,
-        "compute wires commitment",
-        crate::util::stage_log::range("commit:wires", || PolynomialBatch::<F, C, D>::from_values(
-            wires_values,
+    // Interpolated on the device, the wires are read straight from the witness; the CPU path
+    // takes owned copies.
+    #[cfg(feature = "cuda")]
+    let gpu_wires = crate::util::stage_log::range("commit:wires", || {
+        let columns: Vec<&[F]> = witness.wire_values.iter().map(|c| c.as_slice()).collect();
+        crate::gpu::try_commit_value_columns::<F, C::Hasher>(
+            &columns,
             config.fri_config.rate_bits,
             config.zero_knowledge && PlonkOracle::WIRES.blinding,
             config.fri_config.cap_height,
-            timing,
-            prover_data.fft_root_table.as_ref(),
-        ))?
-    );
+        )
+        .ok()
+    });
+    #[cfg(not(feature = "cuda"))]
+    let gpu_wires: Option<(crate::hash::merkle_tree::MerkleTree<F, C::Hasher>, Vec<crate::field::polynomial::PolynomialCoeffs<F>>)> = None;
+    let wires_commitment = match gpu_wires {
+        Some((merkle_tree, polynomials)) => PolynomialBatch {
+            degree_log: crate::util::log2_strict(polynomials[0].len()),
+            polynomials,
+            merkle_tree,
+            rate_bits: config.fri_config.rate_bits,
+            blinding: config.zero_knowledge && PlonkOracle::WIRES.blinding,
+        },
+        None => {
+            let wires_values: Vec<PolynomialValues<F>> = timed!(
+                timing,
+                "compute wire polynomials",
+                witness
+                    .wire_values
+                    .par_iter()
+                    .map(|column| PolynomialValues::new(column.clone()))
+                    .collect()
+            );
+            timed!(
+                timing,
+                "compute wires commitment",
+                crate::util::stage_log::range("commit:wires", || PolynomialBatch::<F, C, D>::from_values(
+                    wires_values,
+                    config.fri_config.rate_bits,
+                    config.zero_knowledge && PlonkOracle::WIRES.blinding,
+                    config.fri_config.cap_height,
+                    timing,
+                    prover_data.fft_root_table.as_ref(),
+                ))?
+            )
+        }
+    };
 
     if let Some(l) = stage_log.as_mut() {
         l.mark("wires_commitment");
