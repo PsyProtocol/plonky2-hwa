@@ -10,7 +10,7 @@ use crate::field::fft::FftRootTable;
 use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::proof::FriProof;
-use crate::fri::prover::fri_proof;
+use crate::fri::prover::{fri_proof_with, FriValues};
 use crate::fri::structure::{FriBatchInfo, FriInstanceInfo};
 use crate::fri::FriParams;
 use crate::hash::hash_types::RichField;
@@ -151,37 +151,50 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let alpha_value = challenger.get_extension_challenge::<D>();
         let mut alpha = ReducingFactor::new(alpha_value);
 
+        // On the GPU: the final polynomial from the proof's device LDEs, its values in the first
+        // commit-phase layer's order, and that layer's tree.
+        #[cfg(feature = "cuda")]
+        let first_arity_bits = fri_params.reduction_arity_bits.first().copied();
         #[cfg(feature = "cuda")]
         let gpu = crate::util::stage_log::acc("fri_gpu_final", || {
-            crate::gpu::fri::final_poly::<F, C, D>(instance, oracles, alpha_value, fri_params.config.rate_bits)
+            crate::gpu::fri::final_poly::<F, C, D>(
+                instance,
+                oracles,
+                alpha_value,
+                fri_params.config.rate_bits,
+                first_arity_bits,
+                fri_params.config.cap_height,
+            )
         });
-        #[cfg(not(feature = "cuda"))]
-        let gpu: Option<(PolynomialCoeffs<F::Extension>, PolynomialValues<F::Extension>)> = None;
         #[cfg(feature = "cuda")]
-        let check = gpu.is_some() && crate::gpu::fri::check_enabled();
-        #[cfg(not(feature = "cuda"))]
-        let check = false;
         let (lde_final_poly, lde_final_values) = match gpu {
-            Some(g) if !check => g,
+            Some(g) if !crate::gpu::fri::check_enabled() => (g.coeffs, FriValues::LeafOrder(g.leaf_values, g.first_tree)),
             gpu => {
-                #[cfg(not(feature = "cuda"))]
-                let _ = gpu;
-                #[cfg(feature = "cuda")]
                 if gpu.is_none() {
                     crate::gpu::fri::record_cpu();
                 }
-                let cpu = Self::final_poly_cpu(instance, oracles, &mut alpha, fri_params, timing);
-                #[cfg(feature = "cuda")]
+                let (coeffs, values) = Self::final_poly_cpu(instance, oracles, &mut alpha, fri_params, timing);
                 if let Some(g) = gpu {
-                    if g.0.coeffs != cpu.0.coeffs || g.1.values != cpu.1.values {
+                    let mut leaf = values.values.clone();
+                    crate::util::reverse_index_bits_in_place(&mut leaf);
+                    let tree_ok = match (&g.first_tree, first_arity_bits) {
+                        (Some(t), Some(a)) => crate::gpu::fri::tree_matches(t, &g.leaf_values, a, fri_params.config.cap_height),
+                        _ => true,
+                    };
+                    if g.coeffs.coeffs != coeffs.coeffs || g.leaf_values != leaf || !tree_ok {
                         crate::gpu::fri::record_mismatch();
                     }
                 }
-                cpu
+                (coeffs, FriValues::Natural(values))
             }
         };
+        #[cfg(not(feature = "cuda"))]
+        let (lde_final_poly, lde_final_values) = {
+            let (coeffs, values) = Self::final_poly_cpu(instance, oracles, &mut alpha, fri_params, timing);
+            (coeffs, FriValues::Natural(values))
+        };
 
-        let fri_proof = fri_proof::<F, C, D>(
+        let fri_proof = fri_proof_with::<F, C, D>(
             &oracles
                 .par_iter()
                 .map(|c| &c.merkle_tree)

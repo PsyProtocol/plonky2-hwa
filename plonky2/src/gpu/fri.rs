@@ -7,7 +7,9 @@
 //! constants from the cache), `fri_values_kernel` evaluates the same polynomial at every LDE point:
 //!   V(x) = sum_b alpha^(L_b) (C_b(x) - C_b(z_b)) / (x - z_b),
 //! with C_b(z_b) from the opening values. Field arithmetic is exact, so the values equal the FFT's.
-//! The coefficients (degree < n) come from an inverse FFT of the first coset on the host.
+//! The coefficients (degree < n) come from an inverse FFT of the first coset on the host. The
+//! values come out in leaf order, which is the first commit-phase layer's order: that layer's
+//! Merkle tree (`plonky2_merkle`, leaves of `arity` values) is built on the device as well.
 
 use core::cell::RefCell;
 
@@ -20,6 +22,14 @@ use super::*;
 use crate::fri::oracle::PolynomialBatch;
 use crate::fri::structure::{FriInstanceInfo, FriOpenings};
 use crate::plonk::config::GenericConfig;
+
+/// The FRI final polynomial from the GPU: LDE coefficients, values in leaf order (index bits
+/// reversed), and the first commit-phase layer's tree when it was built.
+pub(crate) struct GpuFinal<F: RichField + Extendable<D>, H: Hasher<F>, const D: usize> {
+    pub coeffs: PolynomialCoeffs<F::Extension>,
+    pub leaf_values: Vec<F::Extension>,
+    pub first_tree: Option<MerkleTree<F, H>>,
+}
 
 #[repr(C)]
 struct FriArgs {
@@ -113,15 +123,17 @@ fn eadd(x: [u64; 2], y: [u64; 2]) -> [u64; 2] {
     [(f(x[0]) + f(y[0])).to_canonical_u64(), (f(x[1]) + f(y[1])).to_canonical_u64()]
 }
 
-/// The FRI final polynomial's LDE coefficients and values (natural order), as `prove_openings`
-/// computes them, or `None` when the GPU does not compute it (nothing is consumed then).
-#[allow(clippy::type_complexity)]
+/// The FRI final polynomial as `prove_openings` computes it, or `None` when the GPU does not
+/// compute it. `first_arity_bits` and `cap_height` describe the first commit-phase layer, whose
+/// tree is built too when its leaves are hashed (more than 4 elements).
 pub(crate) fn final_poly<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     instance: &FriInstanceInfo<F, D>,
     oracles: &[&PolynomialBatch<F, C, D>],
     alpha: F::Extension,
     rate_bits: usize,
-) -> Option<(PolynomialCoeffs<F::Extension>, PolynomialValues<F::Extension>)> {
+    first_arity_bits: Option<usize>,
+    cap_height: usize,
+) -> Option<GpuFinal<F, C::Hasher, D>> {
     let ctx = CONTEXT.with(|c| c.borrow_mut().take());
     if !enabled() || FRI_FAILED.load(Ordering::Relaxed) || FAILED.load(Ordering::Relaxed) {
         return None;
@@ -216,15 +228,21 @@ pub(crate) fn final_poly<F: RichField + Extendable<D>, C: GenericConfig<D, F = F
         args.start[b] = terms.len() as u32;
     }
 
+    // The first layer's tree: rows of `arity` values (2 arity elements), hashed when longer than 4.
+    let poseidon = TypeId::of::<C::Hasher>() == TypeId::of::<PoseidonHash>();
+    let tree_shape = first_arity_bits
+        .filter(|&a| poseidon && 2usize << a > 4 && a <= lg_lde && cap_height <= lg_lde - a)
+        .map(|a| (lg_lde - a, 2usize << a, cap_height));
+
     let t = Instant::now();
     let result = range("gpu:fri", || {
         super::quotient::with_constants(digest, &oracles[0].polynomials, lg_n, rate_bits, |cs| {
             base[0] = cs as usize;
             let cols: Vec<u64> = terms.iter().map(|&(o, c)| (base[o] + c * big_n * 8) as u64).collect();
-            run(&mut args, &cols, &coef, big_n)
+            run(&mut args, &cols, &coef, big_n, tree_shape)
         })
     });
-    let out = match result {
+    let (out, digests) = match result {
         Ok(v) => v,
         Err(e) if e.contains("out of memory") => {
             unsafe { ffi::cudaGetLastError() };
@@ -240,15 +258,51 @@ pub(crate) fn final_poly<F: RichField + Extendable<D>, C: GenericConfig<D, F = F
     let ext = |k: usize| {
         F::Extension::from_basefield_array(core::array::from_fn(|d| F::from_canonical_u64(out[2 * k + d])))
     };
-    // Leaf order -> natural order.
-    let mut values: Vec<F::Extension> = (0..big_n).map(ext).collect();
-    reverse_index_bits_in_place(&mut values);
-    // The first coset, x = shift w_n^m, holds the polynomial's degree < n: its coefficients.
-    let coset0: Vec<F::Extension> = (0..n).map(|m| values[m << rate_bits]).collect();
+    let leaf_values: Vec<F::Extension> = (0..big_n).into_par_iter().map(ext).collect();
+    // Leaf positions 0..n are the first coset, x = shift w_n^m at position bitrev(m): it
+    // determines the polynomial (degree < n), so its inverse FFT gives the coefficients.
+    let mut coset0 = leaf_values[..n].to_vec();
+    reverse_index_bits_in_place(&mut coset0);
     let coeffs = PolynomialValues::new(coset0).coset_ifft(F::coset_shift().into());
+    let first_tree = tree_shape.map(|(lg_rows, row_len, cap_height)| {
+        let rows = 1usize << lg_rows;
+        let digests_len = 2 * (rows - (1 << cap_height)) * HASH_U64;
+        let (digests, cap) = rebuild_digests(&digests, digests_len, lg_rows, cap_height);
+        // SAFETY: F == GoldilocksField (checked above) is repr(transparent) over u64, and H ==
+        // PoseidonHash is required by the caller, so H::Hash == HashOut<GoldilocksField>.
+        unsafe {
+            let leaves: Vec<GoldilocksField> = cast_vec_u64(out);
+            MerkleTree {
+                leaves: crate::hash::leaf_matrix::LeafMatrix::from_flat(cast_vec::<GoldilocksField, F>(leaves), row_len),
+                digests: cast_vec::<HashOut<GoldilocksField>, <C::Hasher as Hasher<F>>::Hash>(digests),
+                cap: MerkleCap(cast_vec::<HashOut<GoldilocksField>, <C::Hasher as Hasher<F>>::Hash>(cap)),
+            }
+        }
+    });
     FRI_GPU.fetch_add(1, Ordering::Relaxed);
     FRI_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    Some((coeffs.lde(rate_bits), PolynomialValues::new(values)))
+    Some(GpuFinal { coeffs: coeffs.lde(rate_bits), leaf_values, first_tree })
+}
+
+/// Reinterprets canonical u64 values as field elements without copying.
+///
+/// # Safety
+/// Every value must be canonical.
+unsafe fn cast_vec_u64(v: Vec<u64>) -> Vec<GoldilocksField> {
+    let mut v = core::mem::ManuallyDrop::new(v);
+    Vec::from_raw_parts(v.as_mut_ptr() as *mut GoldilocksField, v.len(), v.capacity())
+}
+
+/// Check mode: the GPU's first-layer tree against one built on the CPU from the same values.
+pub(crate) fn tree_matches<F: RichField + Extendable<D>, H: Hasher<F>, const D: usize>(
+    tree: &MerkleTree<F, H>,
+    leaf_values: &[F::Extension],
+    arity_bits: usize,
+    cap_height: usize,
+) -> bool {
+    let chunked: Vec<Vec<F>> = leaf_values.chunks(1 << arity_bits).map(|c| plonky2_field::extension::flatten(c)).collect();
+    let cpu = MerkleTree::<F, H>::new(chunked, cap_height);
+    cpu.cap == tree.cap && cpu.digests == tree.digests
 }
 
 pub(crate) fn record_cpu() {
@@ -262,8 +316,10 @@ struct FriCtx {
     stream: usize,
     staging: Pinned,
     out: Pinned,
+    digests: Pinned,
     d_terms: DevBuf,
     d_out: DevBuf,
+    d_digests: DevBuf,
 }
 
 // The raw pointers are only used by the thread that took the context from the pool.
@@ -271,7 +327,15 @@ unsafe impl Send for FriCtx {}
 
 static FRI_CTXS: Mutex<Vec<FriCtx>> = Mutex::new(Vec::new());
 
-fn run(args: &mut FriArgs, cols: &[u64], coef: &[u64], big_n: usize) -> GpuResult<Vec<u64>> {
+/// Runs the kernel (and the first layer's tree for `tree`: lg rows, row length, cap height);
+/// returns the values (leaf order) and the tree's digests followed by its cap.
+fn run(
+    args: &mut FriArgs,
+    cols: &[u64],
+    coef: &[u64],
+    big_n: usize,
+    tree: Option<(usize, usize, usize)>,
+) -> GpuResult<(Vec<u64>, Vec<u64>)> {
     super::quotient::init_once()?;
     let mut ctx = match FRI_CTXS.lock().unwrap_or_else(|e| e.into_inner()).pop() {
         Some(c) => c,
@@ -282,12 +346,14 @@ fn run(args: &mut FriArgs, cols: &[u64], coef: &[u64], big_n: usize) -> GpuResul
                 stream: stream as usize,
                 staging: Pinned::empty(),
                 out: Pinned::empty(),
+                digests: Pinned::empty(),
                 d_terms: DevBuf::empty(),
                 d_out: DevBuf::empty(),
+                d_digests: DevBuf::empty(),
             }
         }
     };
-    let result = ctx_run(&mut ctx, args, cols, coef, big_n);
+    let result = ctx_run(&mut ctx, args, cols, coef, big_n, tree);
     if result.is_ok() {
         // After an error the stream may still be busy; such a context is dropped.
         FRI_CTXS.lock().unwrap_or_else(|e| e.into_inner()).push(ctx);
@@ -295,7 +361,14 @@ fn run(args: &mut FriArgs, cols: &[u64], coef: &[u64], big_n: usize) -> GpuResul
     result
 }
 
-fn ctx_run(ctx: &mut FriCtx, args: &mut FriArgs, cols: &[u64], coef: &[u64], big_n: usize) -> GpuResult<Vec<u64>> {
+fn ctx_run(
+    ctx: &mut FriCtx,
+    args: &mut FriArgs,
+    cols: &[u64],
+    coef: &[u64],
+    big_n: usize,
+    tree: Option<(usize, usize, usize)>,
+) -> GpuResult<(Vec<u64>, Vec<u64>)> {
     let stream = ctx.stream as *mut c_void;
     let len = cols.len() + coef.len();
     let host = ctx.staging.ensure(len)?;
@@ -310,6 +383,23 @@ fn ctx_run(ctx: &mut FriCtx, args: &mut FriArgs, cols: &[u64], coef: &[u64], big
     cuda(unsafe { plonky2_fri_values_launch(args, stream) }, "fri kernel launch")?;
     let out = ctx.out.ensure(2 * big_n)?;
     cuda(unsafe { ffi::cudaMemcpyAsync(out.as_mut_ptr() as *mut c_void, d_out, 2 * big_n * 8, ffi::D2H, stream) }, "fri D2H")?;
+    let mut dig_len = 0;
+    if let Some((lg_rows, row_len, cap_height)) = tree {
+        // Rows of `row_len` elements are consecutive in the leaf-order output.
+        let rows = 1usize << lg_rows;
+        let caps = 1usize << cap_height;
+        let digests_len = 2 * (rows - caps) * HASH_U64;
+        dig_len = digests_len + caps * HASH_U64;
+        let d_dig = ctx.d_digests.ensure(dig_len)? as *mut u64;
+        let d_cap = unsafe { d_dig.add(digests_len) };
+        cuda(
+            unsafe { plonky2_merkle(d_dig, d_cap, d_out as *const u64, lg_rows as u32, row_len as u32, cap_height as u32, stream) },
+            "fri merkle",
+        )?;
+        let h_dig = ctx.digests.ensure(dig_len)?;
+        cuda(unsafe { ffi::cudaMemcpyAsync(h_dig.as_mut_ptr() as *mut c_void, d_dig as *const c_void, dig_len * 8, ffi::D2H, stream) }, "fri digests D2H")?;
+    }
     cuda(unsafe { ffi::cudaStreamSynchronize(stream) }, "fri sync")?;
-    Ok(out[..2 * big_n].to_vec())
+    let digests = if dig_len > 0 { ctx.digests.as_slice()[..dig_len].to_vec() } else { Vec::new() };
+    Ok((out[..2 * big_n].to_vec(), digests))
 }

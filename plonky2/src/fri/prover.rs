@@ -37,6 +37,48 @@ pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const
     max_num_query_steps: Option<usize>,
     timing: &mut TimingTree,
 ) -> FriProof<F, C::Hasher, D> {
+    fri_proof_with::<F, C, D>(
+        initial_merkle_trees,
+        lde_polynomial_coeffs,
+        FriValues::Natural(lde_polynomial_values),
+        challenger,
+        fri_params,
+        final_poly_coeff_len,
+        max_num_query_steps,
+        timing,
+    )
+}
+
+/// The polynomial's evaluations on the large domain, as `fri_proof_with` receives them.
+pub(crate) enum FriValues<F: RichField + Extendable<D>, H: Hasher<F>, const D: usize> {
+    /// Natural order.
+    Natural(PolynomialValues<F::Extension>),
+    /// Index bits reversed (the first commit-phase layer's order), with that layer's Merkle tree
+    /// when it is already built.
+    LeafOrder(Vec<F::Extension>, Option<MerkleTree<F, H>>),
+}
+
+impl<F: RichField + Extendable<D>, H: Hasher<F>, const D: usize> FriValues<F, H, D> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Natural(v) => v.len(),
+            Self::LeafOrder(v, _) => v.len(),
+        }
+    }
+}
+
+/// `fri_proof` with the evaluations in either order.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fri_proof_with<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
+    initial_merkle_trees: &[&MerkleTree<F, C::Hasher>],
+    lde_polynomial_coeffs: PolynomialCoeffs<F::Extension>,
+    lde_polynomial_values: FriValues<F, C::Hasher, D>,
+    challenger: &mut Challenger<F, C::Hasher>,
+    fri_params: &FriParams,
+    final_poly_coeff_len: Option<usize>,
+    max_num_query_steps: Option<usize>,
+    timing: &mut TimingTree,
+) -> FriProof<F, C::Hasher, D> {
     let n = lde_polynomial_values.len();
     assert_eq!(lde_polynomial_coeffs.len(), n);
 
@@ -91,7 +133,7 @@ pub fn final_poly_coeff_len(mut degree_bits: usize, reduction_arity_bits: &Vec<u
 
 fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     mut coeffs: PolynomialCoeffs<F::Extension>,
-    mut values: PolynomialValues<F::Extension>,
+    values: FriValues<F, C::Hasher, D>,
     challenger: &mut Challenger<F, C::Hasher>,
     fri_params: &FriParams,
     final_poly_coeff_len: Option<usize>,
@@ -100,18 +142,30 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
     let mut trees = Vec::with_capacity(fri_params.reduction_arity_bits.len());
 
     let mut shift = F::MULTIPLICATIVE_GROUP_GENERATOR;
+    // The first layer's values may arrive in leaf order already (Some), with its tree (Some(Some)).
+    let (mut values, mut first) = match values {
+        FriValues::Natural(v) => (v, None),
+        FriValues::LeafOrder(v, tree) => (PolynomialValues::new(v), Some(tree)),
+    };
     for arity_bits in &fri_params.reduction_arity_bits {
         let arity = 1 << arity_bits;
 
-        reverse_index_bits_in_place(&mut values.values);
-        let chunked_values = values
-            .values
-            .par_chunks(arity)
-            .map(|chunk: &[F::Extension]| flatten(chunk))
-            .collect();
-        let tree = crate::util::stage_log::acc("fri_commit_merkle", || {
-            MerkleTree::<F, C::Hasher>::new(chunked_values, fri_params.config.cap_height)
-        });
+        let tree = match first.take() {
+            Some(Some(tree)) => tree,
+            leaf_order => {
+                if leaf_order.is_none() {
+                    reverse_index_bits_in_place(&mut values.values);
+                }
+                let chunked_values = values
+                    .values
+                    .par_chunks(arity)
+                    .map(|chunk: &[F::Extension]| flatten(chunk))
+                    .collect();
+                crate::util::stage_log::acc("fri_commit_merkle", || {
+                    MerkleTree::<F, C::Hasher>::new(chunked_values, fri_params.config.cap_height)
+                })
+            }
+        };
 
         challenger.observe_cap(&tree.cap);
         trees.push(tree);

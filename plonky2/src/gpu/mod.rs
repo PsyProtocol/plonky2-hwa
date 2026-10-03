@@ -783,6 +783,12 @@ pub struct GpuStats {
     /// computed on the CPU after all.
     pub oom_retries: u64,
     pub oom_fallbacks: u64,
+    /// FRI final polynomials (PLONKY2_GPU_FRI=1) from the GPU, from the CPU while enabled, check
+    /// mismatches, and GPU wall time.
+    pub fri_gpu: u64,
+    pub fri_cpu: u64,
+    pub fri_mismatch: u64,
+    pub fri_ns: u64,
 }
 
 pub fn stats() -> GpuStats {
@@ -826,6 +832,10 @@ pub fn stats() -> GpuStats {
         pow_ns: pow::pow_stats().1,
         oom_retries: OOM_RETRIES.load(Ordering::Relaxed),
         oom_fallbacks: OOM_FALLBACKS.load(Ordering::Relaxed),
+        fri_gpu: fri::fri_stats().0,
+        fri_cpu: fri::fri_stats().1,
+        fri_mismatch: fri::fri_stats().2,
+        fri_ns: fri::fri_stats().3,
     }
 }
 
