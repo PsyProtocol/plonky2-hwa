@@ -312,19 +312,49 @@ where
     if let Some(l) = stage_log.as_mut() {
         l.mark("quotient_polys");
     }
+    #[cfg(feature = "cuda")]
+    let gpu_quotient_coeffs = crate::gpu::quotient::take_coeffs::<F>();
+    #[cfg(not(feature = "cuda"))]
+    let gpu_quotient_coeffs: Option<Vec<crate::field::polynomial::PolynomialCoeffs<F>>> = None;
     let quotient_polys_commitment = timed!(
         timing,
         "commit to quotient polys",
-        crate::util::stage_log::range("commit:quotient", || C::Compute::transpose_and_compute_from_coeffs(
-            timing,
-            pre_transposed_quotient_polys,
-            quotient_degree,
-            degree,
-            config.fri_config.rate_bits,
-            config.zero_knowledge && PlonkOracle::QUOTIENT.blinding,
-            config.fri_config.cap_height,
-            prover_data.fft_root_table.as_ref(),
-        ))?
+        crate::util::stage_log::range("commit:quotient", || match gpu_quotient_coeffs {
+            // The GPU's coefficients: split into degree-n chunks as `transpose_and_compute_from_coeffs` does.
+            Some(polys) => {
+                #[cfg(test)]
+                for (p, v) in polys.iter().zip(crate::util::transpose(&pre_transposed_quotient_polys)) {
+                    assert!(p.coeffs == PolynomialValues::new(v).coset_ifft(F::coset_shift()).coeffs, "GPU quotient coefficients differ from the CPU");
+                }
+                let chunks = polys
+                    .into_par_iter()
+                    .flat_map(|mut quotient_poly| {
+                        quotient_poly.trim_to_len(quotient_degree).expect(
+                            "Quotient has failed, the vanishing polynomial is not divisible by Z_H",
+                        );
+                        quotient_poly.chunks(degree)
+                    })
+                    .collect();
+                C::Compute::compute_from_coeffs(
+                    timing,
+                    chunks,
+                    config.fri_config.cap_height,
+                    config.fri_config.rate_bits,
+                    config.zero_knowledge && PlonkOracle::QUOTIENT.blinding,
+                    prover_data.fft_root_table.as_ref(),
+                )
+            }
+            None => C::Compute::transpose_and_compute_from_coeffs(
+                timing,
+                pre_transposed_quotient_polys,
+                quotient_degree,
+                degree,
+                config.fri_config.rate_bits,
+                config.zero_knowledge && PlonkOracle::QUOTIENT.blinding,
+                config.fri_config.cap_height,
+                prover_data.fft_root_table.as_ref(),
+            ),
+        })?
     );
 
     if let Some(l) = stage_log.as_mut() {
@@ -738,12 +768,19 @@ fn compute_quotient_polys_pre_transpose<
         ) {
             Ok(gpu) => {
                 if !gpu.needs_check() {
-                    return gpu.values;
+                    // With the coefficients from the GPU the commitment needs no values (tests
+                    // still return them, to compare the coefficients with the CPU's).
+                    if gpu.stash_coeffs() && !cfg!(test) {
+                        return Vec::new();
+                    }
+                    return gpu.values();
                 }
+                let values = gpu.values();
                 let expected = cpu();
-                let Some(k) = (0..expected.len()).find(|&k| gpu.values[k] != expected[k]) else {
+                let Some(k) = (0..expected.len()).find(|&k| values[k] != expected[k]) else {
                     gpu.passed();
-                    return gpu.values;
+                    gpu.stash_coeffs();
+                    return values;
                 };
                 quotient::record_mismatch();
                 gpu.failed();

@@ -1375,6 +1375,47 @@ extern "C" int plonky2_intt(u64* dst, const u64* src, u32 lg_n, u32 cols, u64 om
     return (int)cudaGetLastError();
 }
 
+// Coset inverse NTT: natural-order values at x_i = s w_n^i to coefficients. The inverse NTT gives
+// c_k s^k; each column is then scaled by s^-k (table per lg_n, built once).
+static u64* coset_unscale[LDE_MAX_LG_N + 1];
+
+__global__ void scale_columns_kernel(u64* d, const u64* tab, u32 lg_n, size_t total) {
+    const size_t g = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= total) return;
+    d[g] = gmul(d[g], tab[g & ((1u << lg_n) - 1)]);
+}
+
+extern "C" int plonky2_coset_intt(u64* dst, const u64* src, u32 lg_n, u32 cols, u64 omega_n, u64 shift_inv,
+                                  cudaStream_t stream) {
+    int e = plonky2_intt(dst, src, lg_n, cols, omega_n, stream);
+    if (e) return e;
+    u64* tab;
+    {
+        std::lock_guard<std::mutex> g(intt_mu);
+        if (!coset_unscale[lg_n]) {
+            const u32 n = 1u << lg_n;
+            std::vector<u64> t(n);
+            u64 p = 1;
+            for (u32 k = 0; k < n; k++) {
+                t[k] = p;
+                p = hmul(p, shift_inv);
+            }
+            u64* d = nullptr;
+            e = (int)cudaMalloc(&d, (size_t)n * 8);
+            if (!e) e = (int)cudaMemcpy(d, t.data(), (size_t)n * 8, cudaMemcpyHostToDevice);
+            if (e) {
+                cudaFree(d);
+                return e;
+            }
+            coset_unscale[lg_n] = d;
+        }
+        tab = coset_unscale[lg_n];
+    }
+    const size_t total = (size_t)cols << lg_n;
+    scale_columns_kernel<<<(unsigned)((total + 255) / 256), 256, 0, stream>>>(dst, tab, lg_n, total);
+    return (int)cudaGetLastError();
+}
+
 // Column-major [cols][rows] -> row-major [rows][cols], 32 x 32 tiles.
 __global__ void transpose_kernel(u64* dst, const u64* src, u32 rows, u32 cols) {
     __shared__ u64 tile[32][33];

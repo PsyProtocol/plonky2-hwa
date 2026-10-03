@@ -53,6 +53,7 @@ pub(crate) fn pp_count() -> u64 {
 }
 
 /// Proofs that stayed on the CPU because the sigmas did not fit.
+#[cfg(test)]
 pub(crate) fn no_room_count() -> u64 {
     PP_NO_ROOM.load(Ordering::Relaxed)
 }

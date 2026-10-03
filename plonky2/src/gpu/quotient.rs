@@ -128,6 +128,7 @@ extern "C" {
     fn plonky2_quotient_init(poseidon_constants: *const u64, len: u32) -> i32;
     fn plonky2_quotient_poseidon_constants_len() -> u32;
     fn plonky2_quotient_launch(args: *const QuotientArgs, stream: *mut c_void) -> i32;
+    fn plonky2_coset_intt(dst: *mut u64, src: *const u64, lg_n: u32, cols: u32, omega_n: u64, shift_inv: u64, stream: *mut c_void) -> i32;
 }
 
 /// Device buffers of the quotient evaluation (only touched under the GPU lock).
@@ -142,6 +143,7 @@ pub(super) struct QuotientBufs {
     d_gates: DevBuf,
     d_out: DevBuf,
     d_debug: DevBuf,
+    d_coef: DevBuf,
 }
 
 impl QuotientBufs {
@@ -157,6 +159,7 @@ impl QuotientBufs {
             d_gates: DevBuf::empty(),
             d_out: DevBuf::empty(),
             d_debug: DevBuf::empty(),
+            d_coef: DevBuf::empty(),
         }
     }
 }
@@ -439,6 +442,7 @@ pub(crate) fn begin_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = 
     common: &CommonCircuitData<F, D>,
     prover_data: &ProverOnlyCircuitData<F, C, D>,
 ) {
+    COEFFS.with(|c| c.borrow_mut().take());
     if !enabled() || Q_FAILED.load(Ordering::Relaxed) || FAILED.load(Ordering::Relaxed) {
         return;
     }
@@ -472,14 +476,34 @@ pub(crate) fn try_compute<F: RichField + Extendable<D>, C: GenericConfig<D, F = 
     alphas: &[F],
 ) -> Result<GpuQuotient<F>, String> {
     let (out, n_points, plan) = run(common, prover_data, public_inputs_hash, wires, zs, betas, gammas, alphas, None)?;
-    let values = (0..n_points).map(|i| (0..NC).map(|c| F::from_canonical_u64(out[c * n_points + i])).collect()).collect();
-    Ok(GpuQuotient { values, plan })
+    Ok(GpuQuotient { out, n_points, plan, _f: core::marker::PhantomData })
 }
 
-/// A GPU quotient and the circuit plan that produced it.
+/// A GPU quotient (values per challenge, then optionally its coefficients) and the circuit plan
+/// that produced it.
 pub(crate) struct GpuQuotient<F> {
-    pub values: Vec<Vec<F>>,
+    out: Vec<u64>,
+    n_points: usize,
     plan: Arc<Result<Plan, String>>,
+    _f: core::marker::PhantomData<F>,
+}
+
+impl<F: RichField> GpuQuotient<F> {
+    /// The values as `compute_quotient_polys` returns them: per point, one per challenge.
+    pub fn values(&self) -> Vec<Vec<F>> {
+        let n = self.n_points;
+        (0..n).map(|i| (0..NC).map(|c| F::from_canonical_u64(self.out[c * n + i])).collect()).collect()
+    }
+
+    /// Leaves the coefficients (when computed) for this proof's quotient commitment; true if so.
+    pub fn stash_coeffs(&self) -> bool {
+        let n = self.n_points;
+        if self.out.len() != 2 * NC * n {
+            return false;
+        }
+        COEFFS.with(|c| *c.borrow_mut() = Some((self.out[NC * n..].to_vec(), n)));
+        true
+    }
 }
 
 impl<F> GpuQuotient<F> {
@@ -978,6 +1002,7 @@ fn device_run<F: RichField>(
     let d_gates = q.d_gates.ensure(gate_bytes.div_ceil(8))?;
     cuda(unsafe { ffi::cudaMemcpy(d_gates, gates.as_ptr() as *const c_void, gate_bytes, ffi::H2D) }, "quotient gates")?;
     let d_out = q.d_out.ensure(NC * big_n)?;
+    let want_coeffs = args.debug_point < 0 && coeffs_wanted(args.lg_lde as usize);
     let debug_len = gates.len() * args.debug_stride as usize;
     let d_debug = if args.debug_point >= 0 { q.d_debug.ensure(debug_len)? } else { core::ptr::null_mut() };
     args.aux = d_aux as *const u64;
@@ -990,11 +1015,46 @@ fn device_run<F: RichField>(
     })?;
     lap("q_kernel");
     let (src, len) = if args.debug_point >= 0 { (d_debug, debug_len) } else { (d_out, NC * big_n) };
-    let out = q.out.ensure(len)?;
+    let out = q.out.ensure(len * if want_coeffs { 2 } else { 1 })?;
     cuda(unsafe { ffi::cudaMemcpy(out.as_mut_ptr() as *mut c_void, src, len * 8, ffi::D2H) }, "quotient D2H")?;
+    if want_coeffs {
+        let d_coef = q.d_coef.ensure(NC * big_n)?;
+        coset_coeffs(d_coef, d_out, args.lg_lde as usize, core::ptr::null_mut())?;
+        cuda(unsafe { ffi::cudaMemcpy(out[len..].as_mut_ptr() as *mut c_void, d_coef, len * 8, ffi::D2H) }, "quotient coefficients D2H")?;
+    }
     let out = out.to_vec();
     lap("q_d2h");
     Ok(out)
+}
+
+/// `PLONKY2_GPU_QIFFT=1`: the quotient's coefficients come from a coset inverse NTT on the device
+/// (downloaded with the values) and go straight to the quotient commitment, instead of a
+/// transpose and a coset IFFT per challenge on the CPU. Up to 2^18 points.
+pub(crate) fn coeffs_wanted(lg_lde: usize) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLONKY2_GPU_QIFFT").ok().as_deref() == Some("1")) && lg_lde <= 18
+}
+
+/// The quotient's coefficients (per challenge, natural order) from its values on the LDE coset.
+fn coset_coeffs(dst: *mut c_void, src: *const c_void, lg_lde: usize, stream: *mut c_void) -> GpuResult<()> {
+    use plonky2_field::types::{Field, PrimeField64};
+    let omega = GoldilocksField::primitive_root_of_unity(lg_lde).to_canonical_u64();
+    let shift_inv = GoldilocksField::coset_shift().inverse().to_canonical_u64();
+    cuda(
+        unsafe { plonky2_coset_intt(dst as *mut u64, src as *const u64, lg_lde as u32, NC as u32, omega, shift_inv, stream) },
+        "quotient coset intt",
+    )
+}
+
+std::thread_local! {
+    /// The current proof's quotient coefficients ([challenge][point], raw) and their length.
+    static COEFFS: core::cell::RefCell<Option<(Vec<u64>, usize)>> = const { core::cell::RefCell::new(None) };
+}
+
+/// Takes the quotient coefficients the GPU left for this proof's quotient commitment.
+pub(crate) fn take_coeffs<F: RichField>() -> Option<Vec<PolynomialCoeffs<F>>> {
+    let (raw, n) = COEFFS.with(|c| c.borrow_mut().take())?;
+    Some(raw.chunks_exact(n).map(|c| PolynomialCoeffs::new(c.iter().map(|&x| F::from_canonical_u64(x)).collect())).collect())
 }
 
 /// Device buffers and a non-blocking stream for one quotient running outside the GPU lock.
@@ -1005,6 +1065,7 @@ struct QCtx {
     d_aux: DevBuf,
     d_gates: DevBuf,
     d_out: DevBuf,
+    d_coef: DevBuf,
 }
 
 // The raw pointers are only used by the thread that took the context from the pool.
@@ -1027,6 +1088,7 @@ fn run_unlocked(args: &mut QuotientArgs, aux: &[u64], gates: &[GateDesc], big_n:
                 d_aux: DevBuf::empty(),
                 d_gates: DevBuf::empty(),
                 d_out: DevBuf::empty(),
+                d_coef: DevBuf::empty(),
             }
         }
     };
@@ -1061,8 +1123,15 @@ fn ctx_run(ctx: &mut QCtx, args: &mut QuotientArgs, aux: &[u64], gates: &[GateDe
     args.out = d_out as *mut u64;
     args.debug = core::ptr::null_mut();
     cuda(unsafe { plonky2_quotient_launch(args, stream) }, "quotient kernel launch")?;
-    let out = ctx.out.ensure(NC * big_n)?;
-    cuda(unsafe { ffi::cudaMemcpyAsync(out.as_mut_ptr() as *mut c_void, d_out, NC * big_n * 8, ffi::D2H, stream) }, "quotient D2H")?;
+    let want_coeffs = coeffs_wanted(args.lg_lde as usize);
+    let len = NC * big_n;
+    let out = ctx.out.ensure(len * if want_coeffs { 2 } else { 1 })?;
+    cuda(unsafe { ffi::cudaMemcpyAsync(out.as_mut_ptr() as *mut c_void, d_out, len * 8, ffi::D2H, stream) }, "quotient D2H")?;
+    if want_coeffs {
+        let d_coef = ctx.d_coef.ensure(len)?;
+        coset_coeffs(d_coef, d_out, args.lg_lde as usize, stream)?;
+        cuda(unsafe { ffi::cudaMemcpyAsync(out[len..].as_mut_ptr() as *mut c_void, d_coef, len * 8, ffi::D2H, stream) }, "quotient coefficients D2H")?;
+    }
     cuda(unsafe { ffi::cudaStreamSynchronize(stream) }, "quotient sync")?;
     Ok(out.to_vec())
 }
