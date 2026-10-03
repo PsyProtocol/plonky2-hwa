@@ -1471,8 +1471,10 @@ fn run<F: RichField>(
         &lane.input.as_slice()[..cols * n]
     };
 
-    // Device memory: the reusable workspace, or per-commitment allocations freed when done.
-    let ws_on = device_workspace();
+    // Device memory: the reusable workspace, or per-commitment allocations freed when done. A
+    // large commitment (secp) allocates per call even with the workspace on: a workspace grown to
+    // its size (about 2.6 GB) would stay and crowd out the kept LDEs and the constants cache.
+    let ws_on = device_workspace() && cols * rows * 8 <= LANE_BIG_BYTES;
     let mut owned: Vec<DeviceBuffer> = Vec::new();
     let mut dev = |slot: usize, len: usize| -> GpuResult<*mut c_void> {
         if ws_on {
