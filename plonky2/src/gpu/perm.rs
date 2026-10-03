@@ -4,7 +4,8 @@
 //! for both challenges: per row, the chunk quotients (one inversion per row with Montgomery's
 //! trick) and their product; Z as the exclusive prefix product of the row products (a scan); then
 //! the partial products. Field arithmetic is exact, so the values equal the CPU's. The routed wire
-//! values are uploaded per proof; each circuit's sigmas are uploaded once and kept.
+//! values are read from the wires commitment's kept values when it interpolated them on the device,
+//! else uploaded; each circuit's sigmas are uploaded once and kept.
 
 use std::collections::HashMap;
 
@@ -47,6 +48,12 @@ const PP_MAX_CHUNKS: usize = 32;
 static PP_FAILED: AtomicBool = AtomicBool::new(false);
 static PP_GPU: AtomicU64 = AtomicU64::new(0);
 static PP_NO_ROOM: AtomicU64 = AtomicU64::new(0);
+static PP_KEPT_VALUES: AtomicU64 = AtomicU64::new(0);
+
+/// Partial products that read the wires commitment's kept values instead of uploading them.
+pub(crate) fn kept_values_count() -> u64 {
+    PP_KEPT_VALUES.load(Ordering::Relaxed)
+}
 
 pub(crate) fn pp_count() -> u64 {
     PP_GPU.load(Ordering::Relaxed)
@@ -93,7 +100,11 @@ fn sigmas_on_device<F: RichField>(digest: u64, sigmas: &[Vec<F>], num_routed: us
     let host: Vec<u64> = sigmas.iter().flat_map(|row| row[..num_routed].iter().map(|s| s.to_canonical_u64())).collect();
     let mut p = core::ptr::null_mut();
     cuda(unsafe { ffi::cudaMalloc(&mut p, bytes) }, "cudaMalloc (sigmas)")?;
-    if let Err(e) = cuda(unsafe { ffi::cudaMemcpy(p, host.as_ptr() as *const c_void, bytes, ffi::H2D) }, "sigmas H2D") {
+    // From pageable memory the copy may still be in flight when cudaMemcpy returns, and the
+    // partial products read the sigmas on a non-blocking stream: wait for it.
+    let copied = cuda(unsafe { ffi::cudaMemcpy(p, host.as_ptr() as *const c_void, bytes, ffi::H2D) }, "sigmas H2D")
+        .and_then(|()| cuda(unsafe { ffi::cudaDeviceSynchronize() }, "sigmas sync"));
+    if let Err(e) = copied {
         unsafe { ffi::cudaFree(p) };
         return Err(e);
     }
@@ -143,8 +154,12 @@ pub(crate) fn partial_products<F: RichField + Extendable<D>, C: GenericConfig<D,
         let Some(sigmas) = sigmas_on_device(digest, &prover_data.sigmas, num_routed)? else {
             return Ok(None);
         };
+        let wires_dev = kept(ROLE_WIRE_VALUES, common.config.num_wires, lg_n, false).map(|r| r.ptr as *const u64);
+        if wires_dev.is_some() {
+            PP_KEPT_VALUES.fetch_add(1, Ordering::Relaxed);
+        }
         let mut ctx = PpCtx::take()?;
-        let r = ctx.run(witness, betas, gammas, &common.k_is[..num_routed], sigmas, n, lg_n, num_routed, degree, num_chunks, num_prods);
+        let r = ctx.run(witness, wires_dev, betas, gammas, &common.k_is[..num_routed], sigmas, n, lg_n, num_routed, degree, num_chunks, num_prods);
         if r.is_ok() {
             ctx.give();
         }
@@ -210,6 +225,7 @@ impl PpCtx {
     fn run<F: RichField>(
         &mut self,
         witness: &MatrixWitness<F>,
+        wires_dev: Option<*const u64>,
         betas: &[F],
         gammas: &[F],
         k_is: &[F],
@@ -224,25 +240,29 @@ impl PpCtx {
         let stream = self.stream as *mut c_void;
         let blocks = n.div_ceil(PP_SCAN);
         let out_cols = 2 + 2 * num_prods;
-        // Staging: routed wire values then k_is; device: the same, then the scratch and output.
-        let host = self.staging.ensure(num_routed * n + num_routed)?;
-        host[..num_routed * n].par_chunks_mut(n).zip(witness.wire_values[..num_routed].par_iter()).for_each(|(dst, w)| {
-            for (d, v) in dst.iter_mut().zip(w) {
-                *d = v.to_canonical_u64();
-            }
-        });
-        for (d, k) in host[num_routed * n..].iter_mut().zip(k_is) {
+        // Staging: the routed wire values (unless already on the device) then k_is; device: the
+        // same, then the scratch and output.
+        let wire_len = if wires_dev.is_some() { 0 } else { num_routed * n };
+        let host = self.staging.ensure(wire_len + num_routed)?;
+        if wires_dev.is_none() {
+            host[..wire_len].par_chunks_mut(n).zip(witness.wire_values[..num_routed].par_iter()).for_each(|(dst, w)| {
+                for (d, v) in dst.iter_mut().zip(w) {
+                    *d = v.to_canonical_u64();
+                }
+            });
+        }
+        for (d, k) in host[wire_len..].iter_mut().zip(k_is) {
             *d = k.to_canonical_u64();
         }
-        let up = num_routed * n + num_routed;
+        let up = wire_len + num_routed;
         let total = up + 2 * num_chunks * n + 2 * n + 2 * blocks + out_cols * n;
         let base = self.d.ensure(total)? as *mut u64;
         cuda(unsafe { ffi::cudaMemcpyAsync(base as *mut c_void, host.as_ptr() as *const c_void, up * 8, ffi::H2D, stream) }, "partial products H2D")?;
         let at = |off: usize| unsafe { base.add(off) };
         let args = PpArgs {
-            wires: at(0),
+            wires: wires_dev.unwrap_or(at(0)),
             sigmas,
-            k_is: at(num_routed * n),
+            k_is: at(wire_len),
             q: at(up),
             row: at(up + 2 * num_chunks * n),
             block: at(up + 2 * num_chunks * n + 2 * n),

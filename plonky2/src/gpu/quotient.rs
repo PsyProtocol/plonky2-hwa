@@ -891,6 +891,10 @@ fn constants_lde<F: RichField>(
     }
     let bytes = polys.len() * big_n * 8;
     while c.bytes + bytes <= const_budget() && !super::device_room(bytes) && evict_lru(&mut c) {}
+    if !super::device_room(bytes) {
+        // Idle kept-LDE buffers count against the device's free memory too.
+        super::trim_resident_pool();
+    }
     while c.bytes + bytes > const_budget() && evict_lru(&mut c) {}
     if c.bytes + bytes > const_budget() || !super::device_room(bytes) {
         Q_CONST_NO_ROOM.fetch_add(1, Ordering::Relaxed);
@@ -1242,6 +1246,7 @@ mod tests {
         let reused_before = Q_RESIDENT_USED.load(Ordering::Relaxed);
         let intt_before = super::stats().intt_commits;
         let pp_before = super::perm::pp_count();
+        let pp_kept_before = super::perm::kept_values_count();
         let open_before = super::open::open_count();
         let proof = outer.prove(pw.clone())?;
         outer.verify(proof)?;
@@ -1256,6 +1261,9 @@ mod tests {
         if super::perm::enabled() {
             // Compared with the CPU in prove() under cfg(test).
             assert!(super::perm::pp_count() > pp_before, "partial products did not run on the GPU");
+            if super::intt_enabled() && backend().is_some_and(|b| b.min_lde_rows <= 1 << 10) {
+                assert!(super::perm::kept_values_count() > pp_kept_before, "partial products re-uploaded the wire values");
+            }
         }
         if super::intt_enabled() && backend().is_some_and(|b| b.min_lde_rows <= 1 << 10) {
             // Wires and Z come from values: both interpolated on the device.

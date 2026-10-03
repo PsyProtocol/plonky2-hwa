@@ -525,6 +525,9 @@ std::thread_local! {
 pub(crate) const ROLE_WIRES: u8 = 0;
 pub(crate) const ROLE_ZS: u8 = 1;
 pub(crate) const ROLE_QUOTIENT: u8 = 2;
+/// Not a commitment: the wires' subgroup values, kept by the wires commitment when it
+/// interpolates them on the device, for the partial products.
+pub(crate) const ROLE_WIRE_VALUES: u8 = 3;
 
 /// A commitment's LDE (column-major; in leaf order when `leaf_order`, else natural order) kept on
 /// the device for the quotient and FRI.
@@ -614,7 +617,9 @@ impl DevPool {
             self.taken.fetch_add(1, Ordering::Relaxed);
             return Some(free.swap_remove(i).1 as *mut c_void);
         }
-        while self.held.load(Ordering::Relaxed) + bytes as u64 > resident_budget() {
+        // Free idle buffers of other sizes while over the budget, or while the device lacks room
+        // (idle buffers count against the device's free memory too).
+        while self.held.load(Ordering::Relaxed) + bytes as u64 > resident_budget() || !device_room(bytes) {
             let Some((b, ptr)) = free.pop() else { break };
             unsafe { ffi::cudaFree(ptr as *mut c_void) };
             self.held.fetch_sub(b as u64, Ordering::Relaxed);
@@ -1289,8 +1294,16 @@ fn run<F: RichField>(
     let d_leaves = dev(WS_LEAVES, cols * rows)?;
     let d_digests = dev(WS_DIGESTS, num_digests * HASH_U64)?;
     let d_cap = dev(WS_CAP, caps * HASH_U64)?;
-    // Values are uploaded beside the coefficient buffer and interpolated into it.
-    let d_up = if values_in { dev(WS_VALUES, cols * n)? } else { d_in };
+    // Values are uploaded beside the coefficient buffer and interpolated into it. The wires'
+    // values go to a kept buffer when the partial products will read them on the device.
+    let keep_values = values_in && capture_role == Some(ROLE_WIRES) && perm::enabled();
+    let kept_values = if keep_values { RESIDENT_POOL.take(cols * n * 8) } else { None };
+    let mut values_guard = KeptGuard(kept_values.map(|p| (p as usize, cols * n * 8)));
+    let d_up = match kept_values {
+        Some(p) => p,
+        None if values_in => dev(WS_VALUES, cols * n)?,
+        None => d_in,
+    };
     range("gpu:h2d", || cuda(unsafe { ffi::cudaMemcpy(d_up, input.as_ptr() as *const c_void, cols * n * 8, ffi::H2D) }, "H2D"))?;
     if values_in {
         use plonky2_field::types::{Field, PrimeField64};
@@ -1395,6 +1408,10 @@ fn run<F: RichField>(
     if let Some((p, bytes)) = kept_guard.0.take() {
         let role = capture_role.expect("kept only with a role");
         RESIDENT.with(|r| r.borrow_mut().push(Resident { ptr: p, bytes, cols, lg_rows, leaf_order, role }));
+    }
+    if let Some((p, bytes)) = values_guard.0.take() {
+        // Canonical subgroup values, column-major; `lg_rows` is the subgroup's size here.
+        RESIDENT.with(|r| r.borrow_mut().push(Resident { ptr: p, bytes, cols, lg_rows: lg_n, leaf_order: false, role: ROLE_WIRE_VALUES }));
     }
     Ok((cols * rows, num_digests * HASH_U64, caps * HASH_U64, t.elapsed().as_secs_f64()))
 }

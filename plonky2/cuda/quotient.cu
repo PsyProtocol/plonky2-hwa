@@ -1040,7 +1040,10 @@ extern "C" int plonky2_quotient_init(const u64* poseidon_constants, u32 len) {
     for (u32 k = 0; k < SPONGE_WIDTH; k++) {
         if (poseidon_constants[POS_CIRC + k] != C[k] || poseidon_constants[POS_DIAG + k] != (k == 0 ? MDS_DIAG0 : 0u)) return -2;
     }
-    return (int)cudaMemcpyToSymbol(c_pos, poseidon_constants, sizeof(u64) * POS_LEN);
+    int e = (int)cudaMemcpyToSymbol(c_pos, poseidon_constants, sizeof(u64) * POS_LEN);
+    // From pageable memory the copy may still be in flight when this returns; kernels on
+    // non-blocking streams (PoW, quotient, FRI) do not wait for the legacy stream.
+    return e ? e : (int)cudaDeviceSynchronize();
 }
 
 extern "C" u32 plonky2_quotient_poseidon_constants_len() { return POS_LEN; }
@@ -1126,6 +1129,8 @@ static int lde_tables_get(u32 lg_n, u32 rate_bits, u64 omega_big, u64 shift, Lde
         if (!e) e = (int)cudaMalloc(&nt.tw, tw.size() * 8);
         if (!e) e = (int)cudaMemcpy(nt.scale, scale.data(), scale.size() * 8, cudaMemcpyHostToDevice);
         if (!e) e = (int)cudaMemcpy(nt.tw, tw.data(), tw.size() * 8, cudaMemcpyHostToDevice);
+        // Pageable sources: wait for the copies before any stream may read the tables.
+        if (!e) e = (int)cudaDeviceSynchronize();
         if (e) {
             cudaFree(nt.scale);
             cudaFree(nt.tw);
@@ -1285,6 +1290,7 @@ static int intt_tables_get(u32 lg_n, u64 omega_n, u64** out) {
         u64* d = nullptr;
         int e = (int)cudaMalloc(&d, tw.size() * 8);
         if (!e) e = (int)cudaMemcpy(d, tw.data(), tw.size() * 8, cudaMemcpyHostToDevice);
+        if (!e) e = (int)cudaDeviceSynchronize();  // pageable source, see lde_tables_get
         if (e) {
             cudaFree(d);
             return e;
@@ -1403,6 +1409,7 @@ extern "C" int plonky2_coset_intt(u64* dst, const u64* src, u32 lg_n, u32 cols, 
             u64* d = nullptr;
             e = (int)cudaMalloc(&d, (size_t)n * 8);
             if (!e) e = (int)cudaMemcpy(d, t.data(), (size_t)n * 8, cudaMemcpyHostToDevice);
+            if (!e) e = (int)cudaDeviceSynchronize();  // pageable source, see lde_tables_get
             if (e) {
                 cudaFree(d);
                 return e;
