@@ -159,9 +159,52 @@ fn zeknox_merkle() -> bool {
     *V.get_or_init(|| std::env::var("PLONKY2_GPU_MERKLE").ok().as_deref() == Some("zeknox"))
 }
 
+/// Coset LDEs with `plonky2_coset_lde` (column-major, in leaf order; 4-6x faster than zeknox's LDE
+/// plus `compute_transpose_rev` together) for `lg_n <= 13`, unless `PLONKY2_GPU_LDE=zeknox`.
+/// Larger LDEs, and all with the switch, use zeknox (column-major, natural order). Every LDE of a
+/// circuit has the same `lg_n`, so a quotient's inputs all share one layout.
+pub(crate) fn own_lde(lg_n: usize, rate_bits: usize) -> bool {
+    static ZEKNOX: OnceLock<bool> = OnceLock::new();
+    let zeknox = *ZEKNOX.get_or_init(|| std::env::var("PLONKY2_GPU_LDE").ok().as_deref() == Some("zeknox"));
+    !zeknox && (1..=13).contains(&lg_n) && rate_bits <= 4
+}
+
+/// Extends `cols` canonical coefficient columns (column-major, `2^lg_n` each, on the device) into
+/// `dst` with the layout `own_lde` selects. Synchronous.
+pub(crate) fn coset_lde(dst: *mut c_void, src: *mut c_void, lg_n: usize, rate_bits: usize, cols: usize) -> GpuResult<()> {
+    use plonky2_field::types::{Field, PrimeField64};
+    if own_lde(lg_n, rate_bits) {
+        let omega = GoldilocksField::primitive_root_of_unity(lg_n + rate_bits).to_canonical_u64();
+        let shift = GoldilocksField::coset_shift().to_canonical_u64();
+        cuda(
+            unsafe {
+                plonky2_coset_lde(dst as *mut u64, src as *const u64, lg_n as u32, rate_bits as u32, cols as u32, omega, shift, core::ptr::null_mut())
+            },
+            "coset lde",
+        )?;
+        return sync("coset lde");
+    }
+    let cfg = ffi::NttConfig {
+        batches: cols as u32,
+        order: ffi::Order::NN,
+        ntt_type: ffi::NttType::Standard,
+        extension_rate_bits: rate_bits as u32,
+        are_inputs_on_device: true,
+        are_outputs_on_device: true,
+        with_coset: true,
+        is_multi_gpu: false,
+        salt_size: 0,
+    };
+    // zeknox's LDE synchronises internally.
+    zeknox(unsafe { ffi::compute_batched_lde(0, dst, src, lg_n as u32, ffi::Direction::Forward, cfg) }, "lde")?;
+    sync("lde")
+}
+
 extern "C" {
     fn plonky2_merkle(digests: *mut u64, cap: *mut u64, leaves: *const u64, lg_rows: u32, cols: u32, cap_height: u32, stream: *mut c_void) -> i32;
     fn plonky2_digest_layout(dst: *mut u64, src: *const u64, per_subtree: u32, lg_leaves: u32, num_subtrees: u32) -> i32;
+    fn plonky2_coset_lde(dst: *mut u64, src: *const u64, lg_n: u32, rate_bits: u32, cols: u32, omega: u64, shift: u64, stream: *mut c_void) -> i32;
+    fn plonky2_transpose(dst: *mut u64, src: *const u64, rows: u32, cols: u32, stream: *mut c_void) -> i32;
 }
 
 extern "C" {
@@ -457,13 +500,15 @@ std::thread_local! {
     static RESIDENT: core::cell::RefCell<Vec<Resident>> = const { core::cell::RefCell::new(Vec::new()) };
 }
 
-/// A commitment's LDE (column-major, natural order) kept on the device for the quotient.
+/// A commitment's LDE (column-major; in leaf order when `leaf_order`, else natural order) kept on
+/// the device for the quotient.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Resident {
     pub ptr: usize,
     pub bytes: usize,
     pub cols: usize,
     pub lg_rows: usize,
+    pub leaf_order: bool,
 }
 
 /// Keep the LDEs of this proof's next two commitments (wires, Z) on the device.
@@ -1123,29 +1168,23 @@ fn run<F: RichField>(
     let d_cap = dev(WS_CAP, caps * HASH_U64)?;
     range("gpu:h2d", || cuda(unsafe { ffi::cudaMemcpy(d_in, input.as_ptr() as *const c_void, cols * n * 8, ffi::H2D) }, "H2D"))?;
 
-    let cfg = ffi::NttConfig {
-        batches: cols as u32,
-        order: ffi::Order::NN,
-        ntt_type: ffi::NttType::Standard,
-        extension_rate_bits: rate_bits as u32,
-        are_inputs_on_device: true,
-        are_outputs_on_device: true,
-        with_coset: true,
-        is_multi_gpu: false,
-        salt_size: 0,
-    };
-    // zeknox's LDE and transpose synchronise internally, so their submit ranges include the
-    // kernel time; the separate sync ranges then only catch what is left.
-    range("gpu:lde:submit", || {
-        zeknox(unsafe { ffi::compute_batched_lde(0, d_lde, d_in, lg_n as u32, ffi::Direction::Forward, cfg) }, "lde")
-    })?;
-    range("gpu:lde:sync", || sync("lde"))?;
-
-    let tcfg = ffi::TransposeConfig { batches: cols as u32, are_inputs_on_device: true, are_outputs_on_device: true };
-    range("gpu:transpose:submit", || {
-        zeknox(unsafe { ffi::compute_transpose_rev(0, d_leaves, d_lde, lg_rows as u32, tcfg) }, "transpose")
-    })?;
-    range("gpu:transpose:sync", || sync("transpose"))?;
+    let leaf_order = own_lde(lg_n, rate_bits);
+    range("gpu:lde", || coset_lde(d_lde, d_in, lg_n, rate_bits, cols))?;
+    if leaf_order {
+        // Already in leaf order: a plain transpose to row-major leaves.
+        range("gpu:transpose", || {
+            cuda(unsafe { plonky2_transpose(d_leaves as *mut u64, d_lde as *const u64, rows as u32, cols as u32, core::ptr::null_mut()) }, "transpose")?;
+            sync("transpose")
+        })?;
+    } else {
+        // zeknox's transpose synchronises internally, so the submit range includes the kernel
+        // time; the separate sync range then only catches what is left.
+        let tcfg = ffi::TransposeConfig { batches: cols as u32, are_inputs_on_device: true, are_outputs_on_device: true };
+        range("gpu:transpose:submit", || {
+            zeknox(unsafe { ffi::compute_transpose_rev(0, d_leaves, d_lde, lg_rows as u32, tcfg) }, "transpose")
+        })?;
+        range("gpu:transpose:sync", || sync("transpose"))?;
+    }
 
     if overlap {
         // Starts now on the non-blocking stream; the device sync after the Merkle kernels waits
@@ -1215,7 +1254,7 @@ fn run<F: RichField>(
     drop(_d2h);
     range("gpu:free", || drop(owned));
     if let Some((p, bytes)) = kept_guard.0.take() {
-        RESIDENT.with(|r| r.borrow_mut().push(Resident { ptr: p, bytes, cols, lg_rows }));
+        RESIDENT.with(|r| r.borrow_mut().push(Resident { ptr: p, bytes, cols, lg_rows, leaf_order }));
     }
     Ok((cols * rows, num_digests * HASH_U64, caps * HASH_U64, t.elapsed().as_secs_f64()))
 }

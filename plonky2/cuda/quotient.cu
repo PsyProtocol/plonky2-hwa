@@ -6,10 +6,14 @@
 // constraints, combined with powers of each alpha and divided by `Z_H(x)`. Field arithmetic is
 // exact, so the result equals the CPU result element for element (all values are kept canonical).
 //
-// Inputs are the LDEs of the prover's polynomial batches, column-major in natural order:
-// column `c` at point `i` is `lde[c * N + i]`, the value at `x_i = shift * omega^i`.
+// Inputs are the LDEs of the prover's polynomial batches, column-major, in natural order (column
+// `c` at point `i` is `lde[c * N + i]`, the value at `x_i = shift * omega^i`) or, with
+// `leaf_order`, in the commitments' leaf order (point `i` at `lde[c * N + bitrev(i)]`). The output
+// is in natural order either way.
 
 #include <cstdint>
+#include <mutex>
+#include <vector>
 #include <cuda_runtime.h>
 
 typedef unsigned long long u64;
@@ -18,6 +22,11 @@ typedef unsigned int u32;
 #define GL_P 0xFFFFFFFF00000001ull
 #define GL_EPS 0xFFFFFFFFull
 #define EXT_W 7ull  // GoldilocksField quadratic extension: X^2 = 7
+#define LDE_MAX_LG_N 13  // coset LDE: one column's coset (8 << lg_n bytes) in shared memory
+#define LDE_MAX_RATE_BITS 4
+#ifndef LDE_THREADS
+#define LDE_THREADS 512
+#endif
 
 // ---- Goldilocks field, canonical representatives ----------------------------------------------
 
@@ -184,6 +193,7 @@ struct QuotientArgs {
     u32 off_kis, off_betas, off_gammas, off_alpha, num_terms, off_gate_data;
     u32 num_gates;
     u32 debug_stride;
+    u32 leaf_order;    // inputs in leaf order (bit-reversed point index), see above
     int debug_point;   // -1: off
 };
 
@@ -191,6 +201,7 @@ struct QuotientArgs {
 // assume canonical inputs.
 __device__ __forceinline__ u64 gcanon(u64 x) { return x >= GL_P ? x - GL_P : x; }
 
+// Loads of one point; `i` is the point's index in the LDE buffers.
 struct Point {
     const QuotientArgs& a;
     u32 N, i;
@@ -693,9 +704,11 @@ __device__ void eval_gate(const Point& p, const GateDesc& g, const u64* gate_dat
 // spills) on sm_120.
 __global__ void __launch_bounds__(QK_THREADS, QK_MIN_BLOCKS) quotient_kernel(const QuotientArgs a) {
     const u32 N = 1u << a.lg_lde;
-    const u32 i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N) return;
-    Point p{a, N, i};
+    // `t` indexes the LDE buffers; `i` is the point x_i.
+    const u32 t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= N) return;
+    const u32 i = a.leaf_order ? __brev(t) >> (32 - a.lg_lde) : t;
+    Point p{a, N, t};
     const u64* k_is = a.aux + a.off_kis;
     const u64* betas = a.aux + a.off_betas;
     const u64* gammas = a.aux + a.off_gammas;
@@ -710,13 +723,14 @@ __global__ void __launch_bounds__(QK_THREADS, QK_MIN_BLOCKS) quotient_kernel(con
     // L_0(x) = Z_H(x) / (n (x - 1)).
     const u64 l0 = gmul(a.zh_evals[r], ginv(gmul(a.n_field, gsub(x, 1))));
     u32 m = 0;
-    for (u32 c = 0; c < NC; c++) acc.add(m++, gmul(l0, gsub(p.z(c, i), 1)));
+    for (u32 c = 0; c < NC; c++) acc.add(m++, gmul(l0, gsub(p.z(c, t), 1)));
 
     const u32 i_next = (i + a.next_step) & (N - 1);
+    const u32 t_next = a.leaf_order ? __brev(i_next) >> (32 - a.lg_lde) : i_next;
     const u32 num_chunks = (a.num_routed + a.max_degree - 1) / a.max_degree;
     for (u32 c = 0; c < NC; c++) {
         const u64 beta = betas[c], gamma = gammas[c];
-        u64 prev = p.z(c, i);
+        u64 prev = p.z(c, t);
         for (u32 chunk = 0; chunk < num_chunks; chunk++) {
             u64 num = 1, den = 1;
             u32 hi = min((chunk + 1) * a.max_degree, a.num_routed);
@@ -725,7 +739,7 @@ __global__ void __launch_bounds__(QK_THREADS, QK_MIN_BLOCKS) quotient_kernel(con
                 num = gmul(num, gadd(gadd(w, gmul(beta, gmul(k_is[j], x))), gamma));
                 den = gmul(den, gadd(gadd(w, gmul(beta, p.sigma(j))), gamma));
             }
-            u64 next = chunk < a.num_prods ? p.z(NC + c * a.num_prods + chunk, i) : p.z(c, i_next);
+            u64 next = chunk < a.num_prods ? p.z(NC + c * a.num_prods + chunk, t) : p.z(c, t_next);
             acc.add(m++, gsub(gmul(prev, num), gmul(next, den)));
             prev = next;
         }
@@ -1016,5 +1030,132 @@ extern "C" int plonky2_quotient_launch(const QuotientArgs* args, cudaStream_t st
     const u32 N = 1u << args->lg_lde;
     const u32 threads = QK_THREADS;
     quotient_kernel<<<(N + threads - 1) / threads, threads, 0, stream>>>(*args);
+    return (int)cudaGetLastError();
+}
+
+// ---- Coset LDE in leaf order ------------------------------------------------------------------
+
+// With R = 2^rate_bits and N = R n, the value of a polynomial with coefficients c_k (k < n) at
+// x_i = s w_N^i, i = R m + j, is NTT_n(c_k (s w_N^j)^k)[m]: R size-n NTTs of scaled coefficients
+// instead of one size-N NTT of a zero-padded input. A commitment's leaf r is the point
+// i = bitrev_{lg N}(r) = R bitrev_{lg n}(p) + j for r = bitrev_{rate_bits}(j) n + p, so a
+// decimation-in-frequency NTT (natural input, bit-reversed output) of coset j fills leaf positions
+// bitrev_{rate_bits}(j) n .. + n in order. The output is column-major in leaf order:
+// column c at leaf r is dst[c N + r].
+
+// Host Goldilocks arithmetic for the tables.
+static u64 hmul(u64 a, u64 b) { return (u64)((unsigned __int128)a * b % GL_P); }
+
+// Per (lg_n, rate_bits): scale[j][k] = (s w_N^j)^k for j < R, k < n; tw[k] = w_n^k for k < n / 2.
+struct LdeTables {
+    u64* scale = nullptr;
+    u64* tw = nullptr;
+};
+
+static std::mutex lde_tables_mu;
+static LdeTables lde_tables[LDE_MAX_LG_N + 1][LDE_MAX_RATE_BITS + 1];
+
+__global__ void coset_lde_kernel(u64*, const u64*, const u64*, const u64*, u32, u32);
+
+static int lde_tables_get(u32 lg_n, u32 rate_bits, u64 omega_big, u64 shift, LdeTables* out) {
+    std::lock_guard<std::mutex> g(lde_tables_mu);
+    static bool smem_attr = false;
+    if (!smem_attr) {
+        int e = (int)cudaFuncSetAttribute(coset_lde_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 << LDE_MAX_LG_N);
+        if (e) return e;
+        smem_attr = true;
+    }
+    LdeTables& t = lde_tables[lg_n][rate_bits];
+    if (!t.scale) {
+        const u32 n = 1u << lg_n, R = 1u << rate_bits;
+        std::vector<u64> scale((size_t)R * n), tw(n / 2 > 0 ? n / 2 : 1);
+        u64 sj = shift;  // s w_N^j
+        for (u32 j = 0; j < R; j++) {
+            u64 p = 1;
+            for (u32 k = 0; k < n; k++) {
+                scale[(size_t)j * n + k] = p;
+                p = hmul(p, sj);
+            }
+            sj = hmul(sj, omega_big);
+        }
+        u64 omega_n = omega_big;
+        for (u32 b = 0; b < rate_bits; b++) omega_n = hmul(omega_n, omega_n);
+        u64 p = 1;
+        for (u32 k = 0; k < n / 2; k++) {
+            tw[k] = p;
+            p = hmul(p, omega_n);
+        }
+        LdeTables nt;
+        int e = (int)cudaMalloc(&nt.scale, scale.size() * 8);
+        if (!e) e = (int)cudaMalloc(&nt.tw, tw.size() * 8);
+        if (!e) e = (int)cudaMemcpy(nt.scale, scale.data(), scale.size() * 8, cudaMemcpyHostToDevice);
+        if (!e) e = (int)cudaMemcpy(nt.tw, tw.data(), tw.size() * 8, cudaMemcpyHostToDevice);
+        if (e) {
+            cudaFree(nt.scale);
+            cudaFree(nt.tw);
+            return e;
+        }
+        t = nt;
+    }
+    *out = t;
+    return 0;
+}
+
+// One block per (coset j, column): scale, size-n DIF NTT in shared memory, store.
+__global__ void __launch_bounds__(LDE_THREADS) coset_lde_kernel(u64* dst, const u64* src, const u64* scale,
+                                                               const u64* tw, u32 lg_n, u32 rate_bits) {
+    extern __shared__ u64 x[];
+    const u32 n = 1u << lg_n, j = blockIdx.x, col = blockIdx.y;
+    const u64* c = src + (size_t)col * n;
+    const u64* sc = scale + (size_t)j * n;
+    for (u32 k = threadIdx.x; k < n; k += blockDim.x) x[k] = gmul(gcanon(c[k]), sc[k]);
+    __syncthreads();
+    // Stage with half-size h = n/2 .. 1: (u, v) -> (u + v, (u - v) w_{2h}^lo), w_{2h} = w_n^(n / 2h).
+    for (u32 lg_h = lg_n; lg_h-- > 0;) {
+        const u32 h = 1u << lg_h, shift = lg_n - 1 - lg_h;
+        for (u32 b = threadIdx.x; b < n / 2; b += blockDim.x) {
+            const u32 lo = b & (h - 1);
+            const u32 i = ((b >> lg_h) << (lg_h + 1)) | lo;
+            const u64 u = x[i], v = x[i + h];
+            x[i] = gadd(u, v);
+            x[i + h] = gmul(gsub(u, v), tw[lo << shift]);
+        }
+        __syncthreads();
+    }
+    const u32 jr = rate_bits == 0 ? 0 : __brev(j) >> (32 - rate_bits);
+    u64* out = dst + ((size_t)col << (lg_n + rate_bits)) + (size_t)jr * n;
+    for (u32 p = threadIdx.x; p < n; p += blockDim.x) out[p] = x[p];
+}
+
+// Coset LDE of `cols` canonical coefficient columns (column-major, n each) into `dst` (column-major,
+// leaf order, N each). `omega_big` is the primitive N-th root of unity and `shift` the coset shift.
+extern "C" int plonky2_coset_lde(u64* dst, const u64* src, u32 lg_n, u32 rate_bits, u32 cols, u64 omega_big, u64 shift,
+                                 cudaStream_t stream) {
+    if (lg_n < 1 || lg_n > LDE_MAX_LG_N || rate_bits > LDE_MAX_RATE_BITS) return -1;
+    LdeTables t;
+    int e = lde_tables_get(lg_n, rate_bits, omega_big, shift, &t);
+    if (e) return e;
+    const size_t smem = (size_t)8 << lg_n;
+    coset_lde_kernel<<<dim3(1u << rate_bits, cols), LDE_THREADS, smem, stream>>>(dst, src, t.scale, t.tw, lg_n, rate_bits);
+    return (int)cudaGetLastError();
+}
+
+// Column-major [cols][rows] -> row-major [rows][cols], 32 x 32 tiles.
+__global__ void transpose_kernel(u64* dst, const u64* src, u32 rows, u32 cols) {
+    __shared__ u64 tile[32][33];
+    const u32 r0 = blockIdx.x * 32, c0 = blockIdx.y * 32;
+    for (u32 k = threadIdx.y; k < 32; k += blockDim.y) {
+        const u32 c = c0 + k, r = r0 + threadIdx.x;
+        if (c < cols && r < rows) tile[k][threadIdx.x] = src[(size_t)c * rows + r];
+    }
+    __syncthreads();
+    for (u32 k = threadIdx.y; k < 32; k += blockDim.y) {
+        const u32 r = r0 + k, c = c0 + threadIdx.x;
+        if (c < cols && r < rows) dst[(size_t)r * cols + c] = tile[threadIdx.x][k];
+    }
+}
+
+extern "C" int plonky2_transpose(u64* dst, const u64* src, u32 rows, u32 cols, cudaStream_t stream) {
+    transpose_kernel<<<dim3((rows + 31) / 32, (cols + 31) / 32), dim3(32, 8), 0, stream>>>(dst, src, rows, cols);
     return (int)cudaGetLastError();
 }

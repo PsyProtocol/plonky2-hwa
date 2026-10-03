@@ -120,6 +120,7 @@ struct QuotientArgs {
     off_gate_data: u32,
     num_gates: u32,
     debug_stride: u32,
+    leaf_order: u32,
     debug_point: i32,
 }
 
@@ -540,6 +541,8 @@ fn run<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     }
     let lg_n = common.degree_bits();
     let lg_lde = lg_n + rate_bits;
+    // Layout of every LDE this quotient reads (kept, cached or uploaded now).
+    let leaf_order = super::own_lde(lg_n, rate_bits);
     if lg_lde < 7 || lg_lde > MAX_LG {
         return Err(format!("LDE size 2^{lg_lde}"));
     }
@@ -636,6 +639,7 @@ fn run<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         off_gate_data: off_gate_data as u32,
         num_gates: plan.gates.len() as u32,
         debug_stride: plan.max_constraints.max(1) as u32,
+        leaf_order: leaf_order as u32,
         debug_point: debug_point.map_or(-1, |p| p as i32),
     };
 
@@ -645,7 +649,7 @@ fn run<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     if debug_point.is_none() {
         let kept = super::resident();
         let kept_lde = |i: usize, c: usize| {
-            kept.get(i).filter(|r| r.cols == c && r.lg_rows == lg_lde).map(|r| r.ptr as *const u64)
+            kept.get(i).filter(|r| r.cols == c && r.lg_rows == lg_lde && r.leaf_order == leaf_order).map(|r| r.ptr as *const u64)
         };
         if let (Some(w), Some(z)) = (kept_lde(0, cols[1]), kept_lde(1, cols[2])) {
             if let Some(pin) = ConstPin::get(digest) {
@@ -686,7 +690,7 @@ fn run<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     // The wires and Z LDEs kept by this proof's commitments, when their shapes match.
     let kept = super::resident();
     let kept_lde = |i: usize, cols: usize| {
-        kept.get(i).filter(|r| r.cols == cols && r.lg_rows == lg_lde).map(|r| r.ptr as *const u64)
+        kept.get(i).filter(|r| r.cols == cols && r.lg_rows == lg_lde && r.leaf_order == leaf_order).map(|r| r.ptr as *const u64)
     };
     let wires_lde = kept_lde(0, cols[1]).map_or(Lde::Upload(&wires.polynomials), Lde::Device);
     let zs_lde = kept_lde(1, cols[2]).map_or(Lde::Upload(&zs.polynomials), Lde::Device);
@@ -774,21 +778,7 @@ fn upload_lde<F: RichField>(
     let d_in = d_in.ensure(cols * n)?;
     cuda(unsafe { ffi::cudaMemcpy(d_in, host.as_ptr() as *const c_void, cols * n * 8, ffi::H2D) }, "quotient H2D")?;
     lap("q_h2d");
-    let cfg = ffi::NttConfig {
-        batches: cols as u32,
-        order: ffi::Order::NN,
-        ntt_type: ffi::NttType::Standard,
-        extension_rate_bits: rate_bits as u32,
-        are_inputs_on_device: true,
-        are_outputs_on_device: true,
-        with_coset: true,
-        is_multi_gpu: false,
-        salt_size: 0,
-    };
-    range("gpu:quotient_lde", || {
-        zeknox(unsafe { ffi::compute_batched_lde(0, dst, d_in, lg_n as u32, ffi::Direction::Forward, cfg) }, "quotient lde")
-    })?;
-    sync("quotient lde")?;
+    range("gpu:quotient_lde", || super::coset_lde(dst, d_in, lg_n, rate_bits, cols))?;
     lap("q_lde");
     Ok(())
 }
