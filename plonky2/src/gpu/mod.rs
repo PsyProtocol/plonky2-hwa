@@ -445,6 +445,7 @@ struct ExtraLanes {
 
 static EXTRA_LANES: Mutex<ExtraLanes> = Mutex::new(ExtraLanes { free: Vec::new(), created: 0 });
 static LANE_FREED: Condvar = Condvar::new();
+static EXTRA_LANE_COMMITS: AtomicU64 = AtomicU64::new(0);
 
 /// A lane held by one commitment.
 enum HeldLane {
@@ -481,12 +482,17 @@ fn acquire_lane(b: &'static Backend, large: bool) -> HeldLane {
     loop {
         {
             let mut x = EXTRA_LANES.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(l) = x.free.pop() {
+            let lane = match x.free.pop() {
+                Some(l) => Some(l),
+                None if x.created < lanes - 1 => {
+                    x.created += 1;
+                    Some(Lane::empty())
+                }
+                None => None,
+            };
+            if let Some(l) = lane {
+                EXTRA_LANE_COMMITS.fetch_add(1, Ordering::Relaxed);
                 return HeldLane::Extra(Some(l));
-            }
-            if x.created < lanes - 1 {
-                x.created += 1;
-                return HeldLane::Extra(Some(Lane::empty()));
             }
         }
         match b.state.try_lock() {
@@ -978,6 +984,10 @@ pub struct GpuStats {
     pub pp_gpu: u64,
     /// Opening sets computed on the GPU (PLONKY2_GPU_OPEN=1).
     pub open_gpu: u64,
+    /// Commitments that ran on a lane other than lane 0, and the extra lanes created
+    /// (PLONKY2_GPU_COMMIT_LANES).
+    pub extra_lane_commits: u64,
+    pub extra_lanes: u64,
 }
 
 pub fn stats() -> GpuStats {
@@ -1029,6 +1039,8 @@ pub fn stats() -> GpuStats {
         device_leaf_commits: DEVICE_LEAF_COMMITS.load(Ordering::Relaxed),
         pp_gpu: perm::pp_count(),
         open_gpu: open::open_count(),
+        extra_lane_commits: EXTRA_LANE_COMMITS.load(Ordering::Relaxed),
+        extra_lanes: EXTRA_LANES.lock().unwrap_or_else(|e| e.into_inner()).created as u64,
     }
 }
 
