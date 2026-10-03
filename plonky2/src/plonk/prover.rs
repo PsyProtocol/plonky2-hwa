@@ -125,6 +125,8 @@ where
     C::Hasher: Hasher<F>,
     C::InnerHasher: Hasher<F>,
 {
+    // Large circuits wait for a slot before generating their witness (PLONKY2_LARGE_PROOF_SLOTS).
+    let _large_slot = crate::util::proof_gate::acquire(common_data.degree_bits());
     let generators_start = crate::util::stage_log::generators_start();
     let partition_witness = timed!(
         timing,
@@ -150,6 +152,8 @@ where
     C::Hasher: Hasher<F>,
     C::InnerHasher: Hasher<F>,
 {
+    // Held already when called from `prove`; otherwise wait here (PLONKY2_LARGE_PROOF_SLOTS).
+    let _large_slot = crate::util::proof_gate::acquire(common_data.degree_bits());
     let has_lookup = !common_data.luts.is_empty();
     let config = &common_data.config;
     let num_challenges = config.num_challenges;
@@ -165,6 +169,7 @@ where
         crate::plonk::config::GenericHashOut::to_vec(&prover_data.circuit_digest)[0]
             .to_canonical_u64(),
     );
+    crate::util::stage_log::detail("large_proof_wait", crate::util::proof_gate::take_wait());
     set_lookup_wires(prover_data, common_data, &mut partition_witness)?;
 
     let public_inputs = partition_witness.get_targets(&prover_data.public_inputs);
