@@ -121,6 +121,7 @@ fn device_search(
     unsafe { *h_best = u64::MAX };
     cuda(unsafe { ffi::cudaMemcpyAsync(d_best, h_best as *const c_void, 8, ffi::H2D, stream) }, "pow init")?;
     for batch in 0..MAX_BATCHES {
+        super::ktime::start(stream);
         let args = PowArgs {
             state: *state,
             base: batch * BATCH as u64,
@@ -131,8 +132,10 @@ fn device_search(
             count: BATCH,
         };
         cuda(unsafe { plonky2_pow_launch(&args, stream) }, "pow launch")?;
+        super::ktime::lap(stream, "pow.batch");
         cuda(unsafe { ffi::cudaMemcpyAsync(h_best as *mut c_void, d_best, 8, ffi::D2H, stream) }, "pow result")?;
         cuda(unsafe { ffi::cudaStreamSynchronize(stream) }, "pow sync")?;
+        super::ktime::collect();
         let best = unsafe { *h_best };
         if best != u64::MAX {
             return Ok(Some(best));

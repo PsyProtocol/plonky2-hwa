@@ -258,7 +258,9 @@ impl PpCtx {
         let up = wire_len + num_routed;
         let total = up + 2 * num_chunks * n + 2 * n + 2 * blocks + out_cols * n;
         let base = self.d.ensure(total)? as *mut u64;
+        super::ktime::start(stream);
         cuda(unsafe { ffi::cudaMemcpyAsync(base as *mut c_void, host.as_ptr() as *const c_void, up * 8, ffi::H2D, stream) }, "partial products H2D")?;
+        super::ktime::lap(stream, "pp.h2d");
         let at = |off: usize| unsafe { base.add(off) };
         let args = PpArgs {
             wires: wires_dev.unwrap_or(at(0)),
@@ -278,9 +280,12 @@ impl PpCtx {
             num_prods: num_prods as u32,
         };
         cuda(unsafe { plonky2_partial_products(&args, stream) }, "partial products launch")?;
+        super::ktime::lap(stream, "pp.kernel");
         let out = self.out.ensure(out_cols * n)?;
         cuda(unsafe { ffi::cudaMemcpyAsync(out.as_mut_ptr() as *mut c_void, args.out as *const c_void, out_cols * n * 8, ffi::D2H, stream) }, "partial products D2H")?;
+        super::ktime::lap(stream, "pp.d2h");
         cuda(unsafe { ffi::cudaStreamSynchronize(stream) }, "partial products sync")?;
+        super::ktime::collect();
         Ok(out[..out_cols * n].to_vec())
     }
 }

@@ -39,6 +39,7 @@ use crate::plonk::config::Hasher;
 use crate::util::stage_log;
 
 pub(crate) mod fri;
+pub(crate) mod ktime;
 mod leaf_pool;
 pub(crate) mod open;
 pub(crate) mod perm;
@@ -1079,6 +1080,9 @@ fn backend() -> Option<&'static Backend> {
                         std::thread::spawn(move || loop {
                             std::thread::sleep(std::time::Duration::from_secs(secs));
                             log::info!("plonky2 GPU stats {:?}", stats());
+                            if ktime::enabled() {
+                                log::info!("plonky2 GPU ktime {}", ktime::summary());
+                            }
                         });
                     }
                     log::info!(
@@ -1518,8 +1522,15 @@ fn run<F: RichField>(
         }
     }
     let mut idle = Idle([lane.stream, lane.copy_stream], false);
+    // Device time per phase (lab): only our kernels run on the lane's stream.
+    let big = cols * rows * 8 > LANE_BIG_BYTES;
+    let ph = |small: &'static str, large: &'static str| if big { large } else { small };
+    if leaf_order && own_merkle {
+        ktime::start(stream);
+    }
     // From pinned staging, ordered on the lane's stream.
     range("gpu:h2d", || cuda(unsafe { ffi::cudaMemcpyAsync(d_up, input.as_ptr() as *const c_void, cols * n * 8, ffi::H2D, stream) }, "H2D"))?;
+    ktime::lap(stream, ph("c.h2d", "c.h2d.L"));
     if values_in {
         use plonky2_field::types::{Field, PrimeField64};
         let omega_n = GoldilocksField::primitive_root_of_unity(lg_n).to_canonical_u64();
@@ -1529,14 +1540,17 @@ fn run<F: RichField>(
                 "intt",
             )
         })?;
+        ktime::lap(stream, ph("c.intt", "c.intt.L"));
     }
 
     range("gpu:lde", || coset_lde_on(d_lde, d_in, lg_n, rate_bits, cols, stream))?;
+    ktime::lap(stream, ph("c.lde", "c.lde.L"));
     if let Some(host) = coeffs_host {
         // Into pinned staging after the interpolation, ordered on the lane's stream.
         range("gpu:d2h_coeffs", || {
             cuda(unsafe { ffi::cudaMemcpyAsync(host as *mut c_void, d_in, cols * n * 8, ffi::D2H, stream) }, "D2H coefficients")
         })?;
+        ktime::lap(stream, ph("c.d2h_coef", "c.d2h_coef.L"));
     }
     if device_leaves {
         // The tree hashes the column-major LDE; no row-major copy is needed.
@@ -1547,6 +1561,7 @@ fn run<F: RichField>(
             // The overlapped leaf download (copy stream) starts after the transpose.
             cuda(unsafe { ffi::cudaEventRecord(event, stream) }, "transpose event")
         })?;
+        ktime::lap(stream, ph("c.transpose", "c.transpose.L"));
     } else {
         // zeknox's transpose synchronises internally, so the submit range includes the kernel
         // time; the separate sync range then only catches what is left.
@@ -1585,6 +1600,7 @@ fn run<F: RichField>(
                 "merkle (columns)",
             )
         })?;
+        ktime::lap(stream, ph("c.merkle_cols", "c.merkle_cols.L"));
     } else if own_merkle {
         // Digests straight into plonky2's layout (cuda/quotient.cu); needs the Poseidon constants.
         quotient::init_once()?;
@@ -1596,6 +1612,7 @@ fn run<F: RichField>(
                 "merkle",
             )
         })?;
+        ktime::lap(stream, ph("c.merkle", "c.merkle.L"));
     } else {
         // zeknox's Merkle runs on the legacy stream: the leaves must be complete first.
         stream_sync(stream, "before merkle")?;
@@ -1630,10 +1647,12 @@ fn run<F: RichField>(
             }
             cuda(unsafe { ffi::cudaMemcpyAsync(cp.as_mut_ptr() as *mut c_void, d_cap, caps * HASH_U64 * 8, ffi::D2H, stream) }, "D2H cap")
         })?;
+        ktime::lap(stream, ph("c.d2h", "c.d2h.L"));
         range("gpu:merkle+d2h:sync", || {
             stream_sync(stream, "download")?;
             stream_sync(copy_stream, "leaf download")
         })?;
+        ktime::collect();
         idle.1 = true;
         return Ok(finish(kept_guard, values_guard, capture_role, cols, lg_n, lg_rows, leaf_order, device_leaves, num_digests, caps, rows, t, owned));
     }

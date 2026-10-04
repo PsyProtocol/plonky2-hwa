@@ -209,14 +209,19 @@ fn ctx_run(ctx: &mut OpenCtx, args: &mut OpenArgs, cols: &[u64], pts: &[u32], n:
     unsafe { core::ptr::copy_nonoverlapping(pts.as_ptr(), host[terms..].as_mut_ptr() as *mut u32, terms) };
     let up = terms + pts_u64;
     let base = ctx.d.ensure(up + 4 * n + 2 * terms)? as *mut u64;
+    super::ktime::start(stream);
     cuda(unsafe { ffi::cudaMemcpyAsync(base as *mut c_void, host.as_ptr() as *const c_void, up * 8, ffi::H2D, stream) }, "openings H2D")?;
+    super::ktime::lap(stream, "open.h2d");
     args.cols = base as *const *const u64;
     args.point = unsafe { base.add(terms) } as *const u32;
     args.weights = unsafe { base.add(up) };
     args.out = unsafe { base.add(up + 4 * n) };
     cuda(unsafe { plonky2_openings(args, stream) }, "openings launch")?;
+    super::ktime::lap(stream, "open.kernel");
     let out = ctx.out.ensure(2 * terms)?;
     cuda(unsafe { ffi::cudaMemcpyAsync(out.as_mut_ptr() as *mut c_void, args.out as *const c_void, 2 * terms * 8, ffi::D2H, stream) }, "openings D2H")?;
+    super::ktime::lap(stream, "open.d2h");
     cuda(unsafe { ffi::cudaStreamSynchronize(stream) }, "openings sync")?;
+    super::ktime::collect();
     Ok(out[..2 * terms].to_vec())
 }

@@ -385,13 +385,17 @@ fn ctx_run(
     host[cols.len()..len].copy_from_slice(coef);
     let d_terms = ctx.d_terms.ensure(len)?;
     let d_out = ctx.d_out.ensure(2 * big_n)?;
+    super::ktime::start(stream);
     cuda(unsafe { ffi::cudaMemcpyAsync(d_terms, host.as_ptr() as *const c_void, len * 8, ffi::H2D, stream) }, "fri terms")?;
+    super::ktime::lap(stream, "fri.h2d");
     args.cols = d_terms as *const *const u64;
     args.coef = unsafe { (d_terms as *const u64).add(cols.len()) };
     args.out = d_out as *mut u64;
     cuda(unsafe { plonky2_fri_values_launch(args, stream) }, "fri kernel launch")?;
+    super::ktime::lap(stream, "fri.values");
     let out = ctx.out.ensure(2 * big_n)?;
     cuda(unsafe { ffi::cudaMemcpyAsync(out.as_mut_ptr() as *mut c_void, d_out, 2 * big_n * 8, ffi::D2H, stream) }, "fri D2H")?;
+    super::ktime::lap(stream, "fri.d2h");
     let mut dig_len = 0;
     if let Some((lg_rows, row_len, cap_height)) = tree {
         // Rows of `row_len` elements are consecutive in the leaf-order output.
@@ -405,10 +409,13 @@ fn ctx_run(
             unsafe { plonky2_merkle(d_dig, d_cap, d_out as *const u64, lg_rows as u32, row_len as u32, cap_height as u32, stream) },
             "fri merkle",
         )?;
+        super::ktime::lap(stream, "fri.merkle");
         let h_dig = ctx.digests.ensure(dig_len)?;
         cuda(unsafe { ffi::cudaMemcpyAsync(h_dig.as_mut_ptr() as *mut c_void, d_dig as *const c_void, dig_len * 8, ffi::D2H, stream) }, "fri digests D2H")?;
+        super::ktime::lap(stream, "fri.d2h_digests");
     }
     cuda(unsafe { ffi::cudaStreamSynchronize(stream) }, "fri sync")?;
+    super::ktime::collect();
     let digests = if dig_len > 0 { ctx.digests.as_slice()[..dig_len].to_vec() } else { Vec::new() };
     Ok((out[..2 * big_n].to_vec(), digests))
 }

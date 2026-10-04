@@ -1019,8 +1019,12 @@ fn device_run<F: RichField>(
     args.out = d_out as *mut u64;
     args.debug = d_debug as *mut u64;
     range("gpu:quotient_kernel", || -> GpuResult<()> {
+        super::ktime::start(core::ptr::null_mut());
         cuda(unsafe { plonky2_quotient_launch(args, core::ptr::null_mut()) }, "quotient kernel launch")?;
-        sync("quotient kernel")
+        super::ktime::lap(core::ptr::null_mut(), "qL.kernel");
+        sync("quotient kernel")?;
+        super::ktime::collect();
+        Ok(())
     })?;
     lap("q_kernel");
     let (src, len) = if args.debug_point >= 0 { (d_debug, debug_len) } else { (d_out, NC * big_n) };
@@ -1141,17 +1145,25 @@ fn ctx_run(ctx: &mut QCtx, args: &mut QuotientArgs, aux: &[u64], gates: &[GateDe
     args.gates = d_gates as *const GateDesc;
     args.out = d_out as *mut u64;
     args.debug = core::ptr::null_mut();
+    let big = args.lg_lde >= 18;
+    let ph = |small: &'static str, large: &'static str| if big { large } else { small };
+    super::ktime::start(stream);
     cuda(unsafe { plonky2_quotient_launch(args, stream) }, "quotient kernel launch")?;
+    super::ktime::lap(stream, ph("q.kernel", "q.kernel.L"));
     let want_coeffs = coeffs_wanted(args.lg_lde as usize);
     let len = NC * big_n;
     let out = ctx.out.ensure(len * if want_coeffs { 2 } else { 1 })?;
     cuda(unsafe { ffi::cudaMemcpyAsync(out.as_mut_ptr() as *mut c_void, d_out, len * 8, ffi::D2H, stream) }, "quotient D2H")?;
+    super::ktime::lap(stream, ph("q.d2h", "q.d2h.L"));
     if want_coeffs {
         let d_coef = ctx.d_coef.ensure(len)?;
         coset_coeffs(d_coef, d_out, args.lg_lde as usize, stream)?;
+        super::ktime::lap(stream, ph("q.coset_intt", "q.coset_intt.L"));
         cuda(unsafe { ffi::cudaMemcpyAsync(out[len..].as_mut_ptr() as *mut c_void, d_coef, len * 8, ffi::D2H, stream) }, "quotient coefficients D2H")?;
+        super::ktime::lap(stream, ph("q.d2h_coef", "q.d2h_coef.L"));
     }
     cuda(unsafe { ffi::cudaStreamSynchronize(stream) }, "quotient sync")?;
+    super::ktime::collect();
     Ok(out.to_vec())
 }
 
