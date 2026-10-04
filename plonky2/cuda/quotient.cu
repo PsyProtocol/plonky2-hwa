@@ -803,16 +803,68 @@ __device__ __forceinline__ u64 reduce160(const Acc160& a) {
     return t2 >= GL_P ? t2 - GL_P : t2;
 }
 
+// ---- Non-canonical arithmetic for the permutation ---------------------------------------------
+// Inside `poseidon_permute` values are any u64 congruent mod p (as plonky2's CPU field keeps
+// them); the state is canonicalised once at the end. Each helper accepts any u64 inputs.
+
+__device__ __forceinline__ u64 gcanon64(u64 x) { return x >= GL_P ? x - GL_P : x; }
+
+// lo + hi 2^64 mod p, any 128-bit value (plonky2's reduce128), not canonicalised.
+__device__ __forceinline__ u64 reduce128_nc(u64 lo, u64 hi) {
+    u64 hi_hi = hi >> 32, hi_lo = hi & GL_EPS;
+    u64 t0 = lo - hi_hi;
+    if (lo < hi_hi) t0 -= GL_EPS;
+    u64 t1 = (hi_lo << 32) - hi_lo;  // hi_lo EPS
+    u64 t2 = t0 + t1;
+    if (t2 < t0) t2 += GL_EPS;
+    return t2;
+}
+
+__device__ __forceinline__ u64 gmul_nc(u64 a, u64 b) { return reduce128_nc(a * b, __umul64hi(a, b)); }
+
+// a b + c mod p in one reduction.
+__device__ __forceinline__ u64 gmuladd_nc(u64 a, u64 b, u64 c) {
+    u64 lo = a * b, hi = __umul64hi(a, b);
+    u64 l2 = lo + c;
+    hi += l2 < lo;
+    return reduce128_nc(l2, hi);
+}
+
+__device__ __forceinline__ u64 gadd_nc(u64 a, u64 b) {
+    u64 s = a + b;
+    if (s < a) {  // + 2^64 = + EPS, which can carry once more
+        u64 t = s + GL_EPS;
+        s = t < s ? t + GL_EPS : t;
+    }
+    return s;
+}
+
+__device__ __forceinline__ u64 gsbox_nc(u64 x) {  // x^7
+    u64 x2 = gmul_nc(x, x);
+    u64 x3 = gmul_nc(x2, x);
+    u64 x4 = gmul_nc(x2, x2);
+    return gmul_nc(x3, x4);
+}
+
+// reduce160 without the final canonicalisation.
+__device__ __forceinline__ u64 reduce160_nc(const Acc160& a) {
+    u64 h = (u64)a.hi * GL_EPS;  // hi < 2^32
+    u64 t = a.mid + h;
+    if (t < h) t += GL_EPS;
+    return reduce128_nc(a.lo, t);
+}
+
 // plonky2's Goldilocks Poseidon MDS matrix (MDS_MATRIX_CIRC; MDS_MATRIX_DIAG is MDS_DIAG0 at index
 // 0 and zero elsewhere), compiled in so the products become 32-bit multiplications by immediates.
 // `plonky2_quotient_init` rejects constants that disagree.
 #define MDS_CIRC_VALUES {17, 15, 41, 16, 2, 28, 13, 13, 39, 18, 34, 20}
 #define MDS_DIAG0 8u
 
-// Row ROW of the MDS layer: each element split into 32-bit halves, the products by the small
-// entries summed per half (both below 2^42), combined and reduced once.
+// Row ROW of the MDS layer for any u64 inputs, not canonicalised: each element split into 32-bit
+// halves (below 2^32), the products by the small entries summed per half (both below 2^42),
+// combined and reduced once.
 template <u32 ROW>
-__device__ __forceinline__ u64 mds_row(const u64* s) {
+__device__ __forceinline__ u64 mds_row_nc(const u64* s) {
     constexpr u32 C[SPONGE_WIDTH] = MDS_CIRC_VALUES;
     u64 lo_sum = 0, hi_sum = 0;
 #pragma unroll
@@ -827,31 +879,32 @@ __device__ __forceinline__ u64 mds_row(const u64* s) {
     const u64 h = (hi << 32) - hi;                  // hi 2^64 = hi EPS (mod p)
     u64 r = lo + h;
     if (r < h) r += GL_EPS;
-    return r >= GL_P ? r - GL_P : r;
+    return r;
 }
 
 template <u32 ROW>
-__device__ __forceinline__ void mds_rows(const u64* s, u64* t) {
-    t[ROW] = mds_row<ROW>(s);
-    if constexpr (ROW + 1 < SPONGE_WIDTH) mds_rows<ROW + 1>(s, t);
+__device__ __forceinline__ void mds_rows_nc(const u64* s, u64* t) {
+    t[ROW] = mds_row_nc<ROW>(s);
+    if constexpr (ROW + 1 < SPONGE_WIDTH) mds_rows_nc<ROW + 1>(s, t);
 }
 
 // `Poseidon::poseidon`: full rounds, fast partial rounds, full rounds. Same values as plonky2;
-// sums of products are accumulated wide and reduced once.
+// sums of products are accumulated wide and reduced once, intermediate values are left
+// non-canonical and the state is canonicalised at the end.
 __device__ void poseidon_permute(u64* st) {
     u32 round_ctr = 0;
 #pragma unroll
     for (u32 r = 0; r < HALF_N_FULL_ROUNDS; r++) {
 #pragma unroll
-        for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = gsbox(gadd(st[k], c_pos[POS_RC + k + SPONGE_WIDTH * round_ctr]));
+        for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = gsbox_nc(gadd_nc(st[k], c_pos[POS_RC + k + SPONGE_WIDTH * round_ctr]));
         u64 t[SPONGE_WIDTH];
-        mds_rows<0>(st, t);
+        mds_rows_nc<0>(st, t);
 #pragma unroll
         for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = t[k];
         round_ctr++;
     }
 #pragma unroll
-    for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = gadd(st[k], c_pos[POS_FIRST + k]);
+    for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = gadd_nc(st[k], c_pos[POS_FIRST + k]);
     {
         u64 r0[SPONGE_WIDTH];
         r0[0] = st[0];
@@ -860,7 +913,7 @@ __device__ void poseidon_permute(u64* st) {
             Acc160 a{0, 0, 0};
 #pragma unroll
             for (u32 r = 1; r < SPONGE_WIDTH; r++) acc_mul(a, st[r], c_pos[POS_INIT + (r - 1) * 11 + (c - 1)]);
-            r0[c] = reduce160(a);
+            r0[c] = reduce160_nc(a);
         }
 #pragma unroll
         for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = r0[k];
@@ -869,27 +922,29 @@ __device__ void poseidon_permute(u64* st) {
     const u64 mds0to0 = C[0] + MDS_DIAG0;
 #pragma unroll
     for (u32 r = 0; r < N_PARTIAL_ROUNDS; r++) {
-        st[0] = gadd(gsbox(st[0]), c_pos[POS_FAST_RC + r]);
+        st[0] = gadd_nc(gsbox_nc(st[0]), c_pos[POS_FAST_RC + r]);
         Acc160 a{0, 0, 0};
         acc_mul(a, st[0], mds0to0);
 #pragma unroll
         for (u32 k = 1; k < SPONGE_WIDTH; k++) acc_mul(a, st[k], c_pos[POS_WHATS + r * 11 + (k - 1)]);
         u64 s0 = st[0];
-        st[0] = reduce160(a);
+        st[0] = reduce160_nc(a);
 #pragma unroll
-        for (u32 k = 1; k < SPONGE_WIDTH; k++) st[k] = gadd(gmul(s0, c_pos[POS_VS + r * 11 + (k - 1)]), st[k]);
+        for (u32 k = 1; k < SPONGE_WIDTH; k++) st[k] = gmuladd_nc(s0, c_pos[POS_VS + r * 11 + (k - 1)], st[k]);
     }
     round_ctr += N_PARTIAL_ROUNDS;
 #pragma unroll
     for (u32 r = 0; r < HALF_N_FULL_ROUNDS; r++) {
 #pragma unroll
-        for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = gsbox(gadd(st[k], c_pos[POS_RC + k + SPONGE_WIDTH * round_ctr]));
+        for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = gsbox_nc(gadd_nc(st[k], c_pos[POS_RC + k + SPONGE_WIDTH * round_ctr]));
         u64 t[SPONGE_WIDTH];
-        mds_rows<0>(st, t);
+        mds_rows_nc<0>(st, t);
 #pragma unroll
         for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = t[k];
         round_ctr++;
     }
+#pragma unroll
+    for (u32 k = 0; k < SPONGE_WIDTH; k++) st[k] = gcanon64(st[k]);
 }
 
 // ---- Merkle trees in plonky2's layout ---------------------------------------------------------
