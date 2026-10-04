@@ -3,7 +3,7 @@
 //! `pow_kernel` (in `cuda/quotient.cu`, which holds the device Poseidon constants) tries a batch of
 //! consecutive candidates per launch and keeps the smallest accepting one, so the result equals
 //! the CPU's ordered search (`find_first`). Batches continue from where the previous one ended;
-//! after `MAX_BATCHES` without a hit, or after a device error, the CPU searches instead.
+//! after `MAX_CANDIDATES` without a hit, or after a device error, the CPU searches instead.
 //!
 //! The search does not take the GPU lock: each search borrows a context (its own non-blocking
 //! stream, a device word and a pinned host word) from a small pool, so it runs alongside the
@@ -28,9 +28,20 @@ extern "C" {
     fn plonky2_poseidon_permute_states(states: *mut u64, n: u32) -> i32;
 }
 
-/// Candidates per launch: 2^16 is the expected number of tries at 16 PoW bits.
-const BATCH: u32 = 1 << 16;
-const MAX_BATCHES: u64 = 1 << 10;
+/// Candidates per launch, 2^`PLONKY2_GPU_POW_BATCH_LOG` (default 16, the expected number of tries
+/// at 16 PoW bits; 10..=20). Batches go in order and each keeps its smallest hit, so the result is
+/// the smallest accepting candidate whatever the size; smaller batches waste fewer permutations
+/// past the first hit and synchronise more often.
+fn batch() -> u32 {
+    static V: OnceLock<u32> = OnceLock::new();
+    *V.get_or_init(|| {
+        let lg = std::env::var("PLONKY2_GPU_POW_BATCH_LOG").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(16);
+        1 << lg.clamp(10, 20)
+    })
+}
+
+/// Candidates searched on the GPU before the CPU takes over.
+const MAX_CANDIDATES: u64 = 1 << 26;
 
 static POW_FAILED: AtomicBool = AtomicBool::new(false);
 static POW_GPU: AtomicU64 = AtomicU64::new(0);
@@ -120,16 +131,17 @@ fn device_search(
     let d_best = ctx.d_best as *mut c_void;
     unsafe { *h_best = u64::MAX };
     cuda(unsafe { ffi::cudaMemcpyAsync(d_best, h_best as *const c_void, 8, ffi::H2D, stream) }, "pow init")?;
-    for batch in 0..MAX_BATCHES {
+    let size = batch();
+    for batch in 0..MAX_CANDIDATES / size as u64 {
         super::ktime::start(stream);
         let args = PowArgs {
             state: *state,
-            base: batch * BATCH as u64,
+            base: batch * size as u64,
             best: d_best as *mut u64,
             pos: pos as u32,
             response: response as u32,
             min_leading_zeros,
-            count: BATCH,
+            count: size,
         };
         cuda(unsafe { plonky2_pow_launch(&args, stream) }, "pow launch")?;
         super::ktime::lap(stream, "pow.batch");
