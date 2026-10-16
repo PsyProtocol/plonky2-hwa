@@ -46,7 +46,7 @@ mod imp {
     }
 
     /// Holds a slot of its gate until dropped.
-    pub struct LargeProofSlot(Option<&'static Gate>);
+    pub struct LargeProofSlot(Option<&'static Gate>, Option<crate::util::observation::Span>);
 
     impl core::fmt::Debug for LargeProofSlot {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -60,6 +60,7 @@ mod imp {
                 HELD.with(|h| h.set(false));
                 *g.in_use.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
                 g.freed.notify_one();
+                self.1.take(); // Record release only after the permit was returned.
             }
         }
     }
@@ -72,9 +73,10 @@ mod imp {
 
     fn acquire_with(gate: &'static Gate, n: usize, min_bits: usize, degree_bits: usize) -> (LargeProofSlot, f64) {
         if n == 0 || degree_bits < min_bits || HELD.with(|h| h.get()) {
-            return (LargeProofSlot(None), 0.0);
+            return (LargeProofSlot(None, None), 0.0);
         }
         let start = Instant::now();
+        let observation_wait = crate::util::observation::enter(crate::util::observation::Phase::LargeProofWait);
         let mut in_use = gate.in_use.lock().unwrap_or_else(|e| e.into_inner());
         while *in_use >= n {
             in_use = gate.freed.wait(in_use).unwrap_or_else(|e| e.into_inner());
@@ -82,9 +84,13 @@ mod imp {
         *in_use += 1;
         drop(in_use);
         HELD.with(|h| h.set(true));
+        // Own the permit before any user-supplied hook or guard destructor runs.
+        let mut slot = LargeProofSlot(Some(gate), None);
         let waited = start.elapsed().as_secs_f64();
         WAITED.with(|w| w.set(waited));
-        (LargeProofSlot(Some(gate)), waited)
+        drop(observation_wait);
+        slot.1 = Some(crate::util::observation::enter(crate::util::observation::Phase::LargeProofHeld));
+        (slot, waited)
     }
 
     #[cfg(test)]
@@ -97,6 +103,32 @@ mod imp {
         // Gates of their own, so proofs of other tests running in parallel do not count.
         static G1: Gate = Gate { in_use: Mutex::new(0), freed: Condvar::new() };
         static G2: Gate = Gate { in_use: Mutex::new(0), freed: Condvar::new() };
+
+        #[test]
+        fn hook_panic_returns_permit_and_clears_thread_state() {
+            use crate::util::observation::{with_hook, Hook, Phase};
+            static G3: Gate = Gate { in_use: Mutex::new(0), freed: Condvar::new() };
+            struct End(bool);
+            impl Drop for End {
+                fn drop(&mut self) { if self.0 { panic!("wait span destructor fixture"); } }
+            }
+            for fail_wait_drop in [false, true] {
+                let hook: Hook = Arc::new(move |phase| {
+                    if !fail_wait_drop && phase == Phase::LargeProofHeld { panic!("held callback fixture"); }
+                    Box::new(End(fail_wait_drop && phase == Phase::LargeProofWait))
+                });
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    with_hook(hook, || { let _slot = acquire_with(&G3, 1, 16, 17); });
+                }));
+                assert!(result.is_err());
+                assert_eq!(*G3.in_use.lock().unwrap(), 0);
+                assert!(!HELD.with(|h| h.get()));
+                let (slot, _) = acquire_with(&G3, 1, 16, 17);
+                assert!(slot.0.is_some());
+                drop(slot);
+                assert_eq!(*G3.in_use.lock().unwrap(), 0);
+            }
+        }
 
         #[test]
         fn small_circuits_and_nested_calls_do_not_wait() {

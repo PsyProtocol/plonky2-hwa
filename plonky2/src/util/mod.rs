@@ -13,6 +13,7 @@ use crate::field::types::Field;
 pub(crate) mod context_tree;
 pub(crate) mod partial_products;
 pub mod proof_gate;
+pub mod observation;
 pub mod reducing;
 pub mod serialization;
 pub mod stage_log;

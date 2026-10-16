@@ -67,6 +67,9 @@ mod imp {
     /// NVTX range only (no stage-log accounting); a no-op without the `cuda` feature.
     #[inline]
     pub fn range<R>(name: &'static str, f: impl FnOnce() -> R) -> R {
+        // CUDA range installs the same hook; avoid entering it twice.
+        #[cfg(not(feature = "cuda"))]
+        let _observation = crate::util::observation::enter_named(name);
         #[cfg(feature = "cuda")]
         {
             crate::gpu::range(name, f)

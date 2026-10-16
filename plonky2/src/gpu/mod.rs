@@ -256,6 +256,7 @@ pub fn nvtx_enabled() -> bool {
 
 /// Runs `f` inside an NVTX range named `name` when NVTX is enabled.
 pub fn range<R>(name: &'static str, f: impl FnOnce() -> R) -> R {
+    let _observation = crate::util::observation::enter_named(name);
     if !nvtx_enabled() {
         return f();
     }
@@ -1290,8 +1291,12 @@ fn commit_columns<F: RichField, H: Hasher<F>>(
     // download into the claimed set, all on the lane's streams.
     let large = cols * (n << rate_bits) * 8 > LANE_BIG_BYTES || !own_lde(lg_n, rate_bits) || zeknox_merkle();
     let wait = Instant::now();
+    // Declare observation first so the lane is released before its end event
+    // on unwind as well as on the explicit normal-return path below.
+    let mut lane_hold = None;
     let mut held = range("gpu:lock_wait", || acquire_lane(b, large));
     let lock_wait = wait.elapsed().as_secs_f64();
+    lane_hold.insert(crate::util::observation::enter(crate::util::observation::Phase::GpuLaneHeld));
     let mut result = range("gpu:device", || {
         run(held.lane(), out.set.as_mut().expect("claimed"), &mut kept, pre_canon, lease_ptr, columns, values_in, lg_n, rate_bits, cap_height, capture_role)
     });
@@ -1310,6 +1315,7 @@ fn commit_columns<F: RichField, H: Hasher<F>>(
     }
     // 3. Device work is complete (the lane's streams synchronised); the set is ours alone.
     drop(held);
+    drop(lane_hold);
 
     match result {
         Ok((leaves_flat_len, digests_len, cap_len, exec_s, device)) => {
