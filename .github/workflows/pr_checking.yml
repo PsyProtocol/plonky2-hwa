@@ -12,45 +12,30 @@ jobs:
     name: Validate PR
     runs-on: ubuntu-latest
     steps:
-      - name: Set up keywords
-        id: setup_keywords
-        run: echo "RESTRICTED_KEYWORDS=$(echo '${{ secrets.RESTRICTED_KEYWORDS }}' | jq -r '.[]' | tr '\n' ' ')" >> $GITHUB_ENV
-
       - name: Check for spam PR
         id: check
+        env:
+          RESTRICTED_KEYWORDS_JSON: ${{ secrets.RESTRICTED_KEYWORDS }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          # Initialize variables to track spam presence
-          title_is_spam=false
-          description_is_spam=false
-          
-          # Check title for spam
-          for keyword in $RESTRICTED_KEYWORDS; do
-            if echo "${{ github.event.pull_request.title }}" | grep -i -q "$keyword"; then
-              title_is_spam=true
-              break
-            fi
-          done
+          python3 - <<'PY'
+          import json
+          import os
 
-          # Check description for spam
-          for keyword in $RESTRICTED_KEYWORDS; do
-            if echo "${{ github.event.pull_request.body }}" | grep -i -q "$keyword"; then
-              description_is_spam=true
-              break
-            fi
-          done
-
-          # Set the output based on the presence of spam
-          if [ "$title_is_spam" = true ] || [ "$description_is_spam" = true ]; then
-            echo "is_spam=true" >> $GITHUB_ENV
-          else
-            echo "is_spam=false" >> $GITHUB_ENV
-          fi
-
-      - name: Checkout repository
-        uses: actions/checkout@v4
+          keywords = json.loads(os.environ.get("RESTRICTED_KEYWORDS_JSON") or "[]")
+          if not isinstance(keywords, list) or not all(isinstance(word, str) for word in keywords):
+              raise ValueError("Restricted keywords must be a JSON array of strings")
+          content = (os.environ.get("PR_TITLE", "") + "\n" + os.environ.get("PR_BODY", "")).casefold()
+          is_spam = any(word and word.casefold() in content for word in keywords)
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+              output.write(f"is_spam={str(is_spam).lower()}\n")
+          PY
 
       - name: Close PR if spam are found and author is not a contributor or member
         if: ${{ env.is_spam == 'true' && github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR' }}
-        run: gh pr close ${{ github.event.pull_request.number }} --comment "Spam detected"
+        run: gh pr close "$PR_NUMBER" --comment "Spam detected"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
