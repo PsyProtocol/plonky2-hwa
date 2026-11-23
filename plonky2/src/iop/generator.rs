@@ -76,7 +76,13 @@ pub fn generate_partial_witness<
             // targets' representatives.
             let mut new_target_reps = Vec::with_capacity(buffer.target_values.len());
             for (t, v) in buffer.target_values.drain(..) {
-                let reps = witness.set_target_returning_rep(t, v)?;
+                let reps = witness.set_target_returning_rep(t, v).map_err(|error| {
+                    anyhow!(
+                        "{error} (generator {} setting {t:?} = {v}, watching {:?})",
+                        generators[generator_idx].0.id(),
+                        generators[generator_idx].0.watch_list()
+                    )
+                })?;
                 new_target_reps.extend(reps);
             }
 
