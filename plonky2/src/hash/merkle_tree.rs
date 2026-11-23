@@ -211,31 +211,33 @@ pub(crate) fn fill_digests_buf<F: RichField, H: Hasher<F>>(
     );
 }
 
-/// Hashes the leaves of a Poseidon tree somewhere else (a GPU). Receives the leaves as one
-/// row-major matrix of field words (`leaf_len` words per leaf) and writes four canonical words per
-/// leaf into the output. Returns false to leave the work to the CPU.
-pub type PoseidonLeafAccelerator = dyn Fn(&[u64], usize, &mut [u64]) -> bool + Send + Sync;
+/// Hashes a Poseidon tree somewhere else (a GPU). Receives the leaves as one row-major matrix of
+/// field words (`leaf_len` words per leaf) and the number of tree levels to build above the leaf
+/// digests; writes four canonical words per node, leaf digests first, then each level. Returns
+/// false to leave the work to the CPU.
+pub type PoseidonTreeAccelerator = dyn Fn(&[u64], usize, usize, &mut [u64]) -> bool + Send + Sync;
 
 #[cfg(feature = "std")]
-static POSEIDON_LEAF_ACCELERATOR: std::sync::RwLock<Option<std::sync::Arc<PoseidonLeafAccelerator>>> =
+static POSEIDON_TREE_ACCELERATOR: std::sync::RwLock<Option<std::sync::Arc<PoseidonTreeAccelerator>>> =
     std::sync::RwLock::new(None);
 
 /// Trees with fewer leaves than this stay on the CPU.
 #[cfg(feature = "std")]
 const ACCELERATOR_MIN_LEAVES: usize = 1 << 12;
 
-/// Installs or removes the leaf accelerator used by `MerkleTree::new` for Poseidon trees.
+/// Installs or removes the accelerator used by `MerkleTree::new` for Poseidon trees.
 #[cfg(feature = "std")]
-pub fn set_poseidon_leaf_accelerator(accelerator: Option<std::sync::Arc<PoseidonLeafAccelerator>>) {
-    if let Ok(mut slot) = POSEIDON_LEAF_ACCELERATOR.write() {
+pub fn set_poseidon_tree_accelerator(accelerator: Option<std::sync::Arc<PoseidonTreeAccelerator>>) {
+    if let Ok(mut slot) = POSEIDON_TREE_ACCELERATOR.write() {
         *slot = accelerator;
     }
 }
 
-/// The leaf digests from the accelerator, or `None` when it is absent, declines, or the tree is
-/// not a Poseidon tree of equal-length leaves that are actually hashed.
+/// The digests of every level from the accelerator (leaf digests first, the cap last), or `None`
+/// when it is absent, declines, fails the spot check, or the tree is not a Poseidon tree of
+/// equal-length leaves that are actually hashed.
 #[cfg(feature = "std")]
-fn accelerated_leaf_digests<F: RichField, H: Hasher<F>>(leaves: &[Vec<F>]) -> Option<Vec<H::Hash>> {
+fn accelerated_levels<F: RichField, H: Hasher<F>>(leaves: &[Vec<F>], cap_height: usize) -> Option<Vec<Vec<H::Hash>>> {
     use core::any::TypeId;
 
     use crate::field::goldilocks_field::GoldilocksField;
@@ -249,7 +251,7 @@ fn accelerated_leaf_digests<F: RichField, H: Hasher<F>>(leaves: &[Vec<F>]) -> Op
     if leaves.len() < ACCELERATOR_MIN_LEAVES || leaf_len * 8 <= H::HASH_SIZE || leaves.iter().any(|l| l.len() != leaf_len) {
         return None;
     }
-    let accelerator = POSEIDON_LEAF_ACCELERATOR.read().ok()?.clone()?;
+    let accelerator = POSEIDON_TREE_ACCELERATOR.read().ok()?.clone()?;
     let matrix: Vec<u64> = acc("gpu_flatten", || {
         let mut matrix = vec![0u64; leaves.len() * leaf_len];
         matrix.par_chunks_mut(leaf_len).zip(leaves.par_iter()).for_each(|(row, leaf)| {
@@ -259,66 +261,66 @@ fn accelerated_leaf_digests<F: RichField, H: Hasher<F>>(leaves: &[Vec<F>]) -> Op
         });
         matrix
     });
-    let mut words = vec![0u64; leaves.len() * 4];
-    if !acc("gpu_leaf_hash", || accelerator(&matrix, leaf_len, &mut words)) {
+    let level_count = log2_strict(leaves.len()) - cap_height;
+    let node_count: usize = (0..=level_count).map(|level| leaves.len() >> level).sum();
+    let mut words = vec![0u64; node_count * 4];
+    if !acc("gpu_tree", || accelerator(&matrix, leaf_len, level_count, &mut words)) {
         return None;
     }
-    // Spot check against the CPU: a wrong digest must never reach a proof.
-    for index in (0..leaves.len()).step_by((leaves.len() / 16).max(1)) {
-        let expected = H::hash_or_noop(&leaves[index]).to_bytes();
-        let actual: Vec<u8> = words[index * 4..index * 4 + 4].iter().flat_map(|w| w.to_le_bytes()).collect();
-        if expected != actual {
-            log::error!("Poseidon leaf accelerator returned a wrong digest for leaf {index}; using the CPU");
-            return None;
-        }
+    let mut levels = Vec::with_capacity(level_count + 1);
+    let mut rest = &words[..];
+    for level in 0..=level_count {
+        let (level_words, tail) = rest.split_at((leaves.len() >> level) * 4);
+        rest = tail;
+        levels.push(
+            level_words
+                .chunks_exact(4)
+                .map(|digest| {
+                    let mut bytes = [0u8; 32];
+                    for (chunk, word) in bytes.chunks_exact_mut(8).zip(digest) {
+                        chunk.copy_from_slice(&word.to_le_bytes());
+                    }
+                    H::Hash::from_bytes(&bytes)
+                })
+                .collect::<Vec<H::Hash>>(),
+        );
     }
-    Some(
-        words
-            .chunks_exact(4)
-            .map(|digest| {
-                let mut bytes = [0u8; 32];
-                for (chunk, word) in bytes.chunks_exact_mut(8).zip(digest) {
-                    chunk.copy_from_slice(&word.to_le_bytes());
-                }
-                H::Hash::from_bytes(&bytes)
-            })
-            .collect(),
-    )
+    // Spot check against the CPU: a wrong digest must never reach a proof.
+    let leaf_checks = (0..leaves.len()).step_by((leaves.len() / 16).max(1)).all(|i| H::hash_or_noop(&leaves[i]) == levels[0][i]);
+    let node_checks = (1..=level_count).all(|level| {
+        let nodes = &levels[level];
+        (0..nodes.len()).step_by((nodes.len() / 4).max(1)).all(|i| H::two_to_one(levels[level - 1][2 * i], levels[level - 1][2 * i + 1]) == nodes[i])
+    });
+    if !leaf_checks || !node_checks {
+        log::error!("Poseidon tree accelerator returned a wrong digest; using the CPU");
+        return None;
+    }
+    Some(levels)
 }
 
-/// `fill_digests_buf` starting from leaf digests that are already known.
+/// `fill_digests_buf` from digests that are already known for every level.
 #[cfg(feature = "std")]
-fn fill_digests_buf_from_leaf_digests<F: RichField, H: Hasher<F>>(
+fn fill_digests_buf_from_levels<F: RichField, H: Hasher<F>>(
     digests_buf: &mut [MaybeUninit<H::Hash>],
     cap_buf: &mut [MaybeUninit<H::Hash>],
-    leaf_digests: &[H::Hash],
-    cap_height: usize,
+    levels: &[Vec<H::Hash>],
 ) {
+    let (cap, lower) = levels.split_last().expect("at least the leaf level");
+    for (slot, digest) in cap_buf.iter_mut().zip(cap) {
+        slot.write(*digest);
+    }
     if digests_buf.is_empty() {
-        for (cap, digest) in cap_buf.iter_mut().zip(leaf_digests) {
-            cap.write(*digest);
-        }
         return;
     }
-    let subtree_digests_len = digests_buf.len() >> cap_height;
-    let subtree_leaves_len = leaf_digests.len() >> cap_height;
-    digests_buf
-        .par_chunks_exact_mut(subtree_digests_len)
-        .zip(cap_buf)
-        .zip(leaf_digests.par_chunks_exact(subtree_leaves_len))
-        .for_each(|((subtree_digests, subtree_cap), subtree_leaf_digests)| {
-            // Same layout as `fill_subtree_batched`, one layer at a time.
-            let mut layer_digests = subtree_leaf_digests.to_vec();
-            let mut layer = 0;
-            while layer_digests.len() > 1 {
-                for (index, &digest) in layer_digests.iter().enumerate() {
-                    subtree_digests[subtree_digest_index(layer, index)].write(digest);
-                }
-                layer_digests = H::two_to_one_batch(&layer_digests);
-                layer += 1;
+    let subtree_digests_len = digests_buf.len() / cap.len();
+    digests_buf.par_chunks_exact_mut(subtree_digests_len).enumerate().for_each(|(subtree, subtree_digests)| {
+        for (level, digests) in lower.iter().enumerate() {
+            let nodes = digests.len() / cap.len();
+            for (index, digest) in digests[subtree * nodes..(subtree + 1) * nodes].iter().enumerate() {
+                subtree_digests[subtree_digest_index(level, index)].write(*digest);
             }
-            subtree_cap.write(layer_digests[0]);
-        });
+        }
+    });
 }
 
 pub(crate) fn merkle_tree_prove<F: RichField, H: Hasher<F>>(
@@ -381,13 +383,13 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         let digests_buf = capacity_up_to_mut(&mut digests, num_digests);
         let cap_buf = capacity_up_to_mut(&mut cap, len_cap);
         #[cfg(feature = "std")]
-        let leaf_digests = accelerated_leaf_digests::<F, H>(&leaves);
+        let levels = accelerated_levels::<F, H>(&leaves, cap_height);
         #[cfg(not(feature = "std"))]
-        let leaf_digests: Option<Vec<H::Hash>> = None;
-        match leaf_digests {
+        let levels: Option<Vec<Vec<H::Hash>>> = None;
+        match levels {
             #[cfg(feature = "std")]
-            Some(leaf_digests) => crate::util::stage_log::acc("gpu_tree_levels", || {
-                fill_digests_buf_from_leaf_digests::<F, H>(digests_buf, cap_buf, &leaf_digests, cap_height)
+            Some(levels) => crate::util::stage_log::acc("gpu_tree_store", || {
+                fill_digests_buf_from_levels::<F, H>(digests_buf, cap_buf, &levels)
             }),
             _ => fill_digests_buf::<F, H>(digests_buf, cap_buf, &leaves[..], cap_height),
         }
@@ -468,17 +470,26 @@ pub(crate) mod tests {
         let leaves = random_data::<F>(1 << 12, 9);
         let caps = [0usize, 4, 8, 12];
         let expected: Vec<_> = caps.iter().map(|&cap| MerkleTree::<F, PoseidonHash>::new(leaves.clone(), cap)).collect();
-        super::set_poseidon_leaf_accelerator(Some(std::sync::Arc::new(|matrix: &[u64], leaf_len: usize, out: &mut [u64]| {
-            for (leaf, digest) in matrix.chunks_exact(leaf_len).zip(out.chunks_exact_mut(4)) {
-                let elements: Vec<F> = leaf.iter().map(|w| F::from_noncanonical_u64(*w)).collect();
-                for (word, element) in digest.iter_mut().zip(PoseidonHash::hash_no_pad(&elements).elements) {
-                    *word = element.to_canonical_u64();
+        super::set_poseidon_tree_accelerator(Some(std::sync::Arc::new(|matrix: &[u64], leaf_len: usize, levels: usize, out: &mut [u64]| {
+            let mut level: Vec<_> = matrix
+                .chunks_exact(leaf_len)
+                .map(|leaf| PoseidonHash::hash_no_pad(&leaf.iter().map(|w| F::from_noncanonical_u64(*w)).collect::<Vec<F>>()))
+                .collect();
+            let mut out = out.chunks_exact_mut(4);
+            for remaining in (0..=levels).rev() {
+                for digest in &level {
+                    for (word, element) in out.next().unwrap().iter_mut().zip(digest.elements) {
+                        *word = element.to_canonical_u64();
+                    }
+                }
+                if remaining > 0 {
+                    level = level.chunks_exact(2).map(|pair| PoseidonHash::two_to_one(pair[0], pair[1])).collect();
                 }
             }
             true
         })));
         let actual: Vec<_> = caps.iter().map(|&cap| MerkleTree::<F, PoseidonHash>::new(leaves.clone(), cap)).collect();
-        super::set_poseidon_leaf_accelerator(None);
+        super::set_poseidon_tree_accelerator(None);
         for (expected, actual) in expected.iter().zip(&actual) {
             assert_eq!(expected.cap, actual.cap);
             assert_eq!(expected.digests, actual.digests);
