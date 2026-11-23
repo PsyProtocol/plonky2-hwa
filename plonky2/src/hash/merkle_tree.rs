@@ -263,6 +263,15 @@ fn accelerated_leaf_digests<F: RichField, H: Hasher<F>>(leaves: &[Vec<F>]) -> Op
     if !acc("gpu_leaf_hash", || accelerator(&matrix, leaf_len, &mut words)) {
         return None;
     }
+    // Spot check against the CPU: a wrong digest must never reach a proof.
+    for index in (0..leaves.len()).step_by((leaves.len() / 16).max(1)) {
+        let expected = H::hash_or_noop(&leaves[index]).to_bytes();
+        let actual: Vec<u8> = words[index * 4..index * 4 + 4].iter().flat_map(|w| w.to_le_bytes()).collect();
+        if expected != actual {
+            log::error!("Poseidon leaf accelerator returned a wrong digest for leaf {index}; using the CPU");
+            return None;
+        }
+    }
     Some(
         words
             .chunks_exact(4)
