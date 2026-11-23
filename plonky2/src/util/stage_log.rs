@@ -11,7 +11,10 @@ mod imp {
     use std::io::Write;
     use std::string::String;
     use std::sync::OnceLock;
-    use std::time::Instant;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    use web_time::Instant;
     use std::vec::Vec;
 
     use crate::field::extension::Extendable;
@@ -54,8 +57,22 @@ mod imp {
         r
     }
 
+    /// Turned on by `set_enabled` (the only way in a browser, which has no environment).
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    /// Finished lines kept in memory for `take`.
+    static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    pub fn set_enabled(enabled: bool) {
+        ENABLED.store(enabled, Ordering::Relaxed);
+    }
+
+    /// The stage lines recorded since the last call, one JSON object per proof.
+    pub fn take() -> Vec<String> {
+        LINES.lock().map(|mut lines| core::mem::take(&mut *lines)).unwrap_or_default()
+    }
+
     pub fn enabled() -> bool {
-        path().is_some()
+        ENABLED.load(Ordering::Relaxed) || path().is_some()
     }
 
     pub fn generators_start() -> Option<Instant> {
@@ -81,7 +98,9 @@ mod imp {
             common: &CommonCircuitData<F, D>,
             circuit_digest: u64,
         ) -> Option<Self> {
-            path()?;
+            if !enabled() {
+                return None;
+            }
             let config = &common.config;
             let fri = &common.fri_params;
             let shape = format!(
@@ -127,7 +146,6 @@ mod imp {
         }
 
         pub fn finish(self) {
-            let Some(path) = path() else { return };
             let generators = GENERATORS_SECONDS.with(|c| c.take());
             let stages: Vec<String> = self
                 .stages
@@ -140,20 +158,20 @@ mod imp {
                     .map(|(name, s)| format!("\"{name}\":{s:.6}"))
                     .collect()
             });
-            let thread = std::thread::current();
             let line = format!(
-                "{{\"t\":{:.3},{},\"generators_s\":{},\"prove_s\":{:.6},\"stages\":{{{}}},\"detail\":{{{}}},\"thread\":\"{}\"}}\n",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs_f64())
-                    .unwrap_or(0.0),
+                "{{{},\"generators_s\":{},\"prove_s\":{:.6},\"stages\":{{{}}},\"detail\":{{{}}}}}\n",
                 self.shape,
                 generators.map_or("null".into(), |g| format!("{g:.6}")),
                 (self.last - self.start).as_secs_f64(),
                 stages.join(","),
                 detail.join(","),
-                thread.name().unwrap_or("?").replace('"', "'"),
             );
+            if ENABLED.load(Ordering::Relaxed) {
+                if let Ok(mut lines) = LINES.lock() {
+                    lines.push(line.trim_end().into());
+                }
+            }
+            let Some(path) = path() else { return };
             // One write call per line keeps concurrent appends from interleaving.
             if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
                 let _ = f.write_all(line.as_bytes());
@@ -170,6 +188,10 @@ mod imp {
 
     pub fn enabled() -> bool {
         false
+    }
+    pub fn set_enabled(_enabled: bool) {}
+    pub fn take() -> alloc::vec::Vec<alloc::string::String> {
+        alloc::vec::Vec::new()
     }
     pub fn generators_start() -> Option<()> {
         None
