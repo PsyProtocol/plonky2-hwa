@@ -308,8 +308,21 @@ impl Poseidon for GoldilocksField {
         }
     }
 
+    // wasm32 has no 64x64->128 multiply; see `poseidon_goldilocks_limbs`.
+    #[cfg(target_arch = "wasm32")]
+    #[inline]
+    fn poseidon(input: [Self; 12]) -> [Self; 12] {
+        crate::hash::poseidon_goldilocks_limbs::poseidon(input)
+    }
+
     #[inline]
     fn poseidon_packed<P: PackedField<Scalar = Self>>(input: [P; 12]) -> [P; 12] {
+        #[cfg(target_arch = "wasm32")]
+        if P::WIDTH == 1 {
+            let scalars: [Self; 12] = core::array::from_fn(|i| input[i].as_slice()[0]);
+            let output = crate::hash::poseidon_goldilocks_limbs::poseidon(scalars);
+            return core::array::from_fn(|i| *P::from_slice(&output[i..i + 1]));
+        }
         match P::WIDTH {
             1 => poseidon12_mds_lanes::poseidon::<P, Simd<u64, 1>, 1>(input),
             2 => poseidon12_mds_lanes::poseidon::<P, Simd<u64, 2>, 2>(input),
@@ -691,7 +704,7 @@ pub(crate) mod poseidon12_mds_lanes {
 // The following code has been adapted from winterfell/crypto/src/hash/mds/mds_f64_12x12.rs
 // located at https://github.com/facebook/winterfell.
 #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
-mod poseidon12_mds {
+pub(crate) mod poseidon12_mds {
     const MDS_FREQ_BLOCK_ONE: [i64; 3] = [16, 32, 16];
     const MDS_FREQ_BLOCK_TWO: [(i64, i64); 3] = [(2, -1), (-4, 1), (16, 1)];
     const MDS_FREQ_BLOCK_THREE: [i64; 3] = [-1, -8, 2];
