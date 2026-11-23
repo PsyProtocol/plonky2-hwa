@@ -28,7 +28,9 @@ pub fn transpose<T: Send + Sync + Copy>(matrix: &[Vec<T>]) -> Vec<Vec<T>> {
     // input vector is read in order instead of one element per output row.
     const BLOCK: usize = 64;
     let len = matrix[0].len();
-    let mut transposed: Vec<Vec<T>> = (0..len).into_par_iter().map(|_| Vec::with_capacity(matrix.len())).collect();
+    // Allocated on this thread: on wasm32 the allocator has one lock, and many threads asking for
+    // thousands of row buffers at once spend their time waiting for it.
+    let mut transposed: Vec<Vec<T>> = (0..len).map(|_| Vec::with_capacity(matrix.len())).collect();
     transposed.par_chunks_mut(BLOCK).enumerate().for_each(|(block, rows)| {
         let (start, count) = (block * BLOCK, rows.len());
         for column in matrix {
