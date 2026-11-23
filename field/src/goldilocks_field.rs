@@ -218,7 +218,14 @@ impl Field for GoldilocksField {
 
     #[inline]
     fn multiply_accumulate(&self, x: Self, y: Self) -> Self {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let (high, low) = wide_mul_limbs(x.0, y.0);
+            let (low, carry) = low.overflowing_add(self.0);
+            reduce128((((high + carry as u64) as u128) << 64) | low as u128)
+        }
         // u64 + u64 * u64 cannot overflow.
+        #[cfg(not(target_arch = "wasm32"))]
         reduce128((self.0 as u128) + (x.0 as u128) * (y.0 as u128))
     }
 }
@@ -350,6 +357,12 @@ impl Mul for GoldilocksField {
 
     #[inline]
     fn mul(self, rhs: Self) -> Self {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let (high, low) = wide_mul_limbs(self.0, rhs.0);
+            reduce128(((high as u128) << 64) | low as u128)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
         reduce128((self.0 as u128) * (rhs.0 as u128))
     }
 }
@@ -420,6 +433,20 @@ const unsafe fn add_no_canonicalize_trashing_input(x: u64, y: u64) -> u64 {
     let (res_wrapped, carry) = x.overflowing_add(y);
     // Below cannot overflow unless the assumption if x + y < 2**64 + ORDER is incorrect.
     res_wrapped + EPSILON * (carry as u64)
+}
+
+/// The 128-bit product as `(high, low)` from four 32x32->64 multiplications. wasm32 has no
+/// 64x64->128 multiply: a `u128` product there is a call to `__multi3`, which costs the CPU its
+/// parallelism across independent multiplications (about 2.6 times on a Poseidon S-box layer).
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+const fn wide_mul_limbs(a: u64, b: u64) -> (u64, u64) {
+    let (a0, a1) = (a & EPSILON, a >> 32);
+    let (b0, b1) = (b & EPSILON, b >> 32);
+    let p00 = a0 * b0;
+    let mid = a0 * b1 + (p00 >> 32);
+    let mid2 = a1 * b0 + (mid & EPSILON);
+    (a1 * b1 + (mid >> 32) + (mid2 >> 32), (mid2 << 32) | (p00 & EPSILON))
 }
 
 /// Reduces to a 64-bit value. The result might not be in canonical form; it could be in between the

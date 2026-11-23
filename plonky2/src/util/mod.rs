@@ -24,11 +24,20 @@ pub(crate) fn transpose_poly_values<F: Field>(polys: Vec<PolynomialValues<F>>) -
 }
 
 pub fn transpose<T: Send + Sync + Copy>(matrix: &[Vec<T>]) -> Vec<Vec<T>> {
+    // Rows of the result are filled a block at a time, one input vector after another, so every
+    // input vector is read in order instead of one element per output row.
+    const BLOCK: usize = 64;
     let len = matrix[0].len();
-    (0..len)
-        .into_par_iter()
-        .map(|i| matrix.iter().map(|row| row[i]).collect())
-        .collect()
+    let mut transposed: Vec<Vec<T>> = (0..len).into_par_iter().map(|_| Vec::with_capacity(matrix.len())).collect();
+    transposed.par_chunks_mut(BLOCK).enumerate().for_each(|(block, rows)| {
+        let (start, count) = (block * BLOCK, rows.len());
+        for column in matrix {
+            for (row, value) in rows.iter_mut().zip(&column[start..start + count]) {
+                row.push(*value);
+            }
+        }
+    });
+    transposed
 }
 
 pub(crate) const fn reverse_bits(n: usize, num_bits: usize) -> usize {
