@@ -199,6 +199,18 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let degree = polynomials[0].len();
         let degree_log = log2_strict(degree);
 
+        // The commit accelerator (a GPU) extends and hashes from the coefficients while the CPU
+        // computes the same extension below; it only saves time if they overlap.
+        #[cfg(feature = "std")]
+        let pending_tree = if blinding {
+            None
+        } else {
+            crate::util::stage_log::acc("gpu_commit_start", || {
+                let coefficients: Vec<&[F]> = polynomials.iter().map(|p| p.coeffs.as_slice()).collect();
+                crate::hash::merkle_tree::PendingCommitTree::start::<F, C::Hasher>(&coefficients, rate_bits, cap_height)
+            })
+        };
+
         let lde_values: Vec<Vec<F>> = timed!(
             timing,
             "generate LDE values",
@@ -227,6 +239,13 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             timing,
             "Merkle tree",
             crate::util::stage_log::acc("merkle", || {
+                #[cfg(feature = "std")]
+                if let Some(pending_tree) = pending_tree {
+                    let levels = crate::util::stage_log::acc("gpu_commit_wait", || pending_tree.finish::<F, C::Hasher>(&leaves));
+                    if levels.is_some() {
+                        return Ok(MerkleTree::new_with_levels(leaves, cap_height, levels));
+                    }
+                }
                 <Self as ProverCompute<F, C, D>>::build_merkle_tree(timing, leaves, cap_height)
             })?
         );

@@ -267,6 +267,114 @@ fn accelerated_levels<F: RichField, H: Hasher<F>>(leaves: &[Vec<F>], cap_height:
     if !acc("gpu_tree", || accelerator(&matrix, leaf_len, level_count, &mut words)) {
         return None;
     }
+    let levels = checked_levels::<F, H>(leaves, cap_height, &words);
+    ACCELERATED_TREES[levels.is_none() as usize].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    levels
+}
+
+/// Starts hashing the tree of a batch of polynomials from their coefficients (the accelerator
+/// does the low-degree extension itself, so only the coefficients travel) and collects it later,
+/// leaving the caller free to compute the same extension on the CPU in between.
+pub trait PoseidonCommitAccelerator: Send + Sync {
+    /// `coefficients` holds `coefficients.len() / poly_len` polynomials one after another. The
+    /// tree is over the coset evaluations on a domain `1 << rate_bits` times larger, leaves in
+    /// bit-reversed order, with `levels` levels above the leaf digests; `out` receives four
+    /// canonical words per node, leaf digests first. Both slices must stay alive and untouched
+    /// until `finish` returns. False declines the work.
+    fn start(&self, coefficients: &[u64], poly_len: usize, rate_bits: usize, levels: usize, out: &mut [u64]) -> bool;
+    /// Blocks until the tree started last is written. False means it failed.
+    fn finish(&self) -> bool;
+}
+
+#[cfg(feature = "std")]
+static POSEIDON_COMMIT_ACCELERATOR: std::sync::RwLock<Option<std::sync::Arc<dyn PoseidonCommitAccelerator>>> =
+    std::sync::RwLock::new(None);
+
+#[cfg(feature = "std")]
+pub fn set_poseidon_commit_accelerator(accelerator: Option<std::sync::Arc<dyn PoseidonCommitAccelerator>>) {
+    if let Ok(mut slot) = POSEIDON_COMMIT_ACCELERATOR.write() {
+        *slot = accelerator;
+    }
+}
+
+/// A commitment tree being hashed by the commit accelerator.
+#[cfg(feature = "std")]
+pub struct PendingCommitTree {
+    accelerator: std::sync::Arc<dyn PoseidonCommitAccelerator>,
+    _coefficients: Vec<u64>,
+    words: Vec<u64>,
+    cap_height: usize,
+}
+
+#[cfg(feature = "std")]
+impl core::fmt::Debug for PendingCommitTree {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PendingCommitTree").field("nodes", &(self.words.len() / 4)).field("cap_height", &self.cap_height).finish()
+    }
+}
+
+/// Trees taken from an accelerator, and trees it returned that failed the spot check or the wait.
+#[cfg(feature = "std")]
+static ACCELERATED_TREES: [core::sync::atomic::AtomicUsize; 2] =
+    [core::sync::atomic::AtomicUsize::new(0), core::sync::atomic::AtomicUsize::new(0)];
+
+/// `(accepted, rejected)` accelerated trees since the process started.
+#[cfg(feature = "std")]
+pub fn accelerated_tree_counts() -> (usize, usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (ACCELERATED_TREES[0].load(Relaxed), ACCELERATED_TREES[1].load(Relaxed))
+}
+
+#[cfg(feature = "std")]
+impl PendingCommitTree {
+    /// Hands the coefficients to the accelerator, or returns `None` when there is none, it
+    /// declines, or this is not a Poseidon tree over Goldilocks that it would hash.
+    pub fn start<F: RichField, H: Hasher<F>>(polynomials: &[&[F]], rate_bits: usize, cap_height: usize) -> Option<Self> {
+        use core::any::TypeId;
+
+        use crate::field::goldilocks_field::GoldilocksField;
+        use crate::hash::poseidon::PoseidonHash;
+
+        if TypeId::of::<H>() != TypeId::of::<PoseidonHash>() || TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+            return None;
+        }
+        let poly_len = polynomials.first()?.len();
+        let leaves = poly_len << rate_bits;
+        if leaves < ACCELERATOR_MIN_LEAVES
+            || !poly_len.is_power_of_two()
+            || polynomials.len() * 8 <= H::HASH_SIZE
+            || polynomials.iter().any(|p| p.len() != poly_len)
+        {
+            return None;
+        }
+        let accelerator = POSEIDON_COMMIT_ACCELERATOR.read().ok()?.clone()?;
+        let mut coefficients = vec![0u64; polynomials.len() * poly_len];
+        for (row, polynomial) in coefficients.chunks_exact_mut(poly_len).zip(polynomials) {
+            for (word, element) in row.iter_mut().zip(*polynomial) {
+                *word = element.to_noncanonical_u64();
+            }
+        }
+        let level_count = log2_strict(leaves) - cap_height;
+        let node_count: usize = (0..=level_count).map(|level| leaves >> level).sum();
+        let mut words = vec![0u64; node_count * 4];
+        accelerator
+            .start(&coefficients, poly_len, rate_bits, level_count, &mut words)
+            .then_some(Self { accelerator, _coefficients: coefficients, words, cap_height })
+    }
+
+    /// Waits for the accelerator and returns the tree's levels if they pass the spot check
+    /// against `leaves` (the same evaluations computed on the CPU).
+    pub fn finish<F: RichField, H: Hasher<F>>(self, leaves: &[Vec<F>]) -> Option<Vec<Vec<H::Hash>>> {
+        let levels = if self.accelerator.finish() { checked_levels::<F, H>(leaves, self.cap_height, &self.words) } else { None };
+        ACCELERATED_TREES[levels.is_none() as usize].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        levels
+    }
+}
+
+/// Decodes the accelerator's words into levels and spot-checks them against the CPU.
+#[cfg(feature = "std")]
+fn checked_levels<F: RichField, H: Hasher<F>>(leaves: &[Vec<F>], cap_height: usize, words: &[u64]) -> Option<Vec<Vec<H::Hash>>> {
+    let level_count = log2_strict(leaves.len()) - cap_height;
     let mut levels = Vec::with_capacity(level_count + 1);
     let mut rest = &words[..];
     for level in 0..=level_count {
@@ -366,6 +474,11 @@ pub(crate) fn merkle_tree_prove<F: RichField, H: Hasher<F>>(
 
 impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
     pub fn new(leaves: Vec<Vec<F>>, cap_height: usize) -> Self {
+        Self::new_with_levels(leaves, cap_height, None)
+    }
+
+    /// `new`, with the digests of every level (leaf digests first, the cap last) already known.
+    pub fn new_with_levels(leaves: Vec<Vec<F>>, cap_height: usize, known_levels: Option<Vec<Vec<H::Hash>>>) -> Self {
         let log2_leaves_len = log2_strict(leaves.len());
         assert!(
             cap_height <= log2_leaves_len,
@@ -383,9 +496,9 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         let digests_buf = capacity_up_to_mut(&mut digests, num_digests);
         let cap_buf = capacity_up_to_mut(&mut cap, len_cap);
         #[cfg(feature = "std")]
-        let levels = accelerated_levels::<F, H>(&leaves, cap_height);
+        let levels = known_levels.or_else(|| accelerated_levels::<F, H>(&leaves, cap_height));
         #[cfg(not(feature = "std"))]
-        let levels: Option<Vec<Vec<H::Hash>>> = None;
+        let levels: Option<Vec<Vec<H::Hash>>> = known_levels;
         match levels {
             #[cfg(feature = "std")]
             Some(levels) => crate::util::stage_log::acc("gpu_tree_store", || {
