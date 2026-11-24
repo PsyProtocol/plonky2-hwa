@@ -689,6 +689,7 @@ fn compute_quotient_polys_pre_transpose<
             let n = xs_batch.len();
             let indices_batch: Vec<usize> =
                 (BATCH_SIZE * batch_i..BATCH_SIZE * batch_i + n).collect();
+            let lab_gather = crate::util::stage_log::timer();
 
             let mut shifted_xs_batch = Vec::with_capacity(n);
             let mut local_zs_batch_vecs = Vec::with_capacity(n);
@@ -767,6 +768,8 @@ fn compute_quotient_polys_pre_transpose<
                 public_inputs_hash,
             );
 
+            crate::util::stage_log::add_shared("q_gather", lab_gather);
+            let lab_eval = crate::util::stage_log::timer();
             let mut quotient_values_batch = eval_vanishing_poly_base_batch::<F, D>(
                 common_data,
                 &indices_batch,
@@ -786,6 +789,8 @@ fn compute_quotient_polys_pre_transpose<
                 &lut_re_poly_evals_refs,
             );
 
+            crate::util::stage_log::add_shared("q_eval", lab_eval);
+            let lab_post = crate::util::stage_log::timer();
             for (&i, quotient_values) in indices_batch.iter().zip(quotient_values_batch.iter_mut())
             {
                 let denominator_inv = z_h_on_coset.eval_inverse(i);
@@ -793,6 +798,7 @@ fn compute_quotient_polys_pre_transpose<
                     .iter_mut()
                     .for_each(|v| *v *= denominator_inv);
             }
+            crate::util::stage_log::add_shared("q_post", lab_post);
             quotient_values_batch
         })
         .collect();

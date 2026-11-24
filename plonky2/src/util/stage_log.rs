@@ -57,6 +57,47 @@ mod imp {
         r
     }
 
+    /// Sub-stage seconds summed over every thread (CPU time, not wall time) since the current
+    /// stage log started; for code that runs on the rayon pool.
+    static SHARED: Mutex<Vec<(&'static str, f64)>> = Mutex::new(Vec::new());
+
+    /// A start time for `add_shared`, or `None` when the log is off.
+    #[inline]
+    pub fn timer() -> Option<Instant> {
+        enabled().then(Instant::now)
+    }
+
+    /// Adds the time since `start` to shared sub-stage `name`.
+    #[inline]
+    pub fn add_shared(name: &'static str, start: Option<Instant>) {
+        let Some(start) = start else { return };
+        let s = start.elapsed().as_secs_f64();
+        if let Ok(mut d) = SHARED.lock() {
+            match d.iter_mut().find(|(n, _)| *n == name) {
+                Some(e) => e.1 += s,
+                None => d.push((name, s)),
+            }
+        }
+    }
+
+    /// Like `acc`, but callable from any thread; the times of all threads are added up.
+    #[inline]
+    pub fn acc_shared<R>(name: &'static str, f: impl FnOnce() -> R) -> R {
+        if !enabled() {
+            return f();
+        }
+        let t = Instant::now();
+        let r = f();
+        let s = t.elapsed().as_secs_f64();
+        if let Ok(mut d) = SHARED.lock() {
+            match d.iter_mut().find(|(n, _)| *n == name) {
+                Some(e) => e.1 += s,
+                None => d.push((name, s)),
+            }
+        }
+        r
+    }
+
     /// Turned on by `set_enabled` (the only way in a browser, which has no environment).
     static ENABLED: AtomicBool = AtomicBool::new(false);
     /// Finished lines kept in memory for `take`.
@@ -167,12 +208,15 @@ mod imp {
                 .iter()
                 .map(|(name, s)| format!("\"{name}\":{s:.6}"))
                 .collect();
-            let detail: Vec<String> = DETAIL.with(|d| {
+            let mut detail: Vec<String> = DETAIL.with(|d| {
                 d.borrow_mut()
                     .drain(..)
                     .map(|(name, s)| format!("\"{name}\":{s:.6}"))
                     .collect()
             });
+            if let Ok(mut shared) = SHARED.lock() {
+                detail.extend(shared.drain(..).map(|(name, s)| format!("\"cpu_{name}\":{s:.6}")));
+            }
             let line = format!(
                 "{{\"kind\":\"proof\",\"end_ms\":{:.1},{},\"generators_s\":{},\"prove_s\":{:.6},\"stages\":{{{}}},\"detail\":{{{}}}}}\n",
                 now_ms(),
@@ -210,6 +254,16 @@ mod imp {
         0.0
     }
     pub fn note(_line: impl FnOnce() -> alloc::string::String) {}
+    #[inline]
+    pub fn acc_shared<R>(_name: &'static str, f: impl FnOnce() -> R) -> R {
+        f()
+    }
+    #[inline]
+    pub fn timer() -> Option<()> {
+        None
+    }
+    #[inline]
+    pub fn add_shared(_name: &'static str, _start: Option<()>) {}
     pub fn take() -> alloc::vec::Vec<alloc::string::String> {
         alloc::vec::Vec::new()
     }

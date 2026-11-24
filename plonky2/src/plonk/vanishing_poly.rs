@@ -204,8 +204,9 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
     let num_gate_constraints = common_data.num_gate_constraints;
 
-    let constraint_terms_batch =
-        evaluate_gate_constraints_base_batch::<F, D>(common_data, vars_batch);
+    let constraint_terms_batch = crate::util::stage_log::acc_shared("q_gates", || {
+        evaluate_gate_constraints_base_batch::<F, D>(common_data, vars_batch)
+    });
     debug_assert!(constraint_terms_batch.len() == n * num_gate_constraints);
 
     let num_challenges = common_data.config.num_challenges;
