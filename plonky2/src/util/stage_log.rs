@@ -66,6 +66,21 @@ mod imp {
         ENABLED.store(enabled, Ordering::Relaxed);
     }
 
+    /// Milliseconds since the first call in this process: one clock for every timeline line.
+    pub fn now_ms() -> f64 {
+        static START: OnceLock<Instant> = OnceLock::new();
+        START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
+    }
+
+    /// Adds a caller's own JSON line (an RPC, a phase) to the lines `take` returns.
+    pub fn note(line: impl FnOnce() -> String) {
+        if ENABLED.load(Ordering::Relaxed) {
+            if let Ok(mut lines) = LINES.lock() {
+                lines.push(line());
+            }
+        }
+    }
+
     /// The stage lines recorded since the last call, one JSON object per proof.
     pub fn take() -> Vec<String> {
         LINES.lock().map(|mut lines| core::mem::take(&mut *lines)).unwrap_or_default()
@@ -159,7 +174,8 @@ mod imp {
                     .collect()
             });
             let line = format!(
-                "{{{},\"generators_s\":{},\"prove_s\":{:.6},\"stages\":{{{}}},\"detail\":{{{}}}}}\n",
+                "{{\"kind\":\"proof\",\"end_ms\":{:.1},{},\"generators_s\":{},\"prove_s\":{:.6},\"stages\":{{{}}},\"detail\":{{{}}}}}\n",
+                now_ms(),
                 self.shape,
                 generators.map_or("null".into(), |g| format!("{g:.6}")),
                 (self.last - self.start).as_secs_f64(),
@@ -190,6 +206,10 @@ mod imp {
         false
     }
     pub fn set_enabled(_enabled: bool) {}
+    pub fn now_ms() -> f64 {
+        0.0
+    }
+    pub fn note(_line: impl FnOnce() -> alloc::string::String) {}
     pub fn take() -> alloc::vec::Vec<alloc::string::String> {
         alloc::vec::Vec::new()
     }
