@@ -156,6 +156,26 @@ fn partial_rounds(state: &mut [u64; 12]) {
     }
 }
 
+/// `Poseidon::mds_partial_layer_fast` for Goldilocks (used by the Poseidon gate's evaluation).
+#[inline]
+pub fn mds_partial_layer_fast(state: &[F; 12], round: usize) -> [F; 12] {
+    let mds_0_0 = <F as Poseidon>::MDS_MATRIX_CIRC[0] + <F as Poseidon>::MDS_MATRIX_DIAG[0];
+    let w_hats = &<F as Poseidon>::FAST_PARTIAL_ROUND_W_HATS[round];
+    let vs = &<F as Poseidon>::FAST_PARTIAL_ROUND_VS[round];
+    let s0 = state[0].0;
+    let mut d = ProductSum::new();
+    d.add_product(s0, mds_0_0);
+    for i in 1..12 {
+        d.add_product(state[i].0, w_hats[i - 1]);
+    }
+    let mut result = [GoldilocksField(0); 12];
+    result[0] = GoldilocksField(d.reduce());
+    for i in 1..12 {
+        result[i] = GoldilocksField(mul_add(state[i].0, s0, vs[i - 1]));
+    }
+    result
+}
+
 /// `Poseidon::poseidon` for Goldilocks.
 #[inline]
 pub fn poseidon(input: [F; 12]) -> [F; 12] {
@@ -199,6 +219,34 @@ mod tests {
             let actual = poseidon(input);
             for i in 0..12 {
                 assert_eq!(actual[i].to_canonical_u64(), expected[i].to_canonical_u64(), "case {case} word {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn partial_layer_matches_the_reference() {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(11);
+        for case in 0..20_000 {
+            let state: [F; 12] = core::array::from_fn(|_| GoldilocksField(rng.gen::<u64>()));
+            let round = case % N_PARTIAL_ROUNDS;
+            let expected = <F as Poseidon>::mds_partial_layer_fast_field::<F, 1>(&state, round);
+            let actual = mds_partial_layer_fast(&state, round);
+            for i in 0..12 {
+                assert_eq!(actual[i].to_canonical_u64(), expected[i].to_canonical_u64(), "case {case} word {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn mds_layer_field_matches_the_row_formula() {
+        use crate::field::extension::quadratic::QuadraticExtension;
+        use crate::field::types::Sample;
+        type FE = QuadraticExtension<F>;
+        for _ in 0..2_000 {
+            let state: [FE; 12] = core::array::from_fn(|_| FE::rand());
+            let actual = <F as Poseidon>::mds_layer_field::<FE, 2>(&state);
+            for r in 0..12 {
+                assert_eq!(actual[r], <F as Poseidon>::mds_row_shf_field::<FE, 2>(r, &state), "row {r}");
             }
         }
     }

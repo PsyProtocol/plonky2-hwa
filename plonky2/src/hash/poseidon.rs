@@ -294,13 +294,20 @@ pub trait Poseidon: PrimeField64 {
     fn mds_layer_field<F: FieldExtension<D, BaseField = Self>, const D: usize>(
         state: &[F; SPONGE_WIDTH],
     ) -> [F; SPONGE_WIDTH] {
-        let mut result = [F::ZERO; SPONGE_WIDTH];
-
-        for r in 0..SPONGE_WIDTH {
-            result[r] = Self::mds_row_shf_field(r, state);
+        // The matrix has base-field entries, so it acts on each coordinate of the extension
+        // separately: D calls of the base field's `mds_layer` (which for Goldilocks uses no
+        // field multiplications) instead of 156 extension multiplications.
+        let coordinates: [[Self; D]; SPONGE_WIDTH] =
+            core::array::from_fn(|i| state[i].to_basefield_array());
+        let mut result_coordinates = [[Self::ZERO; D]; SPONGE_WIDTH];
+        for d in 0..D {
+            let column: [Self; SPONGE_WIDTH] = core::array::from_fn(|i| coordinates[i][d]);
+            let mixed = Self::mds_layer(&column);
+            for i in 0..SPONGE_WIDTH {
+                result_coordinates[i][d] = mixed[i];
+            }
         }
-
-        result
+        core::array::from_fn(|i| F::from_basefield_array(result_coordinates[i]))
     }
 
     /// Same as `mds_layer` for `PackedField`.

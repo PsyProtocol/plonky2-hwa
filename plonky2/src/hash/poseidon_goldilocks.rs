@@ -308,6 +308,12 @@ impl Poseidon for GoldilocksField {
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
+    #[inline]
+    fn mds_partial_layer_fast(state: &[Self; 12], r: usize) -> [Self; 12] {
+        crate::hash::poseidon_goldilocks_limbs::mds_partial_layer_fast(state, r)
+    }
+
     // wasm32 has no 64x64->128 multiply; see `poseidon_goldilocks_limbs`.
     #[cfg(target_arch = "wasm32")]
     #[inline]
