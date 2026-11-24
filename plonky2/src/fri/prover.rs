@@ -156,6 +156,28 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
 }
 
 /// Performs the proof-of-work (a.k.a. grinding) step of the FRI protocol. Returns the PoW witness.
+/// LAB: searches the proof-of-work witness elsewhere (a GPU). Given the sponge state before the
+/// witness is absorbed (canonical words), the position the witness goes to and the number of
+/// leading zero bits required, returns a candidate, which the prover checks before using it.
+#[cfg(feature = "std")]
+pub type PowAccelerator = std::sync::Arc<dyn Fn(&[u64], usize, u32) -> Option<u64> + Send + Sync>;
+
+#[cfg(feature = "std")]
+static POW_ACCELERATOR: std::sync::RwLock<Option<PowAccelerator>> = std::sync::RwLock::new(None);
+#[cfg(feature = "std")]
+static POW_ACCELERATED: [core::sync::atomic::AtomicUsize; 2] = [core::sync::atomic::AtomicUsize::new(0), core::sync::atomic::AtomicUsize::new(0)];
+
+#[cfg(feature = "std")]
+pub fn set_pow_accelerator(accelerator: Option<PowAccelerator>) {
+    *POW_ACCELERATOR.write().unwrap() = accelerator;
+}
+
+/// Accelerated proof-of-work searches accepted and rejected so far.
+#[cfg(feature = "std")]
+pub fn accelerated_pow_counts() -> (usize, usize) {
+    (POW_ACCELERATED[0].load(core::sync::atomic::Ordering::Relaxed), POW_ACCELERATED[1].load(core::sync::atomic::Ordering::Relaxed))
+}
+
 pub(crate) fn fri_proof_of_work<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -186,16 +208,30 @@ pub(crate) fn fri_proof_of_work<
     let witness_input_pos = challenger.input_buffer.len();
     duplex_intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
 
-    let pow_witness = (0..=F::NEG_ONE.to_canonical_u64())
-        .into_par_iter()
-        .find_any(|&candidate| {
-            let mut duplex_state = duplex_intermediate_state;
-            duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
-            duplex_state.permute();
-            let pow_response = duplex_state.squeeze().iter().last().unwrap();
-            let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
-            leading_zeros >= min_leading_zeros
+    let accepts = |candidate: u64| {
+        let mut duplex_state = duplex_intermediate_state;
+        duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
+        duplex_state.permute();
+        let pow_response = duplex_state.squeeze().iter().last().unwrap();
+        let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
+        leading_zeros >= min_leading_zeros
+    };
+    #[cfg(feature = "std")]
+    let accelerated = {
+        let accelerator = POW_ACCELERATOR.read().unwrap().clone();
+        accelerator.and_then(|search| {
+            let state: Vec<u64> = duplex_intermediate_state.as_ref().iter().map(|x| x.to_canonical_u64()).collect();
+            let candidate = crate::util::stage_log::acc("fri_pow_gpu", || search(&state, witness_input_pos, min_leading_zeros));
+            // Whatever the accelerator returns is checked here with the prover's own hash.
+            let good = candidate.filter(|&c| c < F::ORDER && accepts(c));
+            POW_ACCELERATED[good.is_none() as usize].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            good
         })
+    };
+    #[cfg(not(feature = "std"))]
+    let accelerated: Option<u64> = None;
+    let pow_witness = accelerated
+        .or_else(|| (0..=F::NEG_ONE.to_canonical_u64()).into_par_iter().find_any(|&candidate| accepts(candidate)))
         .map(F::from_canonical_u64)
         .expect("Proof of work failed. This is highly unlikely!");
 
