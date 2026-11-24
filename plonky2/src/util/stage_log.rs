@@ -61,6 +61,18 @@ mod imp {
     /// stage log started; for code that runs on the rayon pool.
     static SHARED: Mutex<Vec<(&'static str, f64)>> = Mutex::new(Vec::new());
 
+    /// An interned copy of `name` (leaked once per distinct name), for `add_shared`.
+    pub fn static_name(name: &str) -> &'static str {
+        static NAMES: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+        let mut names = NAMES.lock().unwrap();
+        if let Some(found) = names.iter().find(|n| **n == name) {
+            return found;
+        }
+        let leaked: &'static str = std::boxed::Box::leak(String::from(name).into_boxed_str());
+        names.push(leaked);
+        leaked
+    }
+
     /// A start time for `add_shared`, or `None` when the log is off.
     #[inline]
     pub fn timer() -> Option<Instant> {
@@ -257,6 +269,9 @@ mod imp {
     #[inline]
     pub fn acc_shared<R>(_name: &'static str, f: impl FnOnce() -> R) -> R {
         f()
+    }
+    pub fn static_name(_name: &str) -> &'static str {
+        ""
     }
     #[inline]
     pub fn timer() -> Option<()> {

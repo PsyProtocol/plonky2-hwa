@@ -707,6 +707,7 @@ pub fn evaluate_gate_constraints_base_batch<F: RichField + Extendable<D>, const 
     let mut constraints_batch = vec![F::ZERO; common_data.num_gate_constraints * vars_batch.len()];
     for (i, gate) in common_data.gates.iter().enumerate() {
         let selector_index = common_data.selectors_info.selector_indices[i];
+        let lab_gate = crate::util::stage_log::timer();
         let gate_constraints_batch = gate.0.eval_filtered_base_batch(
             vars_batch,
             i,
@@ -724,6 +725,11 @@ pub fn evaluate_gate_constraints_base_batch<F: RichField + Extendable<D>, const 
             &mut constraints_batch[..gate_constraints_batch.len()],
             &gate_constraints_batch,
         );
+        if lab_gate.is_some() {
+            let id = gate.0.id();
+            let short: String = id.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            crate::util::stage_log::add_shared(crate::util::stage_log::static_name(&format!("gate_{short}")), lab_gate);
+        }
     }
     constraints_batch
 }
