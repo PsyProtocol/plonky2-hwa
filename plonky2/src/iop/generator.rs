@@ -35,7 +35,7 @@ pub fn generate_partial_witness<
 ) -> Result<PartitionWitness<'a, F>> {
     let config = &common_data.config;
     let generators = &prover_data.generators;
-    let generator_indices_by_watches = &prover_data.generator_indices_by_watches;
+    let generator_watch_table = &prover_data.generator_watch_table;
 
     let mut witness = PartitionWitness::new(
         config.num_wires,
@@ -82,12 +82,10 @@ pub fn generate_partial_witness<
 
             // Enqueue unfinished generators that were watching one of the newly populated targets.
             for watch in new_target_reps {
-                let opt_watchers = generator_indices_by_watches.get(&watch);
-                if let Some(watchers) = opt_watchers {
-                    for &watching_generator_idx in watchers {
-                        if !generator_is_expired[watching_generator_idx] {
-                            next_pending_generator_indices.push(watching_generator_idx);
-                        }
+                for &watching_generator_idx in generator_watch_table.get(watch) {
+                    let watching_generator_idx = watching_generator_idx as usize;
+                    if !generator_is_expired[watching_generator_idx] {
+                        next_pending_generator_indices.push(watching_generator_idx);
                     }
                 }
             }

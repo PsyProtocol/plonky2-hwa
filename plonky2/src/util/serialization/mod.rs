@@ -42,8 +42,8 @@ use crate::iop::target::{BoolTarget, Target};
 use crate::iop::wire::Wire;
 use crate::plonk::circuit_builder::LookupWire;
 use crate::plonk::circuit_data::{
-    CircuitConfig, CircuitData, CommonCircuitData, ProverCircuitData, ProverOnlyCircuitData,
-    VerifierCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData,
+    CircuitConfig, CircuitData, CommonCircuitData, GeneratorWatchTable, ProverCircuitData,
+    ProverOnlyCircuitData, VerifierCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData,
 };
 use crate::plonk::config::{GenericConfig, GenericHashOut, Hasher};
 use crate::plonk::plonk_common::salt_size;
@@ -893,6 +893,7 @@ pub trait Read {
 
         Ok(ProverOnlyCircuitData {
             generators,
+            generator_watch_table: GeneratorWatchTable::new(&generator_indices_by_watches),
             generator_indices_by_watches,
             constants_sigmas_commitment,
             sigmas,
@@ -1844,6 +1845,7 @@ pub trait Write {
         let ProverOnlyCircuitData {
             generators,
             generator_indices_by_watches,
+            generator_watch_table: _,
             constants_sigmas_commitment,
             sigmas,
             subgroup,
