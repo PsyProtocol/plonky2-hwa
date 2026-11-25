@@ -129,6 +129,26 @@ where
     prove_with_partition_witness(prover_data, common_data, partition_witness, timing)
 }
 
+/// Below this many rows freeing the oracles takes less than starting a thread.
+const MIN_DEGREE_FOR_BACKGROUND_FREE: usize = 1 << 16;
+
+/// Frees the oracles of a finished proof without holding the caller.
+///
+/// Each oracle owns one small allocation per Merkle leaf (millions on a large
+/// circuit), and returning them one by one took 0.4 s of a 2^19-row proof.
+/// Where no thread can be started the value is dropped here.
+fn free_in_background<T: Send + 'static>(finished: T) {
+    #[cfg(all(feature = "std", not(target_family = "wasm")))]
+    {
+        // A failed spawn drops the closure, and with it `finished`, right here.
+        let _ = std::thread::Builder::new()
+            .name("plonky2-free".into())
+            .spawn(move || drop(finished));
+    }
+    #[cfg(not(all(feature = "std", not(target_family = "wasm"))))]
+    drop(finished);
+}
+
 pub fn prove_with_partition_witness<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -336,12 +356,23 @@ where
     );
 
     let proof = Proof::<F, C, D> {
-        wires_cap: wires_commitment.merkle_tree.cap,
-        plonk_zs_partial_products_cap: partial_products_zs_and_lookup_commitment.merkle_tree.cap,
-        quotient_polys_cap: quotient_polys_commitment.merkle_tree.cap,
+        wires_cap: wires_commitment.merkle_tree.cap.clone(),
+        plonk_zs_partial_products_cap: partial_products_zs_and_lookup_commitment
+            .merkle_tree
+            .cap
+            .clone(),
+        quotient_polys_cap: quotient_polys_commitment.merkle_tree.cap.clone(),
         openings,
         opening_proof,
     };
+    if degree >= MIN_DEGREE_FOR_BACKGROUND_FREE {
+        free_in_background((
+            witness,
+            wires_commitment,
+            partial_products_zs_and_lookup_commitment,
+            quotient_polys_commitment,
+        ));
+    }
     Ok(ProofWithPublicInputs::<F, C, D> {
         proof,
         public_inputs,

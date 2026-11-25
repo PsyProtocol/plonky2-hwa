@@ -334,6 +334,51 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     }
 }
 
+/// Generator indices by the representative they watch, as two flat arrays:
+/// the watchers of representative `r` are `watchers[starts[r]..starts[r + 1]]`.
+///
+/// Witness generation asks for the watchers of every target it sets. On a
+/// circuit of 2^19 rows that lookup in the `BTreeMap` was half of witness
+/// generation; here it is two array reads.
+#[derive(Eq, PartialEq, Debug, Default)]
+pub struct GeneratorWatchTable {
+    starts: Vec<u32>,
+    watchers: Vec<u32>,
+}
+
+impl GeneratorWatchTable {
+    pub fn new(generator_indices_by_watches: &BTreeMap<usize, Vec<usize>>) -> Self {
+        let len = generator_indices_by_watches
+            .keys()
+            .next_back()
+            .map_or(0, |&last| last + 1);
+        let num_watchers: usize = generator_indices_by_watches.values().map(Vec::len).sum();
+        assert!(
+            num_watchers <= u32::MAX as usize,
+            "too many watching generators for a u32 table"
+        );
+        let mut starts = Vec::with_capacity(len + 1);
+        let mut watchers = Vec::with_capacity(num_watchers);
+        for (&representative, indices) in generator_indices_by_watches {
+            starts.resize(representative + 1, watchers.len() as u32);
+            watchers.extend(indices.iter().map(|&index| {
+                u32::try_from(index).expect("generator index exceeds u32")
+            }));
+        }
+        starts.resize(len + 1, watchers.len() as u32);
+        Self { starts, watchers }
+    }
+
+    /// The generators watching `representative`, in the order of the map.
+    #[inline]
+    pub fn get(&self, representative: usize) -> &[u32] {
+        match self.starts.get(representative + 1) {
+            Some(&end) => &self.watchers[self.starts[representative] as usize..end as usize],
+            None => &[],
+        }
+    }
+}
+
 /// Circuit data required by the prover, but not the verifier.
 #[derive(Eq, PartialEq, Debug)]
 pub struct ProverOnlyCircuitData<
@@ -345,6 +390,8 @@ pub struct ProverOnlyCircuitData<
     /// Generator indices (within the `Vec` above), indexed by the representative of each target
     /// they watch.
     pub generator_indices_by_watches: BTreeMap<usize, Vec<usize>>,
+    /// The relation of `generator_indices_by_watches`, indexed directly for witness generation.
+    pub generator_watch_table: GeneratorWatchTable,
     /// Commitments to the constants polynomials and sigma polynomials.
     pub constants_sigmas_commitment: PolynomialBatch<F, C, D>,
     /// The transpose of the list of sigma polynomials.
@@ -675,4 +722,36 @@ pub struct VerifierCircuitTarget {
     /// A digest of the "circuit" (i.e. the instance, minus public inputs), which can be used to
     /// seed Fiat-Shamir.
     pub circuit_digest: HashOutTarget,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generator_watch_table_equals_map() {
+        let map: BTreeMap<usize, Vec<usize>> = [
+            (0, vec![4]),
+            (3, vec![0, 2, 9]),
+            (4, vec![1]),
+            (11, vec![7, 8]),
+        ]
+        .into_iter()
+        .collect();
+        let table = GeneratorWatchTable::new(&map);
+        for representative in 0..20 {
+            let expected: Vec<u32> = map
+                .get(&representative)
+                .map(|indices| indices.iter().map(|&index| index as u32).collect())
+                .unwrap_or_default();
+            assert_eq!(table.get(representative), expected, "representative {representative}");
+        }
+        assert!(table.get(usize::MAX - 1).is_empty());
+    }
+
+    #[test]
+    fn generator_watch_table_of_empty_map_is_empty() {
+        let table = GeneratorWatchTable::new(&BTreeMap::new());
+        assert!(table.get(0).is_empty());
+    }
 }
